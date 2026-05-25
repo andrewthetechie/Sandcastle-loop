@@ -1,7 +1,7 @@
 import * as sandcastle from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -18,9 +18,10 @@ const LABEL_PREFIX = "prd"; // -> label `prd-<N>`, base branch `prd-<N>`
 const STUCK_LABEL = "agent-stuck";
 
 // Loop bounds
-const MAX_REVIEW_ROUNDS = 5; // coder<->reviewer attempts per issue
+const MAX_REVIEW_ROUNDS = 10; // coder<->reviewer attempts per issue
 const MAX_ITERATIONS = 50; // outer-loop safety cap
 const CODER_MAX_ITERATIONS = 30; // per coder invocation
+const MAX_RECOVERY_ATTEMPTS = 2; // branch-hygiene recovery attempts per issue
 
 // Idle timeout for the agent (sandcastle fails the run if stdout is silent
 // this long). Local LLMs like Qwen 35B on a single GPU often go silent for
@@ -123,25 +124,149 @@ console.log(`Loaded PRD: ${prdPath}`);
 const gh = (args: string[]): string =>
   execFileSync("gh", args, { encoding: "utf8" });
 
-const ghJson = <T>(args: string[]): T => JSON.parse(gh(args)) as T;
+const ghJson = <T extends unknown>(args: string[]): T =>
+  JSON.parse(gh(args)) as T;
 
 const git = (args: string[], cwd?: string): string =>
   execFileSync("git", args, { encoding: "utf8", cwd });
 
+function gitSpawn(args: string[], cwd: string): ReturnType<typeof spawnSync> {
+  return spawnSync("git", args, { cwd, encoding: "utf8" });
+}
+
+function originPrdRef(): string {
+  return `origin/${prdBranch}`;
+}
+
+function branchExists(branch: string): boolean {
+  return (
+    spawnSync("git", ["rev-parse", "--verify", branch], {
+      encoding: "utf8",
+    }).status === 0
+  );
+}
+
 function ensureBaseBranch(): void {
-  const existing = git(["branch", "--list", prdBranch]).trim();
-  if (!existing) {
-    console.log(`Creating base branch ${prdBranch} from current HEAD`);
+  // Fetch first so origin/<prdBranch> is current — it's what we use as
+  // baseBranch for every new issue sandbox.
+  const fetch = spawnSync("git", ["fetch", "origin", prdBranch], {
+    encoding: "utf8",
+  });
+
+  if (fetch.status === 0) {
+    // origin/<prdBranch> exists and is now fresh — nothing else to do.
+    return;
+  }
+
+  // origin/<prdBranch> doesn't exist yet. Create it from current HEAD and
+  // push, so future iterations have a remote-tracking ref to fork from.
+  console.log(
+    `origin/${prdBranch} not found; creating ${prdBranch} from current HEAD and pushing`,
+  );
+  const localExists = git(["branch", "--list", prdBranch]).trim();
+  if (!localExists) {
     git(["branch", prdBranch]);
   }
   const push = spawnSync("git", ["push", "-u", "origin", prdBranch], {
     encoding: "utf8",
   });
   if (push.status !== 0) {
-    console.warn(
-      `Could not push ${prdBranch} to origin (status ${push.status}). Subsequent PR creation may fail.\n${push.stderr ?? ""}`,
+    throw new Error(
+      `Could not create ${prdBranch} on origin: ${push.stderr ?? ""}`,
     );
   }
+}
+
+function preflightExistingIssueBranch(
+  issue: IssueDetail,
+  issueBranch: string,
+): void {
+  fetchOriginPrd();
+  if (!branchExists(issueBranch)) return;
+
+  const baseSha = git(["rev-parse", originPrdRef()]).trim();
+  const mergeBase = git(["merge-base", originPrdRef(), issueBranch]).trim();
+  const diff = execFileSync(
+    "git",
+    [
+      "diff",
+      `${originPrdRef()}..${issueBranch}`,
+      "--",
+      ".",
+      ...REVIEW_DIFF_EXCLUDES,
+    ],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  );
+  const changedFiles = execFileSync(
+    "git",
+    [
+      "diff",
+      "--name-only",
+      `${originPrdRef()}..${issueBranch}`,
+      "--",
+      ".",
+      ...REVIEW_DIFF_EXCLUDES,
+    ],
+    { encoding: "utf8", maxBuffer: 1024 * 1024 },
+  )
+    .split("\n")
+    .map((f) => f.trim())
+    .filter(Boolean);
+
+  const stale = mergeBase !== baseSha;
+  const tooLarge = Buffer.byteLength(diff, "utf8") > REVIEW_DIFF_MAX_BYTES;
+  const polluted = looksLikeWorkflowPollution(issue, changedFiles);
+  if (!stale || (!tooLarge && !polluted)) return;
+
+  const worktreePath = findManagedWorktreeForBranch(issueBranch);
+  if (worktreePath) {
+    const dirty = git(["status", "-s"], worktreePath).trim();
+    if (dirty) {
+      console.warn(
+        `Existing branch ${issueBranch} looks stale/polluted, but managed worktree ${worktreePath} has uncommitted changes; reusing it rather than deleting work.`,
+      );
+      return;
+    }
+    execFileSync("git", ["worktree", "remove", "--force", worktreePath], {
+      stdio: "inherit",
+    });
+  }
+
+  const diagnosticBranch = `diagnostic/${issueBranch}-prestart-${Date.now()}`;
+  console.warn(
+    `Existing branch ${issueBranch} is stale and ${tooLarge ? "oversized" : "polluted"}; quarantining to ${diagnosticBranch} and starting fresh from ${originPrdRef()}.`,
+  );
+  git(["branch", "-f", diagnosticBranch, issueBranch]);
+  execFileSync("git", ["branch", "-D", issueBranch], { stdio: "inherit" });
+  const deleteRemote = spawnSync(
+    "git",
+    ["push", "origin", "--delete", issueBranch],
+    {
+      encoding: "utf8",
+    },
+  );
+  if (deleteRemote.status !== 0) {
+    console.warn(
+      `Could not delete remote ${issueBranch}; later push may need manual cleanup. ${deleteRemote.stderr || deleteRemote.stdout || ""}`,
+    );
+  }
+}
+
+function findManagedWorktreeForBranch(branch: string): string | null {
+  const worktreeList = git(["worktree", "list", "--porcelain"]);
+  let currentPath: string | null = null;
+  for (const line of worktreeList.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      currentPath = line.slice("worktree ".length).trim();
+      continue;
+    }
+    if (line === `branch refs/heads/${branch}` && currentPath) {
+      return currentPath.includes("/.sandcastle/worktrees/")
+        ? currentPath
+        : null;
+    }
+  }
+  return null;
 }
 
 interface IssueListItem {
@@ -190,22 +315,186 @@ function pickNextIssue(): IssueDetail | null {
   ]);
 }
 
-function computeReviewDiff(worktreePath: string): string {
-  const out = execFileSync(
+interface ReviewContext {
+  baseSha: string;
+  diff: string;
+  diffBytes: number;
+  diffStat: string;
+  changedFiles: string[];
+  reviewAspects: string[];
+  ecosystems: string[];
+}
+
+function computeReviewContext(
+  worktreePath: string,
+  baseSha: string,
+): ReviewContext {
+  const diff = execFileSync(
+    "git",
+    ["diff", `${baseSha}..HEAD`, "--", ".", ...REVIEW_DIFF_EXCLUDES],
+    { cwd: worktreePath, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  );
+  const changedFiles = execFileSync(
     "git",
     [
       "diff",
-      `${prdBranch}..HEAD`,
+      "--name-only",
+      `${baseSha}..HEAD`,
       "--",
       ".",
       ...REVIEW_DIFF_EXCLUDES,
     ],
-    { cwd: worktreePath, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
-  );
-  if (out.length <= REVIEW_DIFF_MAX_BYTES) return out;
+    { cwd: worktreePath, encoding: "utf8", maxBuffer: 1024 * 1024 },
+  )
+    .split("\n")
+    .map((f) => f.trim())
+    .filter(Boolean);
+  const diffStat = execFileSync(
+    "git",
+    ["diff", "--stat", `${baseSha}..HEAD`, "--", ".", ...REVIEW_DIFF_EXCLUDES],
+    { cwd: worktreePath, encoding: "utf8", maxBuffer: 1024 * 1024 },
+  ).trim();
+  const ecosystems = detectEcosystems(worktreePath, changedFiles);
+  const reviewAspects = classifyReviewAspects(diff, changedFiles);
+  return {
+    baseSha,
+    diff,
+    diffBytes: Buffer.byteLength(diff, "utf8"),
+    diffStat: diffStat || "(no diff stat)",
+    changedFiles,
+    reviewAspects,
+    ecosystems,
+  };
+}
+
+function detectEcosystems(
+  worktreePath: string,
+  changedFiles: string[],
+): string[] {
+  const ecosystems = new Set<string>();
+  const has = (path: string) =>
+    existsSync(join(worktreePath, path)) || changedFiles.includes(path);
+  if (has("package.json")) ecosystems.add("node");
+  if (has("pyproject.toml") || has("requirements.txt") || has("setup.py")) {
+    ecosystems.add("python");
+  }
+  if (has("go.mod")) ecosystems.add("go");
+  if (has("Cargo.toml")) ecosystems.add("rust");
+  if (has("Gemfile")) ecosystems.add("ruby");
+  if (has("composer.json")) ecosystems.add("php");
+  if (has("pom.xml") || has("build.gradle") || has("build.gradle.kts")) {
+    ecosystems.add("jvm");
+  }
+  if (has("mix.exs")) ecosystems.add("elixir");
+  if (has("Package.swift")) ecosystems.add("swift");
+  return [...ecosystems].sort();
+}
+
+function classifyReviewAspects(diff: string, changedFiles: string[]): string[] {
+  const aspects = new Set<string>(["code", "scope"]);
+  const changedLineText = diff
+    .split("\n")
+    .filter((line) => /^[+-]/.test(line) && !/^(---|\+\+\+)/.test(line))
+    .join("\n");
+
+  const testFiles = changedFiles.filter(isTestFile);
+  const sourceFiles = changedFiles.filter(isSourceFile);
+  if (testFiles.length > 0 || sourceFiles.length > 0) aspects.add("tests");
+  if (changedFiles.some(isConfigBuildFile)) aspects.add("config-build");
+  if (
+    /\b(try|catch|except|raise|throw|throws|panic!?|recover|finally|defer|Result|Err|Error|\.catch|onError|fallback|rollback|null|undefined|None|nil|unwrap|expect)\b/i.test(
+      changedLineText,
+    )
+  ) {
+    aspects.add("errors");
+  }
+  if (
+    /\b(interface|type|struct|class|enum|trait|impl|record|dataclass|TypedDict|BaseModel|schema|model|DTO|Request|Response|message|protobuf|z\.object)\b/i.test(
+      changedLineText,
+    )
+  ) {
+    aspects.add("types-contracts");
+  }
+  if (
+    /(^|\n)[+-]\s*(\/\/|#|\/\*|\*|"""|'''|--|;|<!--|\/\/\/|\/\/!)/.test(diff) ||
+    changedFiles.some((f) => /\.(md|mdx|rst|adoc|txt)$/i.test(f))
+  ) {
+    aspects.add("comments-docs");
+  }
+  if (
+    /\b(goroutine|go\s+func|chan|channel|mutex|lock|async|await|Promise|tokio|thread|spawn|context\.Context|cancel|AbortController|useEffect|cleanup|defer)\b/i.test(
+      changedLineText,
+    )
+  ) {
+    aspects.add("concurrency-lifecycle");
+  }
+  if (
+    /\b(select|insert|update|delete|migration|transaction|sql|query|db\.|database|fetch|axios|http|request|response|readFile|writeFile|open\(|fs\.|os\.)\b/i.test(
+      changedLineText,
+    )
+  ) {
+    aspects.add("persistence-io");
+  }
+  if (
+    /\b(auth|permission|role|policy|token|secret|password|session|cookie|csrf|cors|crypto|encrypt|decrypt|validate|sanitize)\b/i.test(
+      changedLineText,
+    )
+  ) {
+    aspects.add("security-auth");
+  }
+  return [...aspects].sort();
+}
+
+function isTestFile(file: string): boolean {
+  const normalized = file.toLowerCase();
   return (
-    out.slice(0, REVIEW_DIFF_MAX_BYTES) +
-    `\n\n... (diff truncated at ${REVIEW_DIFF_MAX_BYTES} bytes; ${out.length - REVIEW_DIFF_MAX_BYTES} bytes omitted)`
+    /(^|\/)(__tests__|tests?|specs?|testing)(\/|$)/.test(normalized) ||
+    /(^|\/)testdata(\/|$)/.test(normalized) ||
+    /(^|\/)test_[^/]+$/.test(normalized) ||
+    /(^|\/)[^/]+(_test|_spec)\.[^/.]+$/.test(normalized) ||
+    /(^|\/)[^/]+\.(test|spec)\.[^/.]+$/.test(normalized) ||
+    /(^|\/)[^/]+tests?\.(java|cs)$/.test(normalized)
+  );
+}
+
+function isSourceFile(file: string): boolean {
+  if (
+    /(^|\/)(node_modules|vendor|dist|build|target|\.next|\.venv|coverage)(\/|$)/.test(
+      file,
+    )
+  ) {
+    return false;
+  }
+  if (isTestFile(file) || isConfigBuildFile(file)) return false;
+  return /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|kts|cs|rb|php|c|cc|cpp|h|hpp|swift|scala|ex|exs|clj|cljs|erl|hrl|lua|dart)$/i.test(
+    file,
+  );
+}
+
+function isConfigBuildFile(file: string): boolean {
+  const base = file.split("/").pop()?.toLowerCase() ?? file.toLowerCase();
+  return (
+    [
+      "package.json",
+      "pyproject.toml",
+      "requirements.txt",
+      "setup.py",
+      "go.mod",
+      "cargo.toml",
+      "gemfile",
+      "composer.json",
+      "pom.xml",
+      "build.gradle",
+      "build.gradle.kts",
+      "makefile",
+      "dockerfile",
+      "tsconfig.json",
+      "vite.config.ts",
+      "webpack.config.js",
+      "eslint.config.js",
+      ".eslintrc",
+      ".prettierrc",
+    ].includes(base) || /\.(ya?ml|toml|json|ini|cfg|conf)$/i.test(file)
   );
 }
 
@@ -218,6 +507,61 @@ function flattenComments(comments: IssueComment[]): string {
 
 type GateResult = { ok: true } | { ok: false; feedback: string };
 
+function summarizeFailureOutput(output: string): string {
+  const lines = output
+    .split("\n")
+    .map((l) => l.replace(/\x1b\[[0-9;]*m/g, "").trimEnd())
+    .filter((l) => l.trim().length > 0);
+
+  // Wrapper noise that's not the actual error — useful for context but never
+  // the headline.
+  const isNoise = (l: string) =>
+    /^npm (error|warn|notice)\b/i.test(l) ||
+    /^\s*>\s/.test(l) ||
+    /Lifecycle script .* failed/.test(l) ||
+    /^npm error code\b/i.test(l) ||
+    /^npm error path\b/i.test(l) ||
+    /^npm error workspace\b/i.test(l) ||
+    /^npm error location\b/i.test(l) ||
+    /^npm error command\b/i.test(l);
+
+  // Patterns that almost always indicate the real failure. First-match wins;
+  // ordered roughly by specificity.
+  const errorPatterns = [
+    /error TS\d+:/i,
+    /error\[E\d+\]/,
+    /ModuleNotFoundError\b/,
+    /^Failed to resolve import\b/,
+    /^\s*Cannot find module\b/,
+    /^FAIL\s/,
+    /^\s*×\s/,
+    /^\s*✗\s/,
+    /^\s*❯\s/,
+    /\bcompilation failed\b/i,
+    /\bbuild failed\b/i,
+    /^Error:\s/,
+    /^\s*panic:\s/i,
+    /^\s*thread .* panicked\b/,
+  ];
+
+  for (const pattern of errorPatterns) {
+    const idx = lines.findIndex((l) => pattern.test(l) && !isNoise(l));
+    if (idx >= 0) {
+      return lines
+        .slice(idx, Math.min(idx + 3, lines.length))
+        .join(" | ")
+        .slice(0, 280);
+    }
+  }
+
+  // Fallback: last 3 non-noise lines.
+  const tail = lines
+    .filter((l) => !isNoise(l))
+    .slice(-3)
+    .join(" | ");
+  return tail.slice(0, 280) || "(no informative output)";
+}
+
 function runValidationGate(worktreePath: string): GateResult {
   for (const cmd of VALIDATION_COMMANDS) {
     console.log(`  $ ${cmd}`);
@@ -228,6 +572,9 @@ function runValidationGate(worktreePath: string): GateResult {
     });
     if (result.status !== 0) {
       const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+      console.log(
+        `    ✗ failed (exit ${result.status}): ${summarizeFailureOutput(output)}`,
+      );
       return {
         ok: false,
         feedback: [
@@ -252,6 +599,8 @@ function runValidationGate(worktreePath: string): GateResult {
 }
 
 interface ReviewFinding {
+  aspect?: string;
+  confidence?: number;
   severity?: string;
   file?: string;
   line?: number;
@@ -287,7 +636,9 @@ function extractReview(stdout: string): ReviewResult {
     const decision = parsed?.decision;
     if (
       typeof decision === "string" &&
-      ["approved", "changes_requested", "needs_human_review"].includes(decision) &&
+      ["approved", "changes_requested", "needs_human_review"].includes(
+        decision,
+      ) &&
       typeof parsed.summary === "string" &&
       Array.isArray(parsed.findings)
     ) {
@@ -321,23 +672,323 @@ function formatFeedback(review: ReviewResult): string {
             const loc = [f.file, f.line ? `line ${f.line}` : null]
               .filter(Boolean)
               .join(" ");
+            const meta = [
+              f.aspect ? `aspect: ${f.aspect}` : null,
+              typeof f.confidence === "number"
+                ? `confidence: ${f.confidence}`
+                : null,
+              f.severity ? `severity: ${f.severity}` : null,
+            ]
+              .filter(Boolean)
+              .join(", ");
             return [
               `### Finding ${i + 1}${loc ? ` (${loc})` : ""}`,
+              meta ? `_${meta}_` : "",
               "",
               `**Problem:** ${f.problem}`,
               "",
               `**Fix:** ${f.remediation}`,
-            ].join("\n");
+            ]
+              .filter((line) => line !== "")
+              .join("\n");
           })
           .join("\n\n");
-  return [header, "", `**Summary:** ${review.summary}`, "", findings].join("\n");
+  return [header, "", `**Summary:** ${review.summary}`, "", findings].join(
+    "\n",
+  );
+}
+
+type PrepResult =
+  | { ok: true; baseSha: string; recoveryAttempts: number }
+  | { ok: false; feedback: string; recoveryAttempts: number };
+
+function prepareBranchForReview(
+  worktreePath: string,
+  issueBranch: string,
+  recoveryAttempts: number,
+): PrepResult {
+  const baseSha = fetchOriginPrd(worktreePath);
+  const oldHead = git(["rev-parse", "HEAD"], worktreePath).trim();
+  console.log(`  rebasing ${issueBranch} onto ${originPrdRef()}`);
+  const rebase = gitSpawn(["rebase", originPrdRef()], worktreePath);
+  if (rebase.status !== 0) {
+    gitSpawn(["rebase", "--abort"], worktreePath);
+    console.log(`  rebase failed; attempting fresh branch recovery`);
+    return recoverFreshBranch(
+      worktreePath,
+      issueBranch,
+      oldHead,
+      recoveryAttempts,
+      `rebase onto ${originPrdRef()} failed`,
+      `${rebase.stdout || ""}\n${rebase.stderr || ""}`.trim(),
+    );
+  }
+
+  const mergeBase = git(
+    ["merge-base", originPrdRef(), "HEAD"],
+    worktreePath,
+  ).trim();
+  if (mergeBase !== baseSha) {
+    console.log(
+      `  branch ancestry is not clean; attempting fresh branch recovery`,
+    );
+    return recoverFreshBranch(
+      worktreePath,
+      issueBranch,
+      git(["rev-parse", "HEAD"], worktreePath).trim(),
+      recoveryAttempts,
+      `merge-base ${mergeBase} did not match reviewed base ${baseSha}`,
+      "",
+    );
+  }
+
+  return { ok: true, baseSha, recoveryAttempts };
+}
+
+function fetchOriginPrd(worktreePath?: string): string {
+  execFileSync("git", ["fetch", "origin", prdBranch], {
+    cwd: worktreePath,
+    stdio: "inherit",
+  });
+  return git(["rev-parse", originPrdRef()], worktreePath).trim();
+}
+
+function recoverFreshBranch(
+  worktreePath: string,
+  issueBranch: string,
+  oldHead: string,
+  recoveryAttempts: number,
+  reason: string,
+  detail: string,
+): PrepResult {
+  if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+    return {
+      ok: false,
+      recoveryAttempts,
+      feedback: [
+        "## Branch recovery failed",
+        "",
+        `The host tried to recover this issue branch ${MAX_RECOVERY_ATTEMPTS} time(s), but the branch still could not be prepared for validation/review.`,
+        "",
+        `Reason: ${reason}`,
+        detail ? `\nDetails:\n\`\`\`\n${detail.slice(-3000)}\n\`\`\`` : "",
+        "",
+        "Continue from the current branch state, reduce the diff to this issue's scope, resolve conflicts if present, commit, and emit `<promise>COMPLETE</promise>`.",
+      ].join("\n"),
+    };
+  }
+
+  const attempt = recoveryAttempts + 1;
+  const diagnosticBranch = `diagnostic/${issueBranch}-recovery-${attempt}`;
+  const baseSha = fetchOriginPrd(worktreePath);
+  const oldBase = git(
+    ["merge-base", originPrdRef(), oldHead],
+    worktreePath,
+  ).trim();
+  const commits = git(
+    ["rev-list", "--reverse", `${originPrdRef()}..${oldHead}`],
+    worktreePath,
+  )
+    .split("\n")
+    .map((c) => c.trim())
+    .filter(Boolean);
+
+  console.log(
+    `  recovery ${attempt}/${MAX_RECOVERY_ATTEMPTS}: replaying ${commits.length} commit(s) on ${originPrdRef()}`,
+  );
+  gitSpawn(["branch", "-f", diagnosticBranch, oldHead], worktreePath);
+  execFileSync("git", ["reset", "--hard", baseSha], {
+    cwd: worktreePath,
+    stdio: "inherit",
+  });
+
+  if (commits.length > 0) {
+    const pick = gitSpawn(["cherry-pick", ...commits], worktreePath);
+    if (pick.status === 0) {
+      return { ok: true, baseSha, recoveryAttempts: attempt };
+    }
+    gitSpawn(["cherry-pick", "--abort"], worktreePath);
+    execFileSync("git", ["reset", "--hard", baseSha], {
+      cwd: worktreePath,
+      stdio: "inherit",
+    });
+    console.log(`  cherry-pick recovery failed; trying net patch replay`);
+  }
+
+  const patch = execFileSync(
+    "git",
+    ["diff", `${oldBase}..${oldHead}`, "--", "."],
+    { cwd: worktreePath, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  );
+  if (!patch.trim()) {
+    return {
+      ok: false,
+      recoveryAttempts: attempt,
+      feedback: [
+        "## Branch recovery found no issue changes",
+        "",
+        `The branch looked polluted or stale, but replay from ${oldBase} to ${oldHead} produced an empty patch.`,
+        "",
+        "Re-read the issue, make the required scoped changes on the fresh branch, commit, and emit `<promise>COMPLETE</promise>`.",
+      ].join("\n"),
+    };
+  }
+
+  const apply = spawnSync("git", ["apply", "--3way", "--index"], {
+    cwd: worktreePath,
+    encoding: "utf8",
+    input: patch,
+  });
+  if (apply.status !== 0) {
+    execFileSync("git", ["reset", "--hard", baseSha], {
+      cwd: worktreePath,
+      stdio: "inherit",
+    });
+    return {
+      ok: false,
+      recoveryAttempts: attempt,
+      feedback: [
+        "## Branch recovery needs coder help",
+        "",
+        `The host could not replay this issue's patch onto the latest ${originPrdRef()}.`,
+        "",
+        `Reason: ${reason}`,
+        "",
+        "Patch replay output:",
+        "```",
+        `${apply.stdout || ""}\n${apply.stderr || ""}`.trim().slice(-3000),
+        "```",
+        "",
+        `A local diagnostic branch was left at \`${diagnosticBranch}\`. Continue from the fresh branch, re-apply only the issue-scoped changes, commit, and emit \`<promise>COMPLETE</promise>\`.`,
+      ].join("\n"),
+    };
+  }
+
+  execFileSync(
+    "git",
+    ["commit", "-m", `recover ${issueBranch} on latest ${prdBranch}`],
+    {
+      cwd: worktreePath,
+      stdio: "inherit",
+    },
+  );
+  return { ok: true, baseSha, recoveryAttempts: attempt };
+}
+
+function maybeRecoverOversizedOrPollutedDiff(
+  worktreePath: string,
+  issue: IssueDetail,
+  issueBranch: string,
+  context: ReviewContext,
+  recoveryAttempts: number,
+): PrepResult {
+  const tooLarge = context.diffBytes > REVIEW_DIFF_MAX_BYTES;
+  const workflowPollution = looksLikeWorkflowPollution(
+    issue,
+    context.changedFiles,
+  );
+  if (!tooLarge && !workflowPollution) {
+    return { ok: true, baseSha: context.baseSha, recoveryAttempts };
+  }
+  if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+    return {
+      ok: false,
+      recoveryAttempts,
+      feedback: tooLarge
+        ? formatDiffTooLargeFeedback(context)
+        : formatWorkflowPollutionFeedback(context),
+    };
+  }
+  const reason = tooLarge
+    ? `review diff is ${context.diffBytes} bytes, above ${REVIEW_DIFF_MAX_BYTES}`
+    : "review diff includes likely workflow-file pollution";
+  return recoverFreshBranch(
+    worktreePath,
+    issueBranch,
+    git(["rev-parse", "HEAD"], worktreePath).trim(),
+    recoveryAttempts,
+    reason,
+    context.diffStat,
+  );
+}
+
+function looksLikeWorkflowPollution(
+  issue: IssueDetail,
+  changedFiles: string[],
+): boolean {
+  const issueText = `${issue.title}\n${issue.body ?? ""}`.toLowerCase();
+  if (issueText.includes("sandcastle") || issueText.includes(".sandcastle")) {
+    return false;
+  }
+  return (
+    changedFiles.some((f) => f.startsWith(".sandcastle/")) &&
+    changedFiles.some((f) => !f.startsWith(".sandcastle/"))
+  );
+}
+
+function formatDiffTooLargeFeedback(context: ReviewContext): string {
+  return [
+    "## Diff too large",
+    "",
+    `The review diff is ${context.diffBytes} bytes, above the ${REVIEW_DIFF_MAX_BYTES} byte limit.`,
+    "",
+    "These PRD issues are expected to be small, scoped changes. Reduce scope, remove unrelated/generated changes, and commit a smaller diff.",
+    "",
+    "Changed files:",
+    "```",
+    context.changedFiles.join("\n").slice(0, 3000) || "(none)",
+    "```",
+    "",
+    "Diff stat:",
+    "```",
+    context.diffStat.slice(0, 3000),
+    "```",
+  ].join("\n");
+}
+
+function formatWorkflowPollutionFeedback(context: ReviewContext): string {
+  return [
+    "## Diff includes workflow-file pollution",
+    "",
+    "The review diff includes `.sandcastle/` workflow files alongside product files, but this issue does not appear to be about Sandcastle workflow changes.",
+    "",
+    "Remove unrelated workflow changes from the issue branch, keep only this issue's scoped product changes, commit, and emit `<promise>COMPLETE</promise>`.",
+    "",
+    "Changed files:",
+    "```",
+    context.changedFiles.join("\n").slice(0, 3000),
+    "```",
+  ].join("\n");
+}
+
+class MergeConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MergeConflictError";
+  }
+}
+
+class BaseAdvancedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BaseAdvancedError";
+  }
 }
 
 function approveAndMerge(
   issue: IssueDetail,
   worktreePath: string,
   issueBranch: string,
+  reviewedBaseSha: string,
 ): void {
+  console.log(`  verifying ${originPrdRef()} has not advanced since review`);
+  const currentBaseSha = fetchOriginPrd(worktreePath);
+  if (currentBaseSha !== reviewedBaseSha) {
+    throw new BaseAdvancedError(
+      `${originPrdRef()} advanced from reviewed base ${reviewedBaseSha} to ${currentBaseSha}. Re-validation and re-review are required before merge.`,
+    );
+  }
+
   execFileSync("git", ["push", "-u", "origin", issueBranch], {
     cwd: worktreePath,
     stdio: "inherit",
@@ -377,15 +1028,16 @@ function approveAndMerge(
     ],
     { stdio: "inherit" },
   );
-  // Fast-forward local prd-<N> so the next issue's baseBranch sees the merge.
-  const sync = spawnSync(
-    "git",
-    ["fetch", "origin", `${prdBranch}:${prdBranch}`],
-    { stdio: "inherit" },
-  );
+  // Refresh origin/<prdBranch> so the next issue's baseBranch (which uses the
+  // remote-tracking ref) sees the merge. We don't touch the local prdBranch:
+  // git refuses to update a branch that's the active HEAD in another worktree
+  // or the main repo, and we don't actually need the local ref to advance.
+  const sync = spawnSync("git", ["fetch", "origin", prdBranch], {
+    stdio: "inherit",
+  });
   if (sync.status !== 0) {
     console.warn(
-      `Could not fast-forward local ${prdBranch} after merge. Next issue may start from a stale base.`,
+      `Could not refresh origin/${prdBranch} after merge. Next issue may start from a stale base.`,
     );
   }
 }
@@ -441,6 +1093,8 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   const issueBranch = `${prdBranch}-issue-${issue.number}`;
   const issueComments = flattenComments(issue.comments);
 
+  preflightExistingIssueBranch(issue, issueBranch);
+
   const sandbox = await sandcastle.createSandbox({
     sandbox: docker({
       mounts: [
@@ -459,7 +1113,11 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       ],
     }),
     branch: issueBranch,
-    baseBranch: prdBranch,
+    // Use the remote-tracking ref as the fork point. This is always current
+    // after the post-merge `git fetch origin <prdBranch>`, and avoids relying
+    // on the local prdBranch being up-to-date (which it can't be if it's
+    // checked out in the host repo).
+    baseBranch: `origin/${prdBranch}`,
     copyToWorktree: COPY_TO_WORKTREE,
     hooks: {
       sandbox: {
@@ -471,51 +1129,174 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   let feedback = "";
   let lastFeedback = "";
   let approved = false;
+  let reviewedBaseSha = "";
+  let recoveryAttempts = 0;
+  let hostOnlyReview = false;
+  let hostOnlyReviewAttempts = 0;
 
   try {
     for (let round = 1; round <= MAX_REVIEW_ROUNDS; round++) {
-      console.log(`\n--- Round ${round}/${MAX_REVIEW_ROUNDS} for #${issue.number} ---`);
-
-      const isRework = round > 1;
-      const coderArgs: Record<string, string> = {
-        ISSUE_NUMBER: String(issue.number),
-        ISSUE_TITLE: issue.title,
-        ISSUE_BODY: issue.body || "(no body)",
-        ISSUE_COMMENTS: issueComments,
-        PRD_BODY: prdBody,
-      };
-      if (isRework) coderArgs.REVIEW_FEEDBACK = feedback;
-
-      const coderResult = await sandbox.run({
-        name: `coder #${issue.number} r${round}`,
-        agent: sandcastle.opencode(CODER_MODEL),
-        maxIterations: CODER_MAX_ITERATIONS,
-        completionSignal: "<promise>COMPLETE</promise>",
-        idleTimeoutSeconds,
-        promptFile: isRework
-          ? "./.sandcastle/rework-prompt-prd.md"
-          : "./.sandcastle/implement-prompt-prd.md",
-        promptArgs: coderArgs,
-      });
-
-      const blockedMatch = coderResult.stdout.match(
-        /<blocked>([\s\S]*?)<\/blocked>/,
+      console.log(
+        `\n--- Round ${round}/${MAX_REVIEW_ROUNDS} for #${issue.number} ---`,
       );
-      if (blockedMatch) {
-        const reason = blockedMatch[1]!.trim();
-        console.log(`  coder signaled blocked: ${reason.slice(0, 200)}`);
-        lastFeedback = `Coder signaled blocked on round ${round}:\n\n${reason}`;
-        break;
+
+      let committedCount = 0;
+      if (hostOnlyReview) {
+        console.log(
+          `  base advanced after review; re-syncing and re-reviewing without invoking coder`,
+        );
+        hostOnlyReview = false;
+        committedCount = Number.parseInt(
+          git(
+            ["rev-list", "--count", `${originPrdRef()}..HEAD`],
+            sandbox.worktreePath,
+          ).trim() || "0",
+          10,
+        );
+      } else {
+        const isRework = round > 1;
+        const coderArgs: Record<string, string> = {
+          ISSUE_NUMBER: String(issue.number),
+          ISSUE_TITLE: issue.title,
+          ISSUE_BODY: issue.body || "(no body)",
+          ISSUE_COMMENTS: issueComments,
+          PRD_BODY: prdBody,
+        };
+        if (isRework) coderArgs.REVIEW_FEEDBACK = feedback;
+
+        const coderResult = await sandbox.run({
+          name: `coder #${issue.number} r${round}`,
+          agent: sandcastle.opencode(CODER_MODEL),
+          maxIterations: CODER_MAX_ITERATIONS,
+          completionSignal: "<promise>COMPLETE</promise>",
+          idleTimeoutSeconds,
+          promptFile: isRework
+            ? "./.sandcastle/rework-prompt-prd.md"
+            : "./.sandcastle/implement-prompt-prd.md",
+          promptArgs: coderArgs,
+        });
+
+        const blockedMatch = coderResult.stdout.match(
+          /<blocked>([\s\S]*?)<\/blocked>/,
+        );
+        if (blockedMatch) {
+          const reason = blockedMatch[1]!.trim();
+          console.log(`  coder signaled blocked: ${reason.slice(0, 200)}`);
+          lastFeedback = `Coder signaled blocked on round ${round}:\n\n${reason}`;
+          break;
+        }
+
+        if (coderResult.commits.length === 0) {
+          // Distinguish "did nothing" from "edited but forgot to commit"
+          const uncommitted = git(
+            ["status", "-s"],
+            sandbox.worktreePath,
+          ).trim();
+          if (uncommitted) {
+            console.log(
+              `  coder produced no commits but worktree has uncommitted edits; feeding back commit reminder`,
+            );
+            feedback = [
+              "## You edited files but did not commit",
+              "",
+              "These files have uncommitted changes in the worktree:",
+              "",
+              "```",
+              uncommitted,
+              "```",
+              "",
+              'Edits without a commit are invisible to the host. Sandcastle only sees `git log` history, not the working tree. Run `git add <files>` and `git commit -m "<message>"` to save your work. Then re-verify and emit `<promise>COMPLETE</promise>`.',
+            ].join("\n");
+          } else {
+            console.log(
+              `  coder produced no commits and no uncommitted changes; feeding back "no commits" message`,
+            );
+            feedback =
+              "## No commits produced\n\nYour previous run finished without committing any changes. Re-read the issue and the PRD, then make the required code changes and commit them.";
+          }
+          lastFeedback = feedback;
+          continue;
+        }
+        committedCount = coderResult.commits.length;
       }
 
-      if (coderResult.commits.length === 0) {
-        feedback =
-          "## No commits produced\n\nYour previous run finished without committing any changes. Re-read the issue and the PRD, then make the required code changes and commit them.";
+      const dirty = git(["status", "-s"], sandbox.worktreePath).trim();
+      if (dirty) {
+        console.log(
+          `  branch has ${committedCount} new commit(s) but uncommitted edits remain; feeding back cleanup request`,
+        );
+        feedback = [
+          "## Uncommitted changes after commit",
+          "",
+          "Your run produced commits, but the worktree still has uncommitted changes:",
+          "",
+          "```",
+          dirty,
+          "```",
+          "",
+          "Commit the intended issue changes and revert unrelated edits. The host validates and reviews only a clean, committed branch.",
+        ].join("\n");
         lastFeedback = feedback;
         continue;
       }
 
-      console.log(`  coder committed ${coderResult.commits.length} time(s); running validation gate`);
+      console.log(
+        `  branch has ${committedCount} new commit(s); syncing branch for validation/review`,
+      );
+      const prep = prepareBranchForReview(
+        sandbox.worktreePath,
+        issueBranch,
+        recoveryAttempts,
+      );
+      recoveryAttempts = prep.recoveryAttempts;
+      if (!prep.ok) {
+        feedback = prep.feedback;
+        lastFeedback = feedback;
+        continue;
+      }
+
+      let reviewContext = computeReviewContext(
+        sandbox.worktreePath,
+        prep.baseSha,
+      );
+      const recoveryAttemptsBeforeDiffCheck = recoveryAttempts;
+      const recovery = maybeRecoverOversizedOrPollutedDiff(
+        sandbox.worktreePath,
+        issue,
+        issueBranch,
+        reviewContext,
+        recoveryAttempts,
+      );
+      recoveryAttempts = recovery.recoveryAttempts;
+      if (!recovery.ok) {
+        feedback = recovery.feedback;
+        lastFeedback = feedback;
+        continue;
+      }
+      if (
+        recovery.baseSha !== reviewContext.baseSha ||
+        recovery.recoveryAttempts !== recoveryAttemptsBeforeDiffCheck
+      ) {
+        reviewContext = computeReviewContext(
+          sandbox.worktreePath,
+          recovery.baseSha,
+        );
+      }
+      if (reviewContext.diffBytes > REVIEW_DIFF_MAX_BYTES) {
+        feedback = formatDiffTooLargeFeedback(reviewContext);
+        lastFeedback = feedback;
+        continue;
+      }
+      if (looksLikeWorkflowPollution(issue, reviewContext.changedFiles)) {
+        feedback = formatWorkflowPollutionFeedback(reviewContext);
+        lastFeedback = feedback;
+        continue;
+      }
+
+      console.log(
+        `  review diff: ${reviewContext.diffBytes} bytes, ${reviewContext.changedFiles.length} file(s), aspects: ${reviewContext.reviewAspects.join(", ")}`,
+      );
+      console.log(`  running validation gate`);
       const gate = runValidationGate(sandbox.worktreePath);
       if (!gate.ok) {
         feedback = gate.feedback;
@@ -524,7 +1305,6 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       }
 
       console.log(`  validation green; invoking reviewer`);
-      const reviewDiff = computeReviewDiff(sandbox.worktreePath);
       const reviewerResult = await sandbox.run({
         name: `reviewer #${issue.number} r${round}`,
         agent: sandcastle.opencode(REVIEWER_MODEL),
@@ -537,14 +1317,43 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
           ISSUE_BODY: issue.body || "(no body)",
           ISSUE_COMMENTS: issueComments,
           PRD_BODY: prdBody,
-          BASE_BRANCH: prdBranch,
-          DIFF: reviewDiff,
+          BASE_BRANCH: originPrdRef(),
+          REVIEW_BASE_SHA: reviewContext.baseSha,
+          DIFF: reviewContext.diff,
+          DIFF_BYTES: String(reviewContext.diffBytes),
+          DIFF_MAX_BYTES: String(REVIEW_DIFF_MAX_BYTES),
+          CHANGED_FILES: reviewContext.changedFiles.join("\n") || "(none)",
+          DIFF_STAT: reviewContext.diffStat,
+          REVIEW_ASPECTS: reviewContext.reviewAspects.join(", "),
+          ECOSYSTEMS: reviewContext.ecosystems.join(", ") || "(unknown)",
         },
       });
 
       const review = extractReview(reviewerResult.stdout);
       console.log(`  reviewer decision: ${review.decision}`);
       if (review.decision === "approved") {
+        const currentBaseSha = fetchOriginPrd(sandbox.worktreePath);
+        if (currentBaseSha !== reviewContext.baseSha) {
+          if (hostOnlyReviewAttempts < 2) {
+            hostOnlyReviewAttempts++;
+            hostOnlyReview = true;
+            round--;
+            console.log(
+              `  ${originPrdRef()} advanced after review; running host-only re-review attempt ${hostOnlyReviewAttempts}/2`,
+            );
+          } else {
+            feedback = [
+              "## Base branch keeps advancing after review",
+              "",
+              `${originPrdRef()} advanced from reviewed base ${reviewContext.baseSha} to ${currentBaseSha} after validation/review completed.`,
+              "",
+              "The host already retried re-sync/re-validation/re-review twice. Continue from the current branch and emit `<promise>COMPLETE</promise>` so the host can try again.",
+            ].join("\n");
+            lastFeedback = feedback;
+          }
+          continue;
+        }
+        reviewedBaseSha = reviewContext.baseSha;
         approved = true;
         break;
       }
@@ -553,19 +1362,68 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     }
 
     if (approved) {
-      approveAndMerge(issue, sandbox.worktreePath, issueBranch);
-      console.log(`Issue #${issue.number} merged into ${prdBranch}.`);
+      try {
+        approveAndMerge(
+          issue,
+          sandbox.worktreePath,
+          issueBranch,
+          reviewedBaseSha,
+        );
+        console.log(`Issue #${issue.number} merged into ${prdBranch}.`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `Issue #${issue.number} approved but merge step failed: ${msg.slice(0, 300)}`,
+        );
+        try {
+          markStuck(
+            issue,
+            sandbox.worktreePath,
+            issueBranch,
+            `Reviewer approved but the host could not complete the merge. Manual intervention required.\n\n${msg.slice(0, 4000)}`,
+          );
+        } catch (stuckErr) {
+          console.error(
+            `markStuck also failed for #${issue.number}: ${stuckErr instanceof Error ? stuckErr.message : stuckErr}`,
+          );
+        }
+      }
     } else {
+      const reasonHeader =
+        (lastFeedback || "(no feedback recorded)")
+          .split("\n")
+          .find((l) => l.trim().startsWith("##"))
+          ?.trim()
+          .replace(/^##\s*/, "") ?? "(no recognizable reason header)";
       console.log(
-        `Issue #${issue.number} stuck after ${MAX_REVIEW_ROUNDS} rounds.`,
+        `Issue #${issue.number} stuck after ${MAX_REVIEW_ROUNDS} rounds. Reason: ${reasonHeader}`,
       );
-      markStuck(
-        issue,
-        sandbox.worktreePath,
-        issueBranch,
-        lastFeedback || "(no feedback recorded)",
-      );
+      const preview = (lastFeedback || "")
+        .split("\n")
+        .slice(0, 12)
+        .map((l) => `    ${l}`)
+        .join("\n");
+      if (preview) {
+        console.log("  Last feedback (first 12 lines):");
+        console.log(preview);
+      }
+      try {
+        markStuck(
+          issue,
+          sandbox.worktreePath,
+          issueBranch,
+          lastFeedback || "(no feedback recorded)",
+        );
+      } catch (stuckErr) {
+        console.error(
+          `markStuck failed for #${issue.number}: ${stuckErr instanceof Error ? stuckErr.message : stuckErr}`,
+        );
+      }
     }
+  } catch (iterErr) {
+    console.error(
+      `Iteration ${iteration} for #${issue.number} crashed unexpectedly. Continuing to next issue.\n${iterErr instanceof Error ? (iterErr.stack ?? iterErr.message) : iterErr}`,
+    );
   } finally {
     await sandbox.close();
   }

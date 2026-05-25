@@ -241,9 +241,10 @@ def main():
     # rollups keyed by (prd, issue, stage, round) and (prd, issue) and (prd,)
     round_rollup = defaultdict(lambda: {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0})
 
-    # Per-issue timing: earliest session.time_created -> latest log mtime
-    issue_start_ms = {}  # (prd, issue) -> ms
-    issue_end_ms = {}
+    # Per-issue elapsed = sum of per-round elapsed. Doing it this way avoids
+    # double-counting idle gaps between retry attempts (an issue retried days
+    # apart shouldn't count as "ran for days").
+    issue_elapsed_s = defaultdict(float)  # (prd, issue) -> seconds
 
     for sid, meta in mapping.items():
         if args.prd is not None and meta["prd"] != args.prd:
@@ -254,13 +255,9 @@ def main():
         key = (meta["prd"], meta["issue"], meta["stage"], meta["round"])
         for k, v in totals.items():
             round_rollup[key][k] += v
-        ikey = (meta["prd"], meta["issue"])
-        sess_t = sessions[sid]["time_created"]
-        log_t = meta["mtime_ms"]
-        if ikey not in issue_start_ms or sess_t < issue_start_ms[ikey]:
-            issue_start_ms[ikey] = sess_t
-        if ikey not in issue_end_ms or log_t > issue_end_ms[ikey]:
-            issue_end_ms[ikey] = log_t
+        round_elapsed = (meta["mtime_ms"] - sessions[sid]["time_created"]) / 1000.0
+        if round_elapsed > 0:
+            issue_elapsed_s[(meta["prd"], meta["issue"])] += round_elapsed
 
     # Per-issue
     issue_rollup = defaultdict(lambda: {
@@ -285,8 +282,7 @@ def main():
         p["reviewer_total"] += d["reviewer_total"]
         p["coder_rounds"] += len(d["coder_rounds"])
         p["reviewer_rounds"] += len(d["reviewer_rounds"])
-        if (prd, issue) in issue_start_ms and (prd, issue) in issue_end_ms:
-            p["elapsed_s"] += (issue_end_ms[(prd, issue)] - issue_start_ms[(prd, issue)]) / 1000.0
+        p["elapsed_s"] += issue_elapsed_s.get((prd, issue), 0.0)
 
     # ---- Output ----
     if args.detail:
@@ -303,9 +299,7 @@ def main():
     for (prd, issue) in sorted(issue_rollup.keys()):
         d = issue_rollup[(prd, issue)]
         total = d["coder_total"] + d["reviewer_total"]
-        start = issue_start_ms.get((prd, issue))
-        end = issue_end_ms.get((prd, issue))
-        elapsed_s = (end - start) / 1000.0 if start and end else None
+        elapsed_s = issue_elapsed_s.get((prd, issue)) or None
         print(
             f"{prd:<5}{issue:<7}"
             f"{len(d['coder_rounds']):<11}{len(d['reviewer_rounds']):<9}"
