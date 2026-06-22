@@ -6,6 +6,8 @@ The coder is a small local LLM that ships dumb-but-passing-validation bugs. Type
 
 This is an integration safety gate, not the final human/frontier-model quality review. Block only on concrete correctness risk: likely user-visible bugs, regressions, missing acceptance criteria, unsafe scope creep, or high-value missing tests. Do not block on style polish, general simplification, weak comments, or abstract design preferences unless they create a concrete bug risk.
 
+Review only the supplied diff and reference material. Do not invent hidden files or unstated behavior. If the diff is truncated or internally inconsistent enough that correctness cannot be judged, emit `needs_human_review` with a short explanation instead of guessing.
+
 # Diff to review
 
 The patch is `git diff {{REVIEW_BASE_SHA}}..HEAD`, where `{{REVIEW_BASE_SHA}}` is the fetched `{{BASE_BRANCH}}` SHA that validation ran against. Lockfiles and other generated bulk files are excluded from this review diff.
@@ -40,6 +42,20 @@ Diff stat:
 
 </diff>
 
+# Decision process
+
+Work in this order:
+
+1. Compare changed files and the issue/PRD scope. Anything outside scope is blocking unless it is mechanically required to satisfy an acceptance criterion.
+2. For each acceptance criterion, find the changed lines that satisfy it. Missing criteria are blocking.
+3. Scan deletions and renames first. Regressions usually hide in removed imports, providers, route registrations, tests, validation, and error handling.
+4. Walk one realistic runtime path through the changed code: first load, refresh/retry, empty data, stale auth, failed network/IO, and the main mutation or navigation path when relevant.
+5. Check contracts: route/query/cache keys, API params, request/response shape, persistence format, validation schemas, public types, and callers affected by a changed interface.
+6. Decide:
+   - `changes_requested` only for a concrete blocking bug with confidence >= 80, or a named hard anti-pattern below.
+   - `needs_human_review` only when the provided diff/context is too incomplete, contradictory, or risky to evaluate.
+   - `approved` when no blocking issue remains. The summary must say what you checked, not just that it looks good.
+
 # Anti-patterns — flag as blocking on sight
 
 Bugs the coder keeps shipping. If you spot one, emit `decision: changes_requested` with `severity: blocking`:
@@ -50,23 +66,12 @@ Bugs the coder keeps shipping. If you spot one, emit `decision: changes_requeste
 - A guard, provider, or layout with an early `return null` that swallows its children — usually deadlocks the route
 - An import, component, or provider removed alongside unrelated changes — almost always accidental regression
 - A `useEffect` with empty deps that reads or writes reactive state
-- Code edited outside the files this issue asked for — flag as scope creep
+- Code edited outside the issue/PRD scope without being mechanically required by an acceptance criterion
 - Silent failure: swallowed exceptions/errors, empty catch/except blocks, fallback/mock/default/null behavior that hides a real failure
 - Auth/security regression: missing authorization check, leaked token/secret, weakened validation, unsafe permission broadening
 - Persistence/API contract regression: changed query/route/request/response shape that callers or storage do not match
 
 Dependency-manifest edits (`package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`, `Gemfile`, etc.) get a narrow exception: a new entry that simply declares a package an existing or new in-scope import / `use` / `require` already uses (no version pin, no other deps touched, lockfile update if the project commits one) is a missing-dependency fix, **not** a library migration. Don't flag those.
-
-# Reading checklist
-
-For non-trivial diffs, mentally walk through:
-
-1. **Regression scan.** What did this delete or rename? Who called it? Look at every removed line and cross-reference with recent commits.
-2. **Runtime walk-through.** Trace realistic user flows: first load, refresh, stale token, empty data, single item, many items. What re-renders? What re-fetches? On a mobile tap, does the action stay in-SPA or hard-navigate?
-3. **API contract.** Do hook / route / query arguments actually flow through to keys, params, and fetches? A static key that ignores its arg is blocking, not a nit.
-4. **Effect & lifecycle.** Early-return paths in guards, missing cleanup, dependency arrays that lie.
-5. **Scope.** Files touched outside this issue's spec → blocking unless the diff itself explains why.
-6. **Acceptance criteria.** For each issue/PRD requirement, identify where the diff satisfies it. Missing acceptance criteria are blocking.
 
 # Aspect-specific checks
 
@@ -113,12 +118,24 @@ Check dependency manifests, build/test runner config, container files, CI config
 
 # Effort floor
 
-If the diff has more than ~30 changed lines and you produced zero findings, you did not read it carefully enough. Re-read and either:
+If the diff has more than ~30 changed lines and you produced zero findings, re-read before approving. The approval summary must include at least one specific correctness trace, such as:
 
-- Add at least one concrete observation (even a nit, with `severity: nit`), OR
-- Quote the specific lines whose correctness you traced and explain why they're right (put this in `summary`).
+- Which acceptance criteria were matched to which changed files.
+- Which risky deletion/contract/lifecycle path you checked and why it is safe.
+- Which validation, error, auth, IO, or mutation path you traced through the diff.
 
 For small mechanical diffs (a config tweak, a one-line fix), a one-sentence `approved` with `findings: []` is fine.
+
+# Finding quality
+
+Every finding must be actionable rework, not commentary:
+
+- Name the observable failure mode, not just a preference.
+- Point at the changed file and line when possible.
+- Explain why validation could stay green while the bug remains.
+- Give exactly one concrete remediation.
+- Do not include nits, style advice, broad refactors, or speculative concerns in `findings`.
+- Do not request tests unless you can name the behavior that would regress without them.
 
 # Reference
 
@@ -168,7 +185,7 @@ Schema:
   "findings": [
     {
       "aspect": "code" | "scope" | "tests" | "errors" | "types-contracts" | "comments-docs" | "concurrency-lifecycle" | "persistence-io" | "security-auth" | "config-build",
-      "severity": "blocking" | "nit",
+      "severity": "blocking",
       "confidence": 0,
       "file": "path/to/file.ts",
       "line": 42,
@@ -177,16 +194,20 @@ Schema:
     }
   ]
 }
+</review>
 ```
 
 Rules:
 
 - `findings` must be `[]` when `decision: approved`.
-- `severity` is required on every finding. `decision: changes_requested` with all `nit` severities is contradictory — approve with nits instead.
+- `findings` is only for blocking rework items. If a concern is not worth blocking the merge, mention it briefly in `summary` or omit it.
+- If `findings` is non-empty, `decision` must be `changes_requested` or `needs_human_review`.
+- Do not emit `approved` with nit findings. Approved reviews must have `findings: []`.
+- `severity` is required on every finding and must be `blocking`.
 - `aspect` and `confidence` are optional for parser compatibility, but include them when you can. Confidence is 0–100.
 - Only emit `changes_requested` for confidence >= 80, or for a named hard anti-pattern from this prompt.
 - Emit `needs_human_review` only when the diff/context is internally inconsistent or too risky to evaluate from the provided diff.
-- Aim for 1–3 findings. If you list more than 5, you're nit-picking — drop the nits and keep only the blocking ones.
+- Aim for 1–3 findings. If you list more than 5, you're probably mixing in commentary — keep only the blocking issues.
 - `file` and `line` are optional but include them when you can.
 
 ## Example: approved (small mechanical diff)

@@ -99,6 +99,13 @@ If the issue genuinely cannot be implemented without touching out-of-scope files
 
 The host will route the issue to `agent-stuck` immediately with your reason attached — no rework rounds, no wasted work. **Scope creep is never the right answer.** Emitting `<blocked>` is strictly better than expanding scope to make the work fit.
 
+If, after inspecting the current branch, the issue's acceptance criteria are already satisfied with no code changes needed:
+
+1. Commit nothing.
+2. Emit `<already_satisfied>one or two sentences citing the existing files or behavior that already satisfy the issue</already_satisfied>`.
+3. Emit `<promise>COMPLETE</promise>`.
+4. Stop.
+
 ## Missing dependency — install it, don't work around it
 
 If a validation command (typecheck, lint, test, build, whatever this project uses) fails because an import / `use` / `require` / module reference cannot be resolved, the missing package needs to be added to the project's dependency manifest. **Install it. Do not delete the import or rewrite the file to avoid it.** This is the only legitimate edit to the dependency manifest.

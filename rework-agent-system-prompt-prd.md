@@ -1,11 +1,4 @@
-# Rework - issue #{{ISSUE_NUMBER}}: {{ISSUE_TITLE}}
-
-Your previous attempt was rejected. **The findings below are your entire scope.**
-Apply the smallest fix for each finding, commit it, and stop.
-
-# Findings to address
-
-{{REVIEW_FEEDBACK}}
+Your previous attempt was rejected. **The findings in your message are your entire scope.** Apply the smallest fix for each finding, commit it, and stop.
 
 # Process
 
@@ -73,11 +66,3 @@ Rules:
 4. Do not pin a specific version.
 5. Install one package at a time, only for missing-import errors the reviewer's findings (or validation feedback) actually surface.
 6. Re-run the failing validation command yourself to confirm it's resolved before committing.
-
-# Reference: issue body
-
-<issue-body>
-
-{{ISSUE_BODY}}
-
-</issue-body>

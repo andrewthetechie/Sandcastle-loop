@@ -3,6 +3,54 @@ import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import {
+  buildAgentDefinition,
+  CODE_QUALITY_AGENT_CONFIG,
+  CODER_AGENT_CONFIG,
+  DECOMPOSER_AGENT_CONFIG,
+  REVIEWER_AGENT_CONFIG,
+  REWORK_AGENT_CONFIG,
+  TWO_AXIS_AGENT_CONFIG,
+} from "./custom-agent-defs.mts";
+import { enforceArgvSizeLimit } from "./custom-agent-argv-guard.mts";
+import { renderSlimMessage } from "./custom-agent-render.mts";
+import {
+  ensureOpencodeGitExclude,
+  writeAgentDefinitionFile,
+} from "./custom-agent-worktree.mts";
+import {
+  EXTRA_CODE_REVIEW_MODEL,
+  EXTRA_DECOMPOSER_MAX_ITERATIONS,
+  EXTRA_ISSUE_DECOMPOSER_MODEL,
+  EXTRA_REVIEWER_MAX_ITERATIONS,
+  EXTRA_TWO_AXIS_REVIEW_MODEL,
+  MAX_EXTRA_REVIEW_ROUNDS,
+  REVIEW_FOLLOW_UP_LABEL,
+} from "./extra-review-config.mts";
+import {
+  writeExtraReviewRoundArtifacts,
+  type ExtraReviewPrdArtifactIdentity,
+  type ExtraReviewRoundArtifactIdentity,
+} from "./extra-review-artifacts.mts";
+import {
+  EXTRA_REVIEW_INPUT_DIFF_EXCLUDES,
+  writeCompletedBranchReviewInputs,
+} from "./extra-review-inputs.mts";
+import {
+  publishExtraReviewIssues,
+  type ExtraReviewIssueArtifactRefs,
+  type ExtraReviewIssueGhClient,
+} from "./extra-review-issues.mts";
+import {
+  runBoundedExtraReviewMainLoop,
+  type ExtraReviewRoundResult,
+  type NormalIssueIterationResult,
+} from "./extra-review-main-loop.mts";
+import type {
+  ExtraReviewBaseValidationState,
+  ExtraReviewQueueIssue,
+} from "./extra-review-queue-state.mts";
+import { runSequentialExtraReviewSessions } from "./extra-review-sessions.mts";
 import { recordMeasuredAgentRun } from "./metrics-recorder.mts";
 
 // ---------------------------------------------------------------------------
@@ -12,6 +60,26 @@ import { recordMeasuredAgentRun } from "./metrics-recorder.mts";
 // Models. Replace with the exact opencode model strings once known.
 const CODER_MODEL = "strix/qwen3.6-35b-a3b-8bit";
 const REVIEWER_MODEL = "zai-coding-plan/glm-5.1";
+const CODER_AGENT_SYSTEM_PROMPT_FILE =
+  "./.sandcastle/coder-agent-system-prompt-prd.md";
+const CODER_USER_PROMPT_FILE = "./.sandcastle/coder-user-prompt-prd.md";
+const REWORK_AGENT_SYSTEM_PROMPT_FILE =
+  "./.sandcastle/rework-agent-system-prompt-prd.md";
+const REWORK_USER_PROMPT_FILE = "./.sandcastle/rework-user-prompt-prd.md";
+const REVIEWER_AGENT_SYSTEM_PROMPT_FILE =
+  "./.sandcastle/reviewer-agent-system-prompt-prd.md";
+const REVIEWER_USER_PROMPT_FILE = "./.sandcastle/reviewer-user-prompt-prd.md";
+const CODE_QUALITY_AGENT_SYSTEM_PROMPT_FILE =
+  "./.sandcastle/code-quality-agent-system-prompt-prd.md";
+const CODE_QUALITY_USER_PROMPT_FILE =
+  "./.sandcastle/code-quality-user-prompt-prd.md";
+const TWO_AXIS_AGENT_SYSTEM_PROMPT_FILE =
+  "./.sandcastle/two-axis-agent-system-prompt-prd.md";
+const TWO_AXIS_USER_PROMPT_FILE = "./.sandcastle/two-axis-user-prompt-prd.md";
+const DECOMPOSER_AGENT_SYSTEM_PROMPT_FILE =
+  "./.sandcastle/decomposer-agent-system-prompt-prd.md";
+const DECOMPOSER_USER_PROMPT_FILE =
+  "./.sandcastle/decomposer-user-prompt-prd.md";
 
 // PRD layout
 const PRD_DIR = "docs/prd";
@@ -46,15 +114,7 @@ const SANDBOX_READY_COMMANDS: string[] = ["npm install"];
 
 // Git pathspec exclusions for the reviewer diff. Lockfiles and other
 // auto-generated bulk bloat the prompt fast and have no review value.
-const REVIEW_DIFF_EXCLUDES: string[] = [
-  ":(exclude)**/package-lock.json",
-  ":(exclude)**/yarn.lock",
-  ":(exclude)**/pnpm-lock.yaml",
-  ":(exclude)**/bun.lockb",
-  ":(exclude)**/poetry.lock",
-  ":(exclude)**/uv.lock",
-  ":(exclude)**/Cargo.lock",
-];
+const REVIEW_DIFF_EXCLUDES: string[] = [...EXTRA_REVIEW_INPUT_DIFF_EXCLUDES];
 
 // Hard cap on the reviewer diff (bytes). Linux execve argv limit is ~128KB
 // system-wide and opencode passes the whole prompt as a single CLI arg, so
@@ -72,11 +132,12 @@ const COPY_TO_WORKTREE: string[] = [];
 // CLI arg parsing
 // ---------------------------------------------------------------------------
 
+const USAGE =
+  "Usage: tsx run-prd-extra-review-custom-agents.mts --prd <N> --review-base <commit-ish> [--idle-timeout <seconds>]";
+
 const prdArgIndex = process.argv.indexOf("--prd");
 if (prdArgIndex === -1 || !process.argv[prdArgIndex + 1]) {
-  throw new Error(
-    "Usage: tsx .sandcastle/run-prd.mts --prd <N> [--idle-timeout <seconds>]",
-  );
+  throw new Error(USAGE);
 }
 const prdNumber = Number.parseInt(process.argv[prdArgIndex + 1]!, 10);
 if (!Number.isInteger(prdNumber) || prdNumber < 1) {
@@ -84,6 +145,18 @@ if (!Number.isInteger(prdNumber) || prdNumber < 1) {
     `--prd must be a positive integer, got ${process.argv[prdArgIndex + 1]}`,
   );
 }
+
+const reviewBaseArgIndex = process.argv.indexOf("--review-base");
+if (
+  reviewBaseArgIndex === -1 ||
+  !process.argv[reviewBaseArgIndex + 1] ||
+  process.argv[reviewBaseArgIndex + 1]!.startsWith("--")
+) {
+  throw new Error(
+    `${USAGE}\n\nMissing required argument: --review-base <commit-ish>`,
+  );
+}
+const extraReviewBaseArg = process.argv[reviewBaseArgIndex + 1]!;
 
 const idleArgIndex = process.argv.indexOf("--idle-timeout");
 let idleTimeoutSeconds = DEFAULT_IDLE_TIMEOUT_SECONDS;
@@ -96,6 +169,22 @@ if (idleArgIndex !== -1) {
   idleTimeoutSeconds = parsed;
 }
 console.log(`Idle timeout: ${idleTimeoutSeconds}s`);
+
+const extraReviewBaseSha = resolveExtraReviewBaseSha(extraReviewBaseArg);
+console.log(
+  `Extra review base: ${extraReviewBaseArg} -> ${extraReviewBaseSha}`,
+);
+console.log(
+  [
+    `Extra review config: rounds=${MAX_EXTRA_REVIEW_ROUNDS}`,
+    `codeReviewModel=${EXTRA_CODE_REVIEW_MODEL}`,
+    `twoAxisModel=${EXTRA_TWO_AXIS_REVIEW_MODEL}`,
+    `issueDecomposerModel=${EXTRA_ISSUE_DECOMPOSER_MODEL}`,
+    `reviewerMaxIterations=${EXTRA_REVIEWER_MAX_ITERATIONS}`,
+    `decomposerMaxIterations=${EXTRA_DECOMPOSER_MAX_ITERATIONS}`,
+    `followUpLabel=${REVIEW_FOLLOW_UP_LABEL}`,
+  ].join(", "),
+);
 
 const padded = String(prdNumber).padStart(3, "0");
 const prdLabel = `${LABEL_PREFIX}-${padded}`;
@@ -131,6 +220,26 @@ const ghJson = <T extends unknown>(args: string[]): T =>
 
 const git = (args: string[], cwd?: string): string =>
   execFileSync("git", args, { encoding: "utf8", cwd });
+
+function resolveExtraReviewBaseSha(reviewBaseArg: string): string {
+  const result = spawnSync(
+    "git",
+    ["rev-parse", "--verify", `${reviewBaseArg}^{commit}`],
+    { encoding: "utf8" },
+  );
+  const resolvedSha = (result.stdout ?? "").trim();
+  if (result.status !== 0 || !resolvedSha) {
+    throw new Error(
+      [
+        `--review-base must resolve to a commit, got ${reviewBaseArg}`,
+        `${result.stdout ?? ""}${result.stderr ?? ""}`.trim(),
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  }
+  return resolvedSha;
+}
 
 function gitSpawn(args: string[], cwd: string): ReturnType<typeof spawnSync> {
   return spawnSync("git", args, { cwd, encoding: "utf8" });
@@ -282,6 +391,7 @@ function findManagedWorktreeForBranch(branch: string): string | null {
 
 interface IssueListItem {
   number: number;
+  title?: string;
   labels: { name: string }[];
 }
 
@@ -1330,21 +1440,16 @@ function closeIssueAsAlreadySatisfied(
 ensureBaseBranch();
 let lastValidatedBaseSha = "";
 
-for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
+async function processNormalIssueIteration(context: {
+  completedIterations: number;
+}): Promise<NormalIssueIterationResult> {
+  const iteration = context.completedIterations + 1;
   console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
-
-  try {
-    lastValidatedBaseSha = ensureBaseBranchIsGreen(lastValidatedBaseSha);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Base validation failed before issue pick:\n${msg}`);
-    break;
-  }
 
   const issue = pickNextIssue();
   if (!issue) {
-    console.log(`No eligible issues with label '${prdLabel}'. Done.`);
-    break;
+    console.log(`No eligible issues with label '${prdLabel}'.`);
+    return { kind: "no_eligible_issue" };
   }
 
   console.log(`Picked issue #${issue.number}: ${issue.title}`);
@@ -1384,6 +1489,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       },
     },
   });
+  ensureOpencodeGitExclude(sandbox.worktreePath);
 
   let feedback = "";
   let lastFeedback = "";
@@ -1415,42 +1521,125 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         );
       } else {
         const isRework = round > 1;
-        const coderArgs: Record<string, string> = {
-          ISSUE_NUMBER: String(issue.number),
-          ISSUE_TITLE: issue.title,
-          ISSUE_BODY: issue.body || "(no body)",
-          ISSUE_COMMENTS: issueComments,
-          PRD_BODY: prdBody,
-        };
-        if (isRework) coderArgs.REVIEW_FEEDBACK = feedback;
+        let coderResult: Awaited<ReturnType<typeof sandbox.run>>;
 
-        const coderPromptFile = isRework
-          ? "./.sandcastle/rework-prompt-prd.md"
-          : "./.sandcastle/implement-prompt-prd.md";
-        const coderRunName = `coder #${issue.number} r${round}`;
-        const coderResult = await recordMeasuredAgentRun(
-          {
-            prd: prdNumber,
-            issue: issue.number,
-            stage: "coder",
-            round,
-            model: CODER_MODEL,
-            runName: coderRunName,
-            worktreePath: sandbox.worktreePath,
-            promptFile: coderPromptFile,
-            promptArgs: coderArgs,
-          },
-          () =>
-            sandbox.run({
-              name: coderRunName,
-              agent: sandcastle.opencode(CODER_MODEL),
-              maxIterations: CODER_MAX_ITERATIONS,
-              completionSignal: "<promise>COMPLETE</promise>",
-              idleTimeoutSeconds,
-              promptFile: coderPromptFile,
-              promptArgs: coderArgs,
-            }),
-        );
+        if (isRework) {
+          const reworkUserArgs = {
+            ISSUE_NUMBER: String(issue.number),
+            ISSUE_TITLE: issue.title,
+            ISSUE_BODY: issue.body || "(no body)",
+            REVIEW_FEEDBACK: feedback,
+          };
+          const reworkTemplate = readFileSync(
+            REWORK_USER_PROMPT_FILE.replace(/^\.\//, ""),
+            "utf8",
+          );
+          const rendered = renderSlimMessage(reworkTemplate, reworkUserArgs);
+          const sizeCheck = enforceArgvSizeLimit(rendered);
+          if (!sizeCheck.ok) {
+            feedback = sizeCheck.error;
+            lastFeedback = feedback;
+            continue;
+          }
+
+          writeAgentDefinitionFile(
+            sandbox.worktreePath,
+            REWORK_AGENT_CONFIG.name,
+            buildAgentDefinition(
+              REWORK_AGENT_CONFIG,
+              CODER_MODEL,
+              readFileSync(
+                REWORK_AGENT_SYSTEM_PROMPT_FILE.replace(/^\.\//, ""),
+                "utf8",
+              ),
+            ),
+          );
+
+          const coderRunName = `coder #${issue.number} r${round}`;
+          coderResult = await recordMeasuredAgentRun(
+            {
+              prd: prdNumber,
+              issue: issue.number,
+              stage: "coder",
+              round,
+              model: CODER_MODEL,
+              runName: coderRunName,
+              worktreePath: sandbox.worktreePath,
+              promptFile: REWORK_USER_PROMPT_FILE,
+              promptArgs: reworkUserArgs,
+            },
+            () =>
+              sandbox.run({
+                name: coderRunName,
+                agent: sandcastle.opencode(CODER_MODEL, {
+                  agent: REWORK_AGENT_CONFIG.name,
+                }),
+                maxIterations: CODER_MAX_ITERATIONS,
+                completionSignal: "<promise>COMPLETE</promise>",
+                idleTimeoutSeconds,
+                promptFile: REWORK_USER_PROMPT_FILE,
+                promptArgs: reworkUserArgs,
+              }),
+          );
+        } else {
+          const coderUserArgs = {
+            ISSUE_NUMBER: String(issue.number),
+            ISSUE_TITLE: issue.title,
+            ISSUE_BODY: issue.body || "(no body)",
+            ISSUE_COMMENTS: issueComments,
+          };
+          const coderTemplate = readFileSync(
+            CODER_USER_PROMPT_FILE.replace(/^\.\//, ""),
+            "utf8",
+          );
+          const rendered = renderSlimMessage(coderTemplate, coderUserArgs);
+          const sizeCheck = enforceArgvSizeLimit(rendered);
+          if (!sizeCheck.ok) {
+            feedback = sizeCheck.error;
+            lastFeedback = feedback;
+            continue;
+          }
+
+          writeAgentDefinitionFile(
+            sandbox.worktreePath,
+            CODER_AGENT_CONFIG.name,
+            buildAgentDefinition(
+              CODER_AGENT_CONFIG,
+              CODER_MODEL,
+              readFileSync(
+                CODER_AGENT_SYSTEM_PROMPT_FILE.replace(/^\.\//, ""),
+                "utf8",
+              ),
+            ),
+          );
+
+          const coderRunName = `coder #${issue.number} r${round}`;
+          coderResult = await recordMeasuredAgentRun(
+            {
+              prd: prdNumber,
+              issue: issue.number,
+              stage: "coder",
+              round,
+              model: CODER_MODEL,
+              runName: coderRunName,
+              worktreePath: sandbox.worktreePath,
+              promptFile: CODER_USER_PROMPT_FILE,
+              promptArgs: coderUserArgs,
+            },
+            () =>
+              sandbox.run({
+                name: coderRunName,
+                agent: sandcastle.opencode(CODER_MODEL, {
+                  agent: CODER_AGENT_CONFIG.name,
+                }),
+                maxIterations: CODER_MAX_ITERATIONS,
+                completionSignal: "<promise>COMPLETE</promise>",
+                idleTimeoutSeconds,
+                promptFile: CODER_USER_PROMPT_FILE,
+                promptArgs: coderUserArgs,
+              }),
+          );
+        }
 
         const blockedMatch = coderResult.stdout.match(
           /<blocked>([\s\S]*?)<\/blocked>/,
@@ -1611,12 +1800,11 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       }
 
       console.log(`  validation green; invoking reviewer`);
-      const reviewerPromptArgs = {
+      const reviewerUserArgs = {
         ISSUE_NUMBER: String(issue.number),
         ISSUE_TITLE: issue.title,
         ISSUE_BODY: issue.body || "(no body)",
         ISSUE_COMMENTS: issueComments,
-        PRD_BODY: prdBody,
         BASE_BRANCH: originPrdRef(),
         REVIEW_BASE_SHA: reviewContext.baseSha,
         DIFF: reviewContext.diff,
@@ -1627,6 +1815,34 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         REVIEW_ASPECTS: reviewContext.reviewAspects.join(", "),
         ECOSYSTEMS: reviewContext.ecosystems.join(", ") || "(unknown)",
       };
+      const reviewerTemplate = readFileSync(
+        REVIEWER_USER_PROMPT_FILE.replace(/^\.\//, ""),
+        "utf8",
+      );
+      const renderedReviewerMessage = renderSlimMessage(
+        reviewerTemplate,
+        reviewerUserArgs,
+      );
+      const reviewerSizeCheck = enforceArgvSizeLimit(renderedReviewerMessage);
+      if (!reviewerSizeCheck.ok) {
+        feedback = reviewerSizeCheck.error;
+        lastFeedback = feedback;
+        continue;
+      }
+
+      writeAgentDefinitionFile(
+        sandbox.worktreePath,
+        REVIEWER_AGENT_CONFIG.name,
+        buildAgentDefinition(
+          REVIEWER_AGENT_CONFIG,
+          REVIEWER_MODEL,
+          readFileSync(
+            REVIEWER_AGENT_SYSTEM_PROMPT_FILE.replace(/^\.\//, ""),
+            "utf8",
+          ),
+        ),
+      );
+
       const reviewerRunName = `reviewer #${issue.number} r${round}`;
       const reviewerResult = await recordMeasuredAgentRun(
         {
@@ -1637,17 +1853,19 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
           model: REVIEWER_MODEL,
           runName: reviewerRunName,
           worktreePath: sandbox.worktreePath,
-          promptFile: "./.sandcastle/review-prompt-prd.md",
-          promptArgs: reviewerPromptArgs,
+          promptFile: REVIEWER_USER_PROMPT_FILE,
+          promptArgs: reviewerUserArgs,
         },
         () =>
           sandbox.run({
             name: reviewerRunName,
-            agent: sandcastle.opencode(REVIEWER_MODEL),
+            agent: sandcastle.opencode(REVIEWER_MODEL, {
+              agent: REVIEWER_AGENT_CONFIG.name,
+            }),
             maxIterations: 1,
             idleTimeoutSeconds,
-            promptFile: "./.sandcastle/review-prompt-prd.md",
-            promptArgs: reviewerPromptArgs,
+            promptFile: REVIEWER_USER_PROMPT_FILE,
+            promptArgs: reviewerUserArgs,
           }),
       );
 
@@ -1773,6 +1991,370 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   } finally {
     await sandbox.close();
   }
+
+  return { kind: "processed_issue", issueNumber: issue.number };
 }
+
+function listOpenPrdIssuesForExtraReview(): ExtraReviewQueueIssue[] {
+  return ghJson<IssueListItem[]>([
+    "issue",
+    "list",
+    "--label",
+    prdLabel,
+    "--state",
+    "open",
+    "--json",
+    "number,title,labels",
+    "--limit",
+    "200",
+  ]).map((issue) => ({
+    number: issue.number,
+    title: issue.title,
+    labels: issue.labels,
+  }));
+}
+
+function validateBaseForExtraReview(): ExtraReviewBaseValidationState {
+  try {
+    lastValidatedBaseSha = ensureBaseBranchIsGreen(lastValidatedBaseSha);
+    return { ok: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Base validation failed before issue pick:\n${msg}`);
+    return {
+      ok: false,
+      summary: "Base validation failed before issue pick.",
+      feedback: msg,
+    };
+  }
+}
+
+function currentReviewedPrdHeadSha(): string {
+  const result = spawnSync(
+    "git",
+    ["rev-parse", "--verify", `${originPrdRef()}^{commit}`],
+    { encoding: "utf8" },
+  );
+  const sha = (result.stdout ?? "").trim();
+  if (result.status === 0 && sha) return sha;
+  return git(["rev-parse", "HEAD"]).trim();
+}
+
+async function runExtraReviewRound(input: {
+  round: ExtraReviewRoundArtifactIdentity & { number: number };
+}): Promise<ExtraReviewRoundResult> {
+  const reviewedHeadSha = currentReviewedPrdHeadSha();
+  const round = extraReviewRoundIdentity(input.round.number, reviewedHeadSha);
+  const prd = prdArtifactIdentity();
+
+  try {
+    console.log(
+      `\n=== Extra Review Round ${round.number}/${MAX_EXTRA_REVIEW_ROUNDS} ===\n`,
+    );
+    console.log(
+      `Reviewing ${extraReviewBaseSha.slice(0, 7)}..${reviewedHeadSha.slice(0, 7)} on ${prdBranch}`,
+    );
+
+    const reviewInputs = writeCompletedBranchReviewInputs({
+      prd: {
+        number: prdNumber,
+        label: prdLabel,
+        branch: prdBranch,
+        path: prdPath,
+        title: prd.title,
+        body: prdBody,
+      },
+      round,
+      originalReviewBaseArg: extraReviewBaseArg,
+      resolvedReviewBaseSha: extraReviewBaseSha,
+      reviewedHeadSha,
+    });
+
+    const sessions = await runSequentialExtraReviewSessions({
+      prd,
+      round,
+      reviewInputs,
+      completedPrdBranch: prdBranch,
+      sandboxBaseBranch: originPrdRef(),
+      idleTimeoutSeconds,
+      copyToWorktree: COPY_TO_WORKTREE,
+      hooks: sandboxReadyHooks(),
+      createSandbox: (sandboxInput) =>
+        sandcastle.createSandbox({
+          sandbox: docker({
+            mounts: [
+              {
+                hostPath: "~/.config/opencode",
+                sandboxPath: "~/.config/opencode",
+                readonly: true,
+              },
+              {
+                hostPath: "~/.local/share/opencode",
+                sandboxPath: "~/.local/share/opencode",
+              },
+            ],
+          }),
+          branch: sandboxInput.branch,
+          baseBranch: sandboxInput.baseBranch,
+          copyToWorktree: sandboxInput.copyToWorktree,
+          hooks: sandboxInput.hooks,
+        }),
+      createAgent: (model, agentName) =>
+        agentName
+          ? sandcastle.opencode(model, { agent: agentName })
+          : sandcastle.opencode(model),
+      sessionAgents: {
+        code_quality: {
+          agentName: CODE_QUALITY_AGENT_CONFIG.name,
+          promptFile: CODE_QUALITY_USER_PROMPT_FILE,
+        },
+        two_axis: {
+          agentName: TWO_AXIS_AGENT_CONFIG.name,
+          promptFile: TWO_AXIS_USER_PROMPT_FILE,
+        },
+        issue_decomposer: {
+          agentName: DECOMPOSER_AGENT_CONFIG.name,
+          promptFile: DECOMPOSER_USER_PROMPT_FILE,
+        },
+      },
+      writeAgentDefinition: ({ worktreePath, session, agentName }) => {
+        ensureOpencodeGitExclude(worktreePath);
+
+        const spec = {
+          code_quality: {
+            config: CODE_QUALITY_AGENT_CONFIG,
+            model: EXTRA_CODE_REVIEW_MODEL,
+            system: CODE_QUALITY_AGENT_SYSTEM_PROMPT_FILE,
+          },
+          two_axis: {
+            config: TWO_AXIS_AGENT_CONFIG,
+            model: EXTRA_TWO_AXIS_REVIEW_MODEL,
+            system: TWO_AXIS_AGENT_SYSTEM_PROMPT_FILE,
+          },
+          issue_decomposer: {
+            config: DECOMPOSER_AGENT_CONFIG,
+            model: EXTRA_ISSUE_DECOMPOSER_MODEL,
+            system: DECOMPOSER_AGENT_SYSTEM_PROMPT_FILE,
+          },
+        }[session];
+
+        writeAgentDefinitionFile(
+          worktreePath,
+          agentName,
+          buildAgentDefinition(
+            spec.config,
+            spec.model,
+            readFileSync(spec.system.replace(/^\.\//, ""), "utf8"),
+          ),
+        );
+      },
+    });
+
+    if (sessions.stopReason !== "success") {
+      console.log(
+        `Extra review round ${round.number} stopped with ${sessions.stopReason}. Handoff: ${sessions.artifactWrite.paths.files.handoff}`,
+      );
+      return {
+        stopReason: sessions.stopReason,
+        createdIssueCount: 0,
+        skippedDuplicateIssueCount: 0,
+        artifactWrite: sessions.artifactWrite,
+      };
+    }
+
+    const decomposition = sessions.outputs.issueDecomposer?.parsed;
+    if (!decomposition) {
+      const artifactWrite = writeExtraReviewRoundArtifacts({
+        runsRootDir: reviewInputs.paths.runsRootDir,
+        prd,
+        round,
+        reviewBase: extraReviewBaseSha,
+        reviewedHead: reviewedHeadSha,
+        stopReason: "failure",
+        stopDetails: ["Issue decomposer output was missing after a success round."],
+        outputs: sessions.outputs,
+      });
+      return {
+        stopReason: "failure",
+        createdIssueCount: 0,
+        skippedDuplicateIssueCount: 0,
+        artifactWrite,
+      };
+    }
+
+    const publication = publishExtraReviewIssues({
+      decomposition,
+      context: {
+        prd: {
+          number: prdNumber,
+          label: prdLabel,
+          path: prdPath,
+          title: prd.title,
+        },
+        round,
+        originalReviewBaseArg: extraReviewBaseArg,
+        resolvedReviewBaseSha: extraReviewBaseSha,
+        reviewedHeadSha,
+        artifactRefs: artifactRefsFromRound(sessions.artifactWrite.paths),
+        reviewFollowUpLabel: REVIEW_FOLLOW_UP_LABEL,
+      },
+      gh: extraReviewGhClient(),
+    });
+
+    const artifactWrite = writeExtraReviewRoundArtifacts({
+      runsRootDir: reviewInputs.paths.runsRootDir,
+      prd,
+      round,
+      reviewBase: extraReviewBaseSha,
+      reviewedHead: reviewedHeadSha,
+      stopReason: publication.stopReason,
+      outputs: sessions.outputs,
+      createdIssues: publication.createdIssues,
+      skippedDuplicateIssues: publication.skippedDuplicateIssues,
+    });
+
+    console.log(
+      [
+        `Extra review round ${round.number} publication: ${publication.stopReason}.`,
+        `Created: ${publication.createdIssues.length}.`,
+        `Skipped duplicates: ${publication.skippedDuplicateIssues.length}.`,
+        `Handoff: ${artifactWrite.paths.files.handoff}`,
+      ].join(" "),
+    );
+
+    return {
+      stopReason: publication.stopReason,
+      createdIssueCount: publication.createdIssues.length,
+      skippedDuplicateIssueCount: publication.skippedDuplicateIssues.length,
+      artifactWrite,
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
+    console.error(`Extra review round ${round.number} failed:\n${msg}`);
+    const artifactWrite = writeExtraReviewRoundArtifacts({
+      prd,
+      round,
+      reviewBase: extraReviewBaseSha,
+      reviewedHead: reviewedHeadSha,
+      stopReason: "failure",
+      stopDetails: [msg.slice(0, 4000)],
+    });
+    return {
+      stopReason: "failure",
+      createdIssueCount: 0,
+      skippedDuplicateIssueCount: 0,
+      artifactWrite,
+    };
+  }
+}
+
+function prdArtifactIdentity(): ExtraReviewPrdArtifactIdentity {
+  return {
+    number: prdNumber,
+    label: prdLabel,
+    path: prdPath,
+    title: prdTitle(),
+  };
+}
+
+function prdTitle(): string | undefined {
+  return prdBody.match(/^#\s+(.+)$/m)?.[1]?.trim();
+}
+
+function extraReviewRoundIdentity(
+  roundNumber: number,
+  reviewedHeadSha: string,
+): ExtraReviewRoundArtifactIdentity & { number: number } {
+  return {
+    number: roundNumber,
+    id: `round-${String(roundNumber).padStart(2, "0")}-head-${reviewedHeadSha.slice(0, 7)}`,
+  };
+}
+
+function sandboxReadyHooks() {
+  return {
+    sandbox: {
+      onSandboxReady: SANDBOX_READY_COMMANDS.map((command) => ({ command })),
+    },
+  };
+}
+
+function artifactRefsFromRound(
+  paths: ReturnType<typeof writeExtraReviewRoundArtifacts>["paths"],
+): ExtraReviewIssueArtifactRefs {
+  return {
+    roundDir: paths.roundDir,
+    codeReviewRaw: paths.files.codeReviewRaw,
+    codeReviewParsed: paths.files.codeReviewParsed,
+    twoAxisReviewRaw: paths.files.twoAxisReviewRaw,
+    twoAxisReviewParsed: paths.files.twoAxisReviewParsed,
+    issueDecomposerRaw: paths.files.issueDecomposerRaw,
+    issueDecomposerParsed: paths.files.issueDecomposerParsed,
+    handoff: paths.files.handoff,
+  };
+}
+
+function extraReviewGhClient(): ExtraReviewIssueGhClient {
+  return {
+    listIssues(args) {
+      return ghJson([...args]);
+    },
+    viewIssue(args) {
+      return ghJson([...args]);
+    },
+    createIssue(args) {
+      const url = gh([...args]).trim();
+      return { url };
+    },
+    ensureLabel(name, description, color) {
+      const existing = ghJson<{ name: string }[]>([
+        "label",
+        "list",
+        "--json",
+        "name",
+        "--limit",
+        "1000",
+      ]);
+      if (existing.some((label) => label.name === name)) return;
+      gh([
+        "label",
+        "create",
+        name,
+        "--color",
+        color ?? "5319e7",
+        "--description",
+        description ?? "",
+      ]);
+    },
+  };
+}
+
+const mainLoopResult = await runBoundedExtraReviewMainLoop({
+  prd: prdArtifactIdentity(),
+  reviewBase: extraReviewBaseSha,
+  maxIterations: MAX_ITERATIONS,
+  maxExtraReviewRounds: MAX_EXTRA_REVIEW_ROUNDS,
+  listOpenIssues: listOpenPrdIssuesForExtraReview,
+  validateBase: validateBaseForExtraReview,
+  getReviewedHead: currentReviewedPrdHeadSha,
+  runNormalIssueIteration: processNormalIssueIteration,
+  runExtraReviewRound,
+});
+
+console.log(
+  [
+    "\nLoop stopped.",
+    `Reason: ${mainLoopResult.reason}`,
+    `Normal issue iterations: ${mainLoopResult.completedIterations}/${MAX_ITERATIONS}`,
+    `Extra review rounds: ${mainLoopResult.completedExtraReviewRounds}/${MAX_EXTRA_REVIEW_ROUNDS}`,
+    `Created follow-up issues: ${mainLoopResult.createdIssueCount}`,
+    `Skipped duplicate follow-up issues: ${mainLoopResult.skippedDuplicateIssueCount}`,
+    mainLoopResult.artifactWrite
+      ? `Handoff: ${mainLoopResult.artifactWrite.paths.files.handoff}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n"),
+);
 
 console.log("\nAll done.");

@@ -1,0 +1,20 @@
+<extra_review>
+{
+  "reviewer": "code_quality",
+  "decision": "followup_recommended",
+  "summary": "Code-quality review found one maintainability follow-up.",
+  "findings": [
+    {
+      "id": "CQ-001",
+      "severity": "major",
+      "confidence": 90,
+      "title": "Extract review orchestration helper",
+      "problem": "Session orchestration is duplicated in a large runner.",
+      "impact": "Future PRD review changes will be fragile.",
+      "recommendation": "Move the sequence into a focused helper.",
+      "files": ["run-prd-extra-reviews.mts"],
+      "source": "code_quality"
+    }
+  ]
+}
+</extra_review>
