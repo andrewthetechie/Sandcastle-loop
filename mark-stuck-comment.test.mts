@@ -56,3 +56,16 @@ test("host headline bypasses round-based copy", () => {
   assert.match(body, /^Reviewer approved but the host could not complete the merge/);
   assert.doesNotMatch(body, /review round/);
 });
+
+test("reviewer parse failure preserves operator-facing headline and feedback", () => {
+  const body = formatStuckIssueComment({
+    headline:
+      "Reviewer attempts exhausted without a valid review verdict (parse failure).",
+    lastFeedback:
+      "## Reviewer parse failure\n\nAttempt 2/2\nFailure code: invalid_json\nLog: /tmp/reviewer.log",
+  });
+
+  assert.match(body, /parse failure/);
+  assert.match(body, /Failure code: invalid_json/);
+  assert.match(body, /\/tmp\/reviewer\.log/);
+});

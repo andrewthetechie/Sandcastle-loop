@@ -3,9 +3,8 @@ import { test } from "node:test";
 import {
   initialLivelockDetectorState,
   initialNoProgressState,
+  observeFailedRoundFingerprint,
   observeNormalizedToolCall,
-  observeReviewDiff,
-  observeValidationFailure,
   toolCallIdentity,
   toolCallIdentityKey,
   type WorktreeProgressSnapshot,
@@ -18,48 +17,85 @@ function snapshot(
   return { head, porcelainStatus };
 }
 
-test("first review diff seeds state without stalling", () => {
-  const r = observeReviewDiff(initialNoProgressState(), "diff-a", 1);
+test("first failed-round fingerprint seeds state without stalling", () => {
+  const r = observeFailedRoundFingerprint(
+    initialNoProgressState(),
+    {
+      diffHash: "diff-a",
+      source: "validation",
+      signatureHash: "sig-a",
+      signatureSummary: "npm run test :: boom",
+    },
+    3,
+  );
   assert.equal(r.stalled, false);
-  assert.equal(r.state.diffStreak, 0);
+  assert.equal(r.state.repeatCount, 0);
 });
 
-test("identical review diff stalls at the limit", () => {
+test("three identical repeats after the seed stall at the limit", () => {
   let state = initialNoProgressState();
-  ({ state } = observeReviewDiff(state, "diff-a", 1)); // seed
-  const r = observeReviewDiff(state, "diff-a", 1); // repeat
+  for (let i = 0; i < 3; i++) {
+    const seeded = observeFailedRoundFingerprint(
+      state,
+      {
+        diffHash: "diff-a",
+        source: "validation",
+        signatureHash: "sig-a",
+        signatureSummary: "npm run test :: boom",
+      },
+      3,
+    );
+    state = seeded.state;
+    assert.equal(seeded.stalled, false);
+  }
+  const r = observeFailedRoundFingerprint(
+    state,
+    {
+      diffHash: "diff-a",
+      source: "validation",
+      signatureHash: "sig-a",
+      signatureSummary: "npm run test :: boom",
+    },
+    3,
+  );
   assert.equal(r.stalled, true);
-  assert.equal(r.state.diffStreak, 1);
+  assert.equal(r.state.repeatCount, 3);
 });
 
-test("a changed review diff resets the streak", () => {
+test("a changed diff, source, or signature resets the failed-round streak", () => {
   let state = initialNoProgressState();
-  ({ state } = observeReviewDiff(state, "diff-a", 1));
-  ({ state } = observeReviewDiff(state, "diff-a", 1)); // would stall, but caller bails
-  const r = observeReviewDiff(state, "diff-b", 1); // progress
+  ({ state } = observeFailedRoundFingerprint(
+    state,
+    {
+      diffHash: "diff-a",
+      source: "validation",
+      signatureHash: "sig-a",
+      signatureSummary: "first",
+    },
+    3,
+  ));
+  ({ state } = observeFailedRoundFingerprint(
+    state,
+    {
+      diffHash: "diff-a",
+      source: "validation",
+      signatureHash: "sig-a",
+      signatureSummary: "first",
+    },
+    3,
+  ));
+  const r = observeFailedRoundFingerprint(
+    state,
+    {
+      diffHash: "diff-b",
+      source: "reviewer_changes_requested",
+      signatureHash: "sig-b",
+      signatureSummary: "second",
+    },
+    3,
+  );
   assert.equal(r.stalled, false);
-  assert.equal(r.state.diffStreak, 0);
-});
-
-test("validation failure stalls only after the limit", () => {
-  let state = initialNoProgressState();
-  let r = observeValidationFailure(state, "tsc :: error TS2345", 2);
-  state = r.state;
-  assert.equal(r.stalled, false); // seed
-  r = observeValidationFailure(state, "tsc :: error TS2345", 2);
-  state = r.state;
-  assert.equal(r.stalled, false); // streak 1, limit 2
-  r = observeValidationFailure(state, "tsc :: error TS2345", 2);
-  assert.equal(r.stalled, true); // streak 2 >= 2
-});
-
-test("a different validation signature resets the streak", () => {
-  let state = initialNoProgressState();
-  ({ state } = observeValidationFailure(state, "sig-a", 2));
-  ({ state } = observeValidationFailure(state, "sig-a", 2));
-  const r = observeValidationFailure(state, "sig-b", 2);
-  assert.equal(r.stalled, false);
-  assert.equal(r.state.validationStreak, 0);
+  assert.equal(r.state.repeatCount, 0);
 });
 
 test("tool call identity normalizes tool name case and argument whitespace", () => {

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   buildIssueOutcomeRecord,
   buildMeasuredAgentRunRecord,
+  buildReviewerResultRecord,
   buildValidationRunRecord,
 } from "./metrics-recorder.mts";
 
@@ -131,4 +132,51 @@ test("buildIssueOutcomeRecord records stuck_livelock outcome", () => {
   assert.equal(record.outcome, "stuck_livelock");
   assert.equal(record.rounds_used, 2);
   assert.equal(record.issue, 14);
+});
+
+test("buildIssueOutcomeRecord records reviewer terminal outcomes distinctly", () => {
+  const parseFailure = buildIssueOutcomeRecord({
+    prd: 3,
+    issue: 14,
+    outcome: "stuck_reviewer_parse_failure",
+    roundsUsed: 2,
+  });
+  assert.equal(parseFailure.outcome, "stuck_reviewer_parse_failure");
+
+  const incomplete = buildIssueOutcomeRecord({
+    prd: 3,
+    issue: 14,
+    outcome: "stuck_reviewer_incomplete",
+    roundsUsed: 2,
+  });
+  assert.equal(incomplete.outcome, "stuck_reviewer_incomplete");
+
+  const humanReview = buildIssueOutcomeRecord({
+    prd: 3,
+    issue: 14,
+    outcome: "stuck_needs_human_review",
+    roundsUsed: 1,
+  });
+  assert.equal(humanReview.outcome, "stuck_needs_human_review");
+});
+
+test("buildReviewerResultRecord captures attempt metadata and result source", () => {
+  const record = buildReviewerResultRecord({
+    prd: 3,
+    issue: 14,
+    round: 2,
+    attempt: 2,
+    maxAttempts: 3,
+    status: "changes_requested",
+    resultSource: "run_log",
+    logFallbackUsed: true,
+    logFilePath: "/tmp/reviewer.log",
+  });
+
+  assert.equal(record.kind, "sandcastle_reviewer_result");
+  assert.equal(record.status, "changes_requested");
+  assert.equal(record.result_source, "run_log");
+  assert.equal(record.log_fallback_used, true);
+  assert.equal(record.attempt, 2);
+  assert.equal(record.max_attempts, 3);
 });

@@ -31,6 +31,9 @@ export interface SandcastleLoopConfig {
   validationCommands?: string[];
   setupCommands?: string[];
   cache?: SandcastleLoopCacheConfig;
+  reviewer?: {
+    maxAttempts?: number;
+  };
 }
 
 export interface ResolvedSandcastleLoopCacheMount {
@@ -45,6 +48,9 @@ export interface ResolvedSandcastleLoopConfig {
   models: SandcastleLoopRoleModels;
   validationCommands: string[];
   setupCommands: string[];
+  reviewer: {
+    maxAttempts: number;
+  };
   cache: {
     root: string;
     mounts: ResolvedSandcastleLoopCacheMount[];
@@ -72,6 +78,7 @@ const DEFAULT_VALIDATION_COMMANDS = [
 ];
 
 const DEFAULT_SETUP_COMMANDS = ["npm install"];
+const DEFAULT_REVIEWER_MAX_ATTEMPTS = 2;
 
 export async function loadSandcastleLoopConfig(
   repoRoot: string,
@@ -104,6 +111,10 @@ export async function loadSandcastleLoopConfig(
     validationCommands:
       userConfig.validationCommands ?? [...DEFAULT_VALIDATION_COMMANDS],
     setupCommands: userConfig.setupCommands ?? [...DEFAULT_SETUP_COMMANDS],
+    reviewer: {
+      maxAttempts:
+        userConfig.reviewer?.maxAttempts ?? DEFAULT_REVIEWER_MAX_ATTEMPTS,
+    },
     cache: {
       root: cacheRoot,
       mounts,
@@ -225,6 +236,24 @@ function validateConfig(
   }
   if (config.setupCommands !== undefined && !isStringArray(config.setupCommands)) {
     throw new Error(`${configPath}: setupCommands must be a string array`);
+  }
+  if (config.reviewer !== undefined) {
+    if (!isRecord(config.reviewer)) {
+      throw new Error(`${configPath}: reviewer must be an object`);
+    }
+    if (config.reviewer.maxAttempts !== undefined) {
+      const maxAttempts = config.reviewer.maxAttempts;
+      if (
+        typeof maxAttempts !== "number" ||
+        !Number.isInteger(maxAttempts) ||
+        maxAttempts < 1 ||
+        maxAttempts > 5
+      ) {
+        throw new Error(
+          `${configPath}: reviewer.maxAttempts must be an integer from 1 through 5`,
+        );
+      }
+    }
   }
   if (config.cache !== undefined) {
     if (!isRecord(config.cache)) {

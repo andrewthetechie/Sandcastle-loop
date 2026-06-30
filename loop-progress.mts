@@ -1,18 +1,31 @@
 import { createHash } from "node:crypto";
 
+export type FailedRoundSource =
+  | "validation"
+  | "reviewer_changes_requested"
+  | "workflow_pollution"
+  | "diff_too_large"
+  | "branch_hygiene"
+  | "missing_commit"
+  | "host_input_limit"
+  | "livelock";
+
+export interface FailedRoundFingerprint {
+  diffHash: string;
+  source: FailedRoundSource;
+  signatureHash: string;
+  signatureSummary: string;
+}
+
 export interface NoProgressState {
-  lastDiffHash: string | null;
-  diffStreak: number;
-  lastValidationSignature: string | null;
-  validationStreak: number;
+  lastFailedFingerprint: FailedRoundFingerprint | null;
+  repeatCount: number;
 }
 
 export function initialNoProgressState(): NoProgressState {
   return {
-    lastDiffHash: null,
-    diffStreak: 0,
-    lastValidationSignature: null,
-    validationStreak: 0,
+    lastFailedFingerprint: null,
+    repeatCount: 0,
   };
 }
 
@@ -110,49 +123,65 @@ export function observeNormalizedToolCall(
   };
 }
 
-function sha1(value: string): string {
+export function sha1(value: string): string {
   return createHash("sha1").update(value).digest("hex");
 }
 
-/**
- * Observe the review diff for a round. Stalls when the coder reproduces an
- * identical net diff `stallLimit` times in a row (i.e. it is not responding to
- * feedback). Returns the next state and whether to bail.
- */
+export function observeFailedRoundFingerprint(
+  state: NoProgressState,
+  fingerprint: FailedRoundFingerprint,
+  repeatLimit: number,
+): { state: NoProgressState; stalled: boolean } {
+  if (
+    state.lastFailedFingerprint &&
+    state.lastFailedFingerprint.diffHash === fingerprint.diffHash &&
+    state.lastFailedFingerprint.source === fingerprint.source &&
+    state.lastFailedFingerprint.signatureHash === fingerprint.signatureHash
+  ) {
+    const repeatCount = state.repeatCount + 1;
+    return {
+      state: { ...state, repeatCount },
+      stalled: repeatCount >= repeatLimit,
+    };
+  }
+  return {
+    state: { lastFailedFingerprint: fingerprint, repeatCount: 0 },
+    stalled: false,
+  };
+}
+
+// Backward-compatible wrappers for older runner variants. New code should use
+// observeFailedRoundFingerprint with an explicit source and signature.
 export function observeReviewDiff(
   state: NoProgressState,
   diff: string,
   stallLimit: number,
 ): { state: NoProgressState; stalled: boolean } {
-  const diffHash = sha1(diff);
-  if (state.lastDiffHash === diffHash) {
-    const diffStreak = state.diffStreak + 1;
-    return { state: { ...state, diffStreak }, stalled: diffStreak >= stallLimit };
-  }
-  return {
-    state: { ...state, lastDiffHash: diffHash, diffStreak: 0 },
-    stalled: false,
-  };
+  return observeFailedRoundFingerprint(
+    state,
+    {
+      diffHash: sha1(diff),
+      source: "reviewer_changes_requested",
+      signatureHash: sha1(diff),
+      signatureSummary: "legacy review diff repeat",
+    },
+    stallLimit,
+  );
 }
 
-/**
- * Observe a validation failure signature for a round. Stalls when the same
- * failure recurs `stallLimit` times in a row.
- */
 export function observeValidationFailure(
   state: NoProgressState,
   signature: string,
   stallLimit: number,
 ): { state: NoProgressState; stalled: boolean } {
-  if (state.lastValidationSignature === signature) {
-    const validationStreak = state.validationStreak + 1;
-    return {
-      state: { ...state, validationStreak },
-      stalled: validationStreak >= stallLimit,
-    };
-  }
-  return {
-    state: { ...state, lastValidationSignature: signature, validationStreak: 0 },
-    stalled: false,
-  };
+  return observeFailedRoundFingerprint(
+    state,
+    {
+      diffHash: sha1("legacy-validation"),
+      source: "validation",
+      signatureHash: sha1(signature),
+      signatureSummary: signature,
+    },
+    stallLimit,
+  );
 }

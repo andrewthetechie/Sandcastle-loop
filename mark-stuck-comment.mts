@@ -1,6 +1,9 @@
 export type StuckTerminalReason =
   | "stuck_rounds_exhausted"
   | "stuck_no_progress"
+  | "stuck_reviewer_parse_failure"
+  | "stuck_reviewer_incomplete"
+  | "stuck_needs_human_review"
   | "stuck_livelock"
   | "blocked";
 
@@ -29,6 +32,21 @@ export function formatStuckIssueComment(
     intro = headline;
   } else if (terminalReason === "stuck_no_progress" && roundsUsed != null) {
     intro = `Agent stopped early after round ${roundsUsed} (no progress).`;
+  } else if (
+    terminalReason === "stuck_reviewer_parse_failure" &&
+    roundsUsed != null
+  ) {
+    intro = `Reviewer parse failed after round ${roundsUsed}; manual review required.`;
+  } else if (
+    terminalReason === "stuck_reviewer_incomplete" &&
+    roundsUsed != null
+  ) {
+    intro = `Reviewer did not return a complete verdict after round ${roundsUsed}; manual review required.`;
+  } else if (
+    terminalReason === "stuck_needs_human_review" &&
+    roundsUsed != null
+  ) {
+    intro = `Reviewer requested human review on round ${roundsUsed}.`;
   } else if (terminalReason === "blocked" && roundsUsed != null) {
     intro = `Coder signaled blocked on round ${roundsUsed}.`;
   } else if (terminalReason === "stuck_livelock" && roundsUsed != null) {

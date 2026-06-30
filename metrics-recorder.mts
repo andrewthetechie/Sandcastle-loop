@@ -175,6 +175,9 @@ export interface IssueOutcomeMetadata {
     | "already_satisfied"
     | "stuck_rounds_exhausted"
     | "stuck_no_progress"
+    | "stuck_reviewer_parse_failure"
+    | "stuck_reviewer_incomplete"
+    | "stuck_needs_human_review"
     | "stuck_livelock"
     | "blocked"
     | "crashed";
@@ -197,4 +200,46 @@ export function buildIssueOutcomeRecord(
 
 export function recordIssueOutcome(metadata: IssueOutcomeMetadata): void {
   appendMetricRecord(buildIssueOutcomeRecord(metadata));
+}
+
+export interface ReviewerResultMetadata {
+  prd: number | string;
+  issue: number;
+  round: number;
+  attempt: number;
+  maxAttempts: number;
+  status:
+    | "approved"
+    | "changes_requested"
+    | "needs_human_review"
+    | "parse_failed"
+    | "incomplete";
+  resultSource: "stdout" | "run_log" | "none";
+  logFallbackUsed: boolean;
+  logFilePath?: string;
+  parseFailureCode?: string;
+}
+
+export function buildReviewerResultRecord(
+  metadata: ReviewerResultMetadata,
+): Record<string, unknown> {
+  return {
+    kind: "sandcastle_reviewer_result",
+    schema_version: 1,
+    prd: metadata.prd,
+    issue: metadata.issue,
+    round: metadata.round,
+    attempt: metadata.attempt,
+    max_attempts: metadata.maxAttempts,
+    status: metadata.status,
+    result_source: metadata.resultSource,
+    log_fallback_used: metadata.logFallbackUsed,
+    parse_failure_code: metadata.parseFailureCode,
+    log_file_path: metadata.logFilePath,
+    recorded_at: new Date().toISOString(),
+  };
+}
+
+export function recordReviewerResult(metadata: ReviewerResultMetadata): void {
+  appendMetricRecord(buildReviewerResultRecord(metadata));
 }
