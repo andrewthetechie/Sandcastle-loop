@@ -5,6 +5,7 @@ export type StuckTerminalReason =
   | "stuck_reviewer_incomplete"
   | "stuck_needs_human_review"
   | "stuck_livelock"
+  | "stuck_rebase_conflict"
   | "blocked";
 
 export interface FormatStuckIssueCommentInput {
@@ -51,6 +52,9 @@ export function formatStuckIssueComment(
     intro = `Coder signaled blocked on round ${roundsUsed}.`;
   } else if (terminalReason === "stuck_livelock" && roundsUsed != null) {
     intro = `Agent stopped after a livelock on round ${roundsUsed}.`;
+  } else if (terminalReason === "stuck_rebase_conflict") {
+    intro =
+      "Agent could not rebase the issue branch onto the base branch (conflict); a human needs to rebase or resolve conflicts before this can proceed.";
   } else if (roundsUsed != null && maxReviewRounds != null) {
     intro = `Agent gave up after ${roundsUsed} of ${maxReviewRounds} review round(s).`;
   } else {

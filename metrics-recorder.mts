@@ -180,6 +180,7 @@ export interface IssueOutcomeMetadata {
     | "stuck_reviewer_incomplete"
     | "stuck_needs_human_review"
     | "stuck_livelock"
+    | "stuck_rebase_conflict"
     | "blocked"
     | "crashed";
   roundsUsed: number;
