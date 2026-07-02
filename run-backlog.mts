@@ -1,0 +1,2251 @@
+// run-backlog.mts
+//
+// Backlog-clearer loop. Processes independent, already-triaged issues that
+// share one label. Each issue gets its own branch forked fresh from the
+// mainline, runs the coder<->reviewer loop (up to MAX_REVIEW_ROUNDS), and on a
+// clean approval is delivered as a review-ready branch: the branch is pushed to
+// origin and the issue is labelled `Review` and left open for a human to open
+// the pull request. The loop never merges and never closes issues. Issues it
+// cannot land cleanly are pushed, commented, and labelled `agent-stuck`.
+//
+// Unlike run-prd-*, there is no PRD, no issue decomposer, and no extra-review
+// stage; issues are independent and never build on each other.
+//
+// Usage:
+//   tsx run-backlog.mts --label <name> [--base-branch main] [--idle-timeout 1800]
+
+import * as sandcastle from "@ai-hero/sandcastle";
+import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  buildAgentDefinition,
+  CODER_AGENT_CONFIG,
+  REVIEWER_AGENT_CONFIG,
+  REWORK_AGENT_CONFIG,
+} from "./custom-agent-defs.mts";
+import { enforceArgvSizeLimit } from "./custom-agent-argv-guard.mts";
+import { renderSlimMessage } from "./custom-agent-render.mts";
+import {
+  ensureOpencodeGitExclude,
+  writeAgentDefinitionFile,
+} from "./custom-agent-worktree.mts";
+import { EXTRA_REVIEW_INPUT_DIFF_EXCLUDES } from "./extra-review-inputs.mts";
+import {
+  recordIssueOutcome,
+  recordMeasuredAgentRun,
+  recordReviewerResult,
+  recordValidationRun,
+} from "./metrics-recorder.mts";
+import {
+  initialNoProgressState,
+  observeFailedRoundFingerprint,
+  sha1,
+  type NoProgressState,
+  type WorktreeProgressSnapshot,
+} from "./loop-progress.mts";
+import {
+  formatStuckIssueComment,
+  type StuckTerminalReason,
+} from "./mark-stuck-comment.mts";
+import {
+  acquireReviewerResult,
+  buildReviewerAttemptRunName,
+  sanitizeReviewerExcerpt,
+  summarizeReviewerAttemptFailure,
+  type ReviewResult,
+} from "./reviewer-result.mts";
+import { loadSandcastleLoopConfig } from "./sandcastle-loop-config.mts";
+import {
+  createLivelockWatchdogSandcastleRunOptions,
+  agentInvocationStageForRound,
+  resolveRound1CoderLivelockControlFlow,
+  resolveReworkLivelockControlFlow,
+} from "./agent-invocation-livelock.mts";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+const REPO_ROOT = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+  encoding: "utf8",
+}).trim();
+const LOOP_CONFIG = await loadSandcastleLoopConfig(REPO_ROOT);
+
+const CODER_MODEL = LOOP_CONFIG.models.coder;
+const REWORK_MODEL = LOOP_CONFIG.models.rework;
+const REVIEWER_MODEL = LOOP_CONFIG.models.reviewer;
+
+const CODER_AGENT_SYSTEM_PROMPT_FILE =
+  "./.sandcastle/coder-agent-system-prompt-prd.md";
+const CODER_USER_PROMPT_FILE = "./.sandcastle/coder-user-prompt-prd.md";
+const REWORK_AGENT_SYSTEM_PROMPT_FILE =
+  "./.sandcastle/rework-agent-system-prompt-prd.md";
+const REWORK_USER_PROMPT_FILE = "./.sandcastle/rework-user-prompt-prd.md";
+const REVIEWER_AGENT_SYSTEM_PROMPT_FILE =
+  "./.sandcastle/reviewer-agent-system-prompt-prd.md";
+const REVIEWER_USER_PROMPT_FILE = "./.sandcastle/reviewer-user-prompt-prd.md";
+
+// Labels
+const REVIEW_LABEL = "Review"; // added on clean approval; issue kept open
+const STUCK_LABEL = "agent-stuck"; // added when the loop cannot land the issue
+
+// Loop bounds
+const MAX_REVIEW_ROUNDS = 5; // coder<->reviewer attempts per issue
+const FAILED_ROUND_REPEAT_LIMIT = 3; // stop after seed + 3 identical repeats
+const MAX_ITERATIONS = 50; // outer-loop safety backstop (re-run to continue)
+const CODER_MAX_ITERATIONS = 30; // per coder invocation
+const MAX_RECOVERY_ATTEMPTS = 2; // branch-hygiene recovery attempts per issue
+const MAX_PUSH_RECOVERY_ATTEMPTS = 2; // remote issue-branch push recovery
+
+// Idle timeout for the agent (sandcastle fails the run if stdout is silent
+// this long). Override on the command line with `--idle-timeout <seconds>`.
+const DEFAULT_IDLE_TIMEOUT_SECONDS = 1800;
+const DEFAULT_BASE_BRANCH = "main";
+
+// Host-side validation gate. Runs after each coder commit, before the reviewer.
+// Empty array disables the gate.
+const VALIDATION_COMMANDS: string[] = LOOP_CONFIG.validationCommands;
+
+// Commands to run inside the sandbox once it's ready (e.g. install deps).
+const SANDBOX_READY_COMMANDS: string[] = LOOP_CONFIG.setupCommands;
+
+// Git pathspec exclusions for the reviewer diff.
+const REVIEW_DIFF_EXCLUDES: string[] = [...EXTRA_REVIEW_INPUT_DIFF_EXCLUDES];
+
+// Hard cap on the reviewer diff (bytes). opencode passes the whole prompt as a
+// single CLI arg and the Linux execve argv limit is ~128KB system-wide, so keep
+// this well under that with headroom for the rest of the prompt.
+const REVIEW_DIFF_MAX_BYTES = 60_000;
+
+// Files copied from the host into the worktree before the sandbox starts.
+const COPY_TO_WORKTREE: string[] = [];
+
+const OPENCODE_MOUNTS = [
+  {
+    hostPath: "~/.config/opencode",
+    sandboxPath: "~/.config/opencode",
+    readonly: true,
+  },
+  {
+    hostPath: "~/.local/share/opencode",
+    sandboxPath: "~/.local/share/opencode",
+  },
+];
+
+const CACHE_MOUNTS = LOOP_CONFIG.cache.mounts.map((mount) => ({
+  hostPath: mount.hostPath,
+  sandboxPath: mount.sandboxPath,
+}));
+
+const HOST_COMMAND_ENV: NodeJS.ProcessEnv = {
+  ...process.env,
+  ...LOOP_CONFIG.cache.hostEnv,
+};
+
+// ---------------------------------------------------------------------------
+// CLI arg parsing
+// ---------------------------------------------------------------------------
+
+const USAGE =
+  "Usage: tsx run-backlog.mts --label <name> [--base-branch <name>] [--idle-timeout <seconds>]";
+
+function readStringFlag(flag: string): string | undefined {
+  const index = process.argv.indexOf(flag);
+  if (index === -1) return undefined;
+  const value = process.argv[index + 1];
+  if (!value || value.startsWith("--")) {
+    throw new Error(`${USAGE}\n\nMissing value for ${flag}`);
+  }
+  return value;
+}
+
+const labelArg = readStringFlag("--label");
+if (!labelArg) {
+  throw new Error(`${USAGE}\n\nMissing required argument: --label <name>`);
+}
+// Bind to a definitely-string const: control-flow narrowing of the original
+// `string | undefined` read is not retained inside the loop's nested functions.
+const label: string = labelArg;
+
+const baseBranch = readStringFlag("--base-branch") ?? DEFAULT_BASE_BRANCH;
+
+let idleTimeoutSeconds = DEFAULT_IDLE_TIMEOUT_SECONDS;
+const idleRaw = readStringFlag("--idle-timeout");
+if (idleRaw !== undefined) {
+  const parsed = Number.parseInt(idleRaw, 10);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`--idle-timeout must be a positive integer, got ${idleRaw}`);
+  }
+  idleTimeoutSeconds = parsed;
+}
+
+console.log(`Backlog label: ${label}`);
+console.log(`Base branch: ${baseBranch} (fork point: origin/${baseBranch})`);
+console.log(`Idle timeout: ${idleTimeoutSeconds}s`);
+console.log(
+  [
+    LOOP_CONFIG.loadedConfig
+      ? `Sandcastle config: ${LOOP_CONFIG.configPath}`
+      : `Sandcastle config: using built-in defaults; ${LOOP_CONFIG.configPath} not found`,
+    `models=coder:${CODER_MODEL},rework:${REWORK_MODEL},reviewer:${REVIEWER_MODEL}`,
+    `reviewerMaxAttempts=${LOOP_CONFIG.reviewer.maxAttempts}`,
+    `setupCommands=${SANDBOX_READY_COMMANDS.length}`,
+    `validationCommands=${VALIDATION_COMMANDS.length}`,
+    `cacheMounts=${LOOP_CONFIG.cache.mounts.map((m) => m.name).join(",") || "(none)"}`,
+    `cacheEnv=${Object.keys(LOOP_CONFIG.cache.sandboxEnv).join(",") || "(none)"}`,
+  ].join("\n"),
+);
+logCoderReworkModelStartupWarning(CODER_MODEL, REWORK_MODEL);
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+export function sameCoderReworkModelWarning(
+  coderModel: string,
+  reworkModel: string,
+): string | null {
+  if (coderModel !== reworkModel) return null;
+  return `CODER_MODEL and REWORK_MODEL are both "${coderModel}"; rework escalation is prompt-only, not model escalation.`;
+}
+
+export function logCoderReworkModelStartupWarning(
+  coderModel: string,
+  reworkModel: string,
+  warn: (message: string) => void = console.warn,
+): void {
+  const message = sameCoderReworkModelWarning(coderModel, reworkModel);
+  if (message) warn(message);
+}
+
+const gh = (args: string[]): string =>
+  execFileSync("gh", args, { encoding: "utf8" });
+
+const ghJson = <T extends unknown>(args: string[]): T =>
+  JSON.parse(gh(args)) as T;
+
+const git = (args: string[], cwd?: string): string =>
+  execFileSync("git", args, { encoding: "utf8", cwd });
+
+function gitSpawn(args: string[], cwd: string): ReturnType<typeof spawnSync> {
+  return spawnSync("git", args, { cwd, encoding: "utf8" });
+}
+
+function originBaseRef(): string {
+  return `origin/${baseBranch}`;
+}
+
+function captureWorktreeProgressSnapshot(
+  worktreePath: string,
+): WorktreeProgressSnapshot {
+  return {
+    head: git(["rev-parse", "HEAD"], worktreePath).trim(),
+    porcelainStatus: git(["status", "--porcelain"], worktreePath).trim(),
+  };
+}
+
+function agentRunLogPath(branch: string, runName: string): string {
+  const sanitizedBranch = branch.replace(/[^a-zA-Z0-9_.-]/g, "-");
+  const sanitizedName = runName.toLowerCase().replace(/[^a-z0-9_.-]/g, "-");
+  return join(
+    REPO_ROOT,
+    ".sandcastle",
+    "logs",
+    `${sanitizedBranch}-${sanitizedName}.log`,
+  );
+}
+
+function treeShaOf(ref: string, cwd?: string): string {
+  return git(["rev-parse", `${ref}^{tree}`], cwd).trim();
+}
+
+function countCommitsAheadOfBase(worktreePath: string): number {
+  const raw = git(
+    ["rev-list", "--count", `${originBaseRef()}..HEAD`],
+    worktreePath,
+  ).trim();
+  const parsed = Number.parseInt(raw || "0", 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function branchExists(branch: string): boolean {
+  return (
+    spawnSync("git", ["rev-parse", "--verify", branch], {
+      encoding: "utf8",
+    }).status === 0
+  );
+}
+
+function fetchOriginBase(worktreePath?: string): string {
+  execFileSync("git", ["fetch", "origin", baseBranch], {
+    cwd: worktreePath,
+    stdio: "inherit",
+  });
+  return git(["rev-parse", originBaseRef()], worktreePath).trim();
+}
+
+// Fetch the mainline once at startup so origin/<base> exists and is current.
+// Unlike run-prd this loop never creates the base branch; a missing mainline is
+// a fatal misconfiguration.
+function ensureBaseBranchAvailable(): void {
+  const fetch = spawnSync("git", ["fetch", "origin", baseBranch], {
+    encoding: "utf8",
+  });
+  if (fetch.status !== 0) {
+    throw new Error(
+      `Could not fetch origin/${baseBranch}. The base branch must already exist on origin.\n${`${fetch.stdout ?? ""}${fetch.stderr ?? ""}`.trim()}`,
+    );
+  }
+}
+
+// `gh issue edit --add-label` fails if the label does not already exist, so
+// create the terminal labels up front if the repo is missing them.
+function ensureLabels(): void {
+  const existing = ghJson<{ name: string }[]>([
+    "label",
+    "list",
+    "--json",
+    "name",
+    "--limit",
+    "1000",
+  ]);
+  const have = new Set(existing.map((l) => l.name));
+  const wanted: { name: string; color: string; description: string }[] = [
+    {
+      name: REVIEW_LABEL,
+      color: "0e8a16",
+      description: "Agent produced a review-ready branch; open a PR.",
+    },
+    {
+      name: STUCK_LABEL,
+      color: "b60205",
+      description: "Agent could not land this issue; needs a human.",
+    },
+  ];
+  for (const wantedLabel of wanted) {
+    if (have.has(wantedLabel.name)) continue;
+    console.log(`Creating missing label '${wantedLabel.name}'`);
+    gh([
+      "label",
+      "create",
+      wantedLabel.name,
+      "--color",
+      wantedLabel.color,
+      "--description",
+      wantedLabel.description,
+    ]);
+  }
+}
+
+function preflightExistingIssueBranch(
+  issue: IssueDetail,
+  issueBranch: string,
+): void {
+  fetchOriginBase();
+  if (!branchExists(issueBranch)) return;
+
+  const baseSha = git(["rev-parse", originBaseRef()]).trim();
+  const mergeBase = git(["merge-base", originBaseRef(), issueBranch]).trim();
+  const diff = execFileSync(
+    "git",
+    [
+      "diff",
+      `${originBaseRef()}..${issueBranch}`,
+      "--",
+      ".",
+      ...REVIEW_DIFF_EXCLUDES,
+    ],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  );
+  const changedFiles = execFileSync(
+    "git",
+    [
+      "diff",
+      "--name-only",
+      `${originBaseRef()}..${issueBranch}`,
+      "--",
+      ".",
+      ...REVIEW_DIFF_EXCLUDES,
+    ],
+    { encoding: "utf8", maxBuffer: 1024 * 1024 },
+  )
+    .split("\n")
+    .map((f) => f.trim())
+    .filter(Boolean);
+
+  const stale = mergeBase !== baseSha;
+  const tooLarge = Buffer.byteLength(diff, "utf8") > REVIEW_DIFF_MAX_BYTES;
+  const polluted = looksLikeWorkflowPollution(issue, changedFiles);
+  if (!stale || (!tooLarge && !polluted)) return;
+
+  const worktreePath = findManagedWorktreeForBranch(issueBranch);
+  if (worktreePath) {
+    const dirty = git(["status", "-s"], worktreePath).trim();
+    if (dirty) {
+      console.warn(
+        `Existing branch ${issueBranch} looks stale/polluted, but managed worktree ${worktreePath} has uncommitted changes; reusing it rather than deleting work.`,
+      );
+      return;
+    }
+    execFileSync("git", ["worktree", "remove", "--force", worktreePath], {
+      stdio: "inherit",
+    });
+  }
+
+  const diagnosticBranch = `diagnostic/${issueBranch}-prestart-${Date.now()}`;
+  console.warn(
+    `Existing branch ${issueBranch} is stale and ${tooLarge ? "oversized" : "polluted"}; quarantining to ${diagnosticBranch} and starting fresh from ${originBaseRef()}.`,
+  );
+  git(["branch", "-f", diagnosticBranch, issueBranch]);
+  execFileSync("git", ["branch", "-D", issueBranch], { stdio: "inherit" });
+  const deleteRemote = spawnSync(
+    "git",
+    ["push", "origin", "--delete", issueBranch],
+    { encoding: "utf8" },
+  );
+  if (deleteRemote.status !== 0) {
+    console.warn(
+      `Could not delete remote ${issueBranch}; later push may need manual cleanup. ${deleteRemote.stderr || deleteRemote.stdout || ""}`,
+    );
+  }
+}
+
+function findManagedWorktreeForBranch(branch: string): string | null {
+  const worktreeList = git(["worktree", "list", "--porcelain"]);
+  let currentPath: string | null = null;
+  for (const line of worktreeList.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      currentPath = line.slice("worktree ".length).trim();
+      continue;
+    }
+    if (line === `branch refs/heads/${branch}` && currentPath) {
+      return currentPath.includes("/.sandcastle/worktrees/")
+        ? currentPath
+        : null;
+    }
+  }
+  return null;
+}
+
+interface IssueListItem {
+  number: number;
+  title?: string;
+  labels: { name: string }[];
+}
+
+interface IssueComment {
+  author: { login: string };
+  body: string;
+  createdAt: string;
+}
+
+interface IssueDetail {
+  number: number;
+  title: string;
+  body: string;
+  comments: IssueComment[];
+  labels: { name: string }[];
+}
+
+// Backlog issue eligibility: open, carries the target label, and carries
+// neither terminal label. `skip` holds issues already handled in this run so a
+// crash (which leaves no terminal label) can't wedge the loop on one issue.
+function pickNextIssue(skip: ReadonlySet<number>): IssueDetail | null {
+  const list = ghJson<IssueListItem[]>([
+    "issue",
+    "list",
+    "--label",
+    label,
+    "--state",
+    "open",
+    "--json",
+    "number,labels",
+    "--limit",
+    "200",
+  ]);
+  const eligible = list
+    .filter(
+      (i) =>
+        !skip.has(i.number) &&
+        !i.labels.some(
+          (l) => l.name === STUCK_LABEL || l.name === REVIEW_LABEL,
+        ),
+    )
+    .sort((a, b) => a.number - b.number);
+  if (eligible.length === 0) return null;
+  const top = eligible[0]!;
+  return ghJson<IssueDetail>([
+    "issue",
+    "view",
+    String(top.number),
+    "--json",
+    "number,title,body,comments,labels",
+  ]);
+}
+
+interface ReviewContext {
+  baseSha: string;
+  diff: string;
+  diffBytes: number;
+  diffStat: string;
+  changedFiles: string[];
+  reviewAspects: string[];
+  ecosystems: string[];
+}
+
+function computeReviewContext(
+  worktreePath: string,
+  baseSha: string,
+): ReviewContext {
+  const diff = execFileSync(
+    "git",
+    ["diff", `${baseSha}..HEAD`, "--", ".", ...REVIEW_DIFF_EXCLUDES],
+    { cwd: worktreePath, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  );
+  const changedFiles = execFileSync(
+    "git",
+    [
+      "diff",
+      "--name-only",
+      `${baseSha}..HEAD`,
+      "--",
+      ".",
+      ...REVIEW_DIFF_EXCLUDES,
+    ],
+    { cwd: worktreePath, encoding: "utf8", maxBuffer: 1024 * 1024 },
+  )
+    .split("\n")
+    .map((f) => f.trim())
+    .filter(Boolean);
+  const diffStat = execFileSync(
+    "git",
+    ["diff", "--stat", `${baseSha}..HEAD`, "--", ".", ...REVIEW_DIFF_EXCLUDES],
+    { cwd: worktreePath, encoding: "utf8", maxBuffer: 1024 * 1024 },
+  ).trim();
+  const ecosystems = detectEcosystems(worktreePath, changedFiles);
+  const reviewAspects = classifyReviewAspects(diff, changedFiles);
+  return {
+    baseSha,
+    diff,
+    diffBytes: Buffer.byteLength(diff, "utf8"),
+    diffStat: diffStat || "(no diff stat)",
+    changedFiles,
+    reviewAspects,
+    ecosystems,
+  };
+}
+
+function detectEcosystems(
+  worktreePath: string,
+  changedFiles: string[],
+): string[] {
+  const ecosystems = new Set<string>();
+  const has = (path: string) =>
+    existsSync(join(worktreePath, path)) || changedFiles.includes(path);
+  if (has("package.json")) ecosystems.add("node");
+  if (has("pyproject.toml") || has("requirements.txt") || has("setup.py")) {
+    ecosystems.add("python");
+  }
+  if (has("go.mod")) ecosystems.add("go");
+  if (has("Cargo.toml")) ecosystems.add("rust");
+  if (has("Gemfile")) ecosystems.add("ruby");
+  if (has("composer.json")) ecosystems.add("php");
+  if (has("pom.xml") || has("build.gradle") || has("build.gradle.kts")) {
+    ecosystems.add("jvm");
+  }
+  if (has("mix.exs")) ecosystems.add("elixir");
+  if (has("Package.swift")) ecosystems.add("swift");
+  return [...ecosystems].sort();
+}
+
+function classifyReviewAspects(diff: string, changedFiles: string[]): string[] {
+  const aspects = new Set<string>(["code", "scope"]);
+  const changedLineText = diff
+    .split("\n")
+    .filter((line) => /^[+-]/.test(line) && !/^(---|\+\+\+)/.test(line))
+    .join("\n");
+
+  const testFiles = changedFiles.filter(isTestFile);
+  const sourceFiles = changedFiles.filter(isSourceFile);
+  if (testFiles.length > 0 || sourceFiles.length > 0) aspects.add("tests");
+  if (changedFiles.some(isConfigBuildFile)) aspects.add("config-build");
+  if (
+    /\b(try|catch|except|raise|throw|throws|panic!?|recover|finally|defer|Result|Err|Error|\.catch|onError|fallback|rollback|null|undefined|None|nil|unwrap|expect)\b/i.test(
+      changedLineText,
+    )
+  ) {
+    aspects.add("errors");
+  }
+  if (
+    /\b(interface|type|struct|class|enum|trait|impl|record|dataclass|TypedDict|BaseModel|schema|model|DTO|Request|Response|message|protobuf|z\.object)\b/i.test(
+      changedLineText,
+    )
+  ) {
+    aspects.add("types-contracts");
+  }
+  if (
+    /(^|\n)[+-]\s*(\/\/|#|\/\*|\*|"""|'''|--|;|<!--|\/\/\/|\/\/!)/.test(diff) ||
+    changedFiles.some((f) => /\.(md|mdx|rst|adoc|txt)$/i.test(f))
+  ) {
+    aspects.add("comments-docs");
+  }
+  if (
+    /\b(goroutine|go\s+func|chan|channel|mutex|lock|async|await|Promise|tokio|thread|spawn|context\.Context|cancel|AbortController|useEffect|cleanup|defer)\b/i.test(
+      changedLineText,
+    )
+  ) {
+    aspects.add("concurrency-lifecycle");
+  }
+  if (
+    /\b(select|insert|update|delete|migration|transaction|sql|query|db\.|database|fetch|axios|http|request|response|readFile|writeFile|open\(|fs\.|os\.)\b/i.test(
+      changedLineText,
+    )
+  ) {
+    aspects.add("persistence-io");
+  }
+  if (
+    /\b(auth|permission|role|policy|token|secret|password|session|cookie|csrf|cors|crypto|encrypt|decrypt|validate|sanitize)\b/i.test(
+      changedLineText,
+    )
+  ) {
+    aspects.add("security-auth");
+  }
+  return [...aspects].sort();
+}
+
+function isTestFile(file: string): boolean {
+  const normalized = file.toLowerCase();
+  return (
+    /(^|\/)(__tests__|tests?|specs?|testing)(\/|$)/.test(normalized) ||
+    /(^|\/)testdata(\/|$)/.test(normalized) ||
+    /(^|\/)test_[^/]+$/.test(normalized) ||
+    /(^|\/)[^/]+(_test|_spec)\.[^/.]+$/.test(normalized) ||
+    /(^|\/)[^/]+\.(test|spec)\.[^/.]+$/.test(normalized) ||
+    /(^|\/)[^/]+tests?\.(java|cs)$/.test(normalized)
+  );
+}
+
+function isSourceFile(file: string): boolean {
+  if (
+    /(^|\/)(node_modules|vendor|dist|build|target|\.next|\.venv|coverage)(\/|$)/.test(
+      file,
+    )
+  ) {
+    return false;
+  }
+  if (isTestFile(file) || isConfigBuildFile(file)) return false;
+  return /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|kts|cs|rb|php|c|cc|cpp|h|hpp|swift|scala|ex|exs|clj|cljs|erl|hrl|lua|dart)$/i.test(
+    file,
+  );
+}
+
+function isConfigBuildFile(file: string): boolean {
+  const base = file.split("/").pop()?.toLowerCase() ?? file.toLowerCase();
+  return (
+    [
+      "package.json",
+      "pyproject.toml",
+      "requirements.txt",
+      "setup.py",
+      "go.mod",
+      "cargo.toml",
+      "gemfile",
+      "composer.json",
+      "pom.xml",
+      "build.gradle",
+      "build.gradle.kts",
+      "makefile",
+      "dockerfile",
+      "tsconfig.json",
+      "vite.config.ts",
+      "webpack.config.js",
+      "eslint.config.js",
+      ".eslintrc",
+      ".prettierrc",
+    ].includes(base) || /\.(ya?ml|toml|json|ini|cfg|conf)$/i.test(file)
+  );
+}
+
+function flattenComments(comments: IssueComment[]): string {
+  if (comments.length === 0) return "(no comments)";
+  return comments
+    .map((c) => `### @${c.author.login} — ${c.createdAt}\n\n${c.body}`)
+    .join("\n\n");
+}
+
+type GateResult =
+  | { ok: true }
+  | { ok: false; feedback: string; signature: string };
+
+function summarizeFailureOutput(output: string): string {
+  const lines = output
+    .split("\n")
+    .map((l) => l.replace(/\x1b\[[0-9;]*m/g, "").trimEnd())
+    .filter((l) => l.trim().length > 0);
+
+  const isNoise = (l: string) =>
+    /^npm (error|warn|notice)\b/i.test(l) ||
+    /^\s*>\s/.test(l) ||
+    /Lifecycle script .* failed/.test(l) ||
+    /^npm error code\b/i.test(l) ||
+    /^npm error path\b/i.test(l) ||
+    /^npm error workspace\b/i.test(l) ||
+    /^npm error location\b/i.test(l) ||
+    /^npm error command\b/i.test(l);
+
+  const errorPatterns = [
+    /error TS\d+:/i,
+    /error\[E\d+\]/,
+    /ModuleNotFoundError\b/,
+    /^Failed to resolve import\b/,
+    /^\s*Cannot find module\b/,
+    /^FAIL\s/,
+    /^\s*×\s/,
+    /^\s*✗\s/,
+    /^\s*❯\s/,
+    /\bcompilation failed\b/i,
+    /\bbuild failed\b/i,
+    /^Error:\s/,
+    /^\s*panic:\s/i,
+    /^\s*thread .* panicked\b/,
+  ];
+
+  for (const pattern of errorPatterns) {
+    const idx = lines.findIndex((l) => pattern.test(l) && !isNoise(l));
+    if (idx >= 0) {
+      return lines
+        .slice(idx, Math.min(idx + 3, lines.length))
+        .join(" | ")
+        .slice(0, 280);
+    }
+  }
+
+  const tail = lines
+    .filter((l) => !isNoise(l))
+    .slice(-3)
+    .join(" | ");
+  return tail.slice(0, 280) || "(no informative output)";
+}
+
+function runValidationGate(
+  worktreePath: string,
+  context: {
+    prd: string;
+    issue?: number;
+    round: number | string;
+    gate: "issue";
+  },
+): GateResult {
+  for (const [index, cmd] of VALIDATION_COMMANDS.entries()) {
+    console.log(`  $ ${cmd}`);
+    const startedMs = Date.now();
+    const result = spawnSync(cmd, {
+      shell: true,
+      cwd: worktreePath,
+      encoding: "utf8",
+      env: HOST_COMMAND_ENV,
+    });
+    const endedMs = Date.now();
+    recordValidationRun(
+      {
+        prd: context.prd,
+        issue: context.issue,
+        round: context.round,
+        gate: context.gate,
+        command: cmd,
+        commandIndex: index,
+      },
+      {
+        startedMs,
+        endedMs,
+        status: result.status === 0 ? "success" : "failed",
+        exitCode: result.status,
+      },
+    );
+    const elapsedS = ((endedMs - startedMs) / 1000).toFixed(1);
+    if (result.status !== 0) {
+      const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+      const summary = summarizeFailureOutput(output);
+      console.log(
+        `    ✗ failed (exit ${result.status}) in ${elapsedS}s: ${summary}`,
+      );
+      return {
+        ok: false,
+        signature: `${cmd} :: ${summary}`,
+        feedback: [
+          "## Validation failed",
+          "",
+          "Command:",
+          "```",
+          cmd,
+          "```",
+          "",
+          "Output (truncated to last 4000 chars):",
+          "```",
+          output.slice(-4000),
+          "```",
+          "",
+          "Fix the failures and commit again.",
+        ].join("\n"),
+      };
+    }
+    console.log(`    ✓ ${elapsedS}s`);
+  }
+  return { ok: true };
+}
+
+function formatFeedback(review: ReviewResult): string {
+  const header =
+    review.decision === "needs_human_review"
+      ? "## Reviewer flagged human review (treat as blocking)"
+      : "## Reviewer requested changes";
+  const findings =
+    review.findings.length === 0
+      ? "(reviewer listed no specific findings)"
+      : review.findings
+          .map((f, i) => {
+            const loc = [f.file, f.line ? `line ${f.line}` : null]
+              .filter(Boolean)
+              .join(" ");
+            const meta = [
+              f.aspect ? `aspect: ${f.aspect}` : null,
+              typeof f.confidence === "number"
+                ? `confidence: ${f.confidence}`
+                : null,
+              f.severity ? `severity: ${f.severity}` : null,
+            ]
+              .filter(Boolean)
+              .join(", ");
+            return [
+              `### Finding ${i + 1}${loc ? ` (${loc})` : ""}`,
+              meta ? `_${meta}_` : "",
+              "",
+              `**Problem:** ${f.problem}`,
+              "",
+              `**Fix:** ${f.remediation}`,
+            ]
+              .filter((line) => line !== "")
+              .join("\n");
+          })
+          .join("\n\n");
+  return [header, "", `**Summary:** ${review.summary}`, "", findings].join(
+    "\n",
+  );
+}
+
+function buildValidationFailureFingerprint(
+  reviewDiff: string,
+  signature: string,
+): {
+  diffHash: string;
+  source: "validation";
+  signatureHash: string;
+  signatureSummary: string;
+} {
+  return {
+    diffHash: sha1(normalizeForHash(reviewDiff)),
+    source: "validation",
+    signatureHash: sha1(normalizeForHash(signature)),
+    signatureSummary: normalizeSignatureSummary(signature),
+  };
+}
+
+function buildReviewerFailureFingerprint(
+  reviewDiff: string,
+  review: ReviewResult,
+): {
+  diffHash: string;
+  source: "reviewer_changes_requested";
+  signatureHash: string;
+  signatureSummary: string;
+} {
+  const canonicalFindings = review.findings.map((finding) => ({
+    problem: normalizeForHash(finding.problem),
+    remediation: normalizeForHash(finding.remediation),
+    file: finding.file ?? "",
+    line: finding.line ?? null,
+  }));
+  return {
+    diffHash: sha1(normalizeForHash(reviewDiff)),
+    source: "reviewer_changes_requested",
+    signatureHash: sha1(JSON.stringify(canonicalFindings)),
+    signatureSummary: canonicalFindings
+      .slice(0, 2)
+      .map((finding) => finding.problem)
+      .join(" | ")
+      .slice(0, 300),
+  };
+}
+
+function normalizeForHash(value: string): string {
+  return value.replace(/\r\n/g, "\n").replace(/\s+/g, " ").trim();
+}
+
+function normalizeSignatureSummary(value: string): string {
+  return value.replace(/\r\n/g, "\n").trim().slice(0, 300);
+}
+
+function formatNoProgressFeedback(input: {
+  round: number;
+  source: string;
+  repeatedCount: number;
+  signatureSummary: string;
+  lastFeedback: string;
+}): string {
+  return [
+    "## No progress",
+    "",
+    `Stopped early after round ${input.round}: the same failed ${input.source} outcome repeated ${input.repeatedCount + 1} times in total.`,
+    "",
+    `Repeated outcome source: ${input.source}`,
+    `Signature summary: ${input.signatureSummary || "(none)"}`,
+    `Repeat count: ${input.repeatedCount + 1} total identical failures`,
+    "",
+    "Last feedback:",
+    "",
+    input.lastFeedback || "(none recorded)",
+  ].join("\n");
+}
+
+function formatReviewerAcquisitionFeedback(input: {
+  header: string;
+  round: number;
+  attempt: number;
+  maxAttempts: number;
+  runName: string;
+  reviewBaseSha: string;
+  candidateHeadSha: string;
+  candidateTreeSha: string;
+  logFilePath?: string;
+  resultSource: "stdout" | "run_log" | "none";
+  failureCode: string;
+  excerpt: string;
+  diagnostics: string[];
+}): string {
+  return [
+    input.header,
+    "",
+    `Issue round: ${input.round}`,
+    `Reviewer attempt: ${input.attempt}/${input.maxAttempts}`,
+    `Reviewer run: ${input.runName}`,
+    `Review base SHA: ${input.reviewBaseSha}`,
+    `Candidate HEAD: ${input.candidateHeadSha}`,
+    `Candidate tree: ${input.candidateTreeSha}`,
+    `Reviewer log: ${input.logFilePath ?? "(unavailable)"}`,
+    `Result source: ${input.resultSource}`,
+    `Failure code: ${input.failureCode}`,
+    input.diagnostics.length > 0
+      ? `Diagnostics: ${input.diagnostics.join("; ")}`
+      : null,
+    "",
+    "Reviewer excerpt:",
+    "",
+    input.excerpt || "(no assistant excerpt available)",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+type PrepResult =
+  | { ok: true; baseSha: string; recoveryAttempts: number }
+  | { ok: false; feedback: string; recoveryAttempts: number };
+
+function prepareBranchForReview(
+  worktreePath: string,
+  issueBranch: string,
+  recoveryAttempts: number,
+): PrepResult {
+  const baseSha = fetchOriginBase(worktreePath);
+  const oldHead = git(["rev-parse", "HEAD"], worktreePath).trim();
+  console.log(`  rebasing ${issueBranch} onto ${originBaseRef()}`);
+  const rebase = gitSpawn(["rebase", originBaseRef()], worktreePath);
+  if (rebase.status !== 0) {
+    gitSpawn(["rebase", "--abort"], worktreePath);
+    console.log(`  rebase failed; attempting fresh branch recovery`);
+    return recoverFreshBranch(
+      worktreePath,
+      issueBranch,
+      oldHead,
+      recoveryAttempts,
+      `rebase onto ${originBaseRef()} failed`,
+      `${rebase.stdout || ""}\n${rebase.stderr || ""}`.trim(),
+    );
+  }
+
+  const mergeBase = git(
+    ["merge-base", originBaseRef(), "HEAD"],
+    worktreePath,
+  ).trim();
+  if (mergeBase !== baseSha) {
+    console.log(
+      `  branch ancestry is not clean; attempting fresh branch recovery`,
+    );
+    return recoverFreshBranch(
+      worktreePath,
+      issueBranch,
+      git(["rev-parse", "HEAD"], worktreePath).trim(),
+      recoveryAttempts,
+      `merge-base ${mergeBase} did not match reviewed base ${baseSha}`,
+      "",
+    );
+  }
+
+  return { ok: true, baseSha, recoveryAttempts };
+}
+
+function recoverFreshBranch(
+  worktreePath: string,
+  issueBranch: string,
+  oldHead: string,
+  recoveryAttempts: number,
+  reason: string,
+  detail: string,
+): PrepResult {
+  if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+    return {
+      ok: false,
+      recoveryAttempts,
+      feedback: [
+        "## Branch recovery failed",
+        "",
+        `The host tried to recover this issue branch ${MAX_RECOVERY_ATTEMPTS} time(s), but the branch still could not be prepared for validation/review.`,
+        "",
+        `Reason: ${reason}`,
+        detail ? `\nDetails:\n\`\`\`\n${detail.slice(-3000)}\n\`\`\`` : "",
+        "",
+        "Continue from the current branch state, reduce the diff to this issue's scope, resolve conflicts if present, commit, and emit `<promise>COMPLETE</promise>`.",
+      ].join("\n"),
+    };
+  }
+
+  const attempt = recoveryAttempts + 1;
+  const diagnosticBranch = `diagnostic/${issueBranch}-recovery-${attempt}`;
+  const baseSha = fetchOriginBase(worktreePath);
+  const oldBase = git(
+    ["merge-base", originBaseRef(), oldHead],
+    worktreePath,
+  ).trim();
+  const commits = git(
+    ["rev-list", "--reverse", `${originBaseRef()}..${oldHead}`],
+    worktreePath,
+  )
+    .split("\n")
+    .map((c) => c.trim())
+    .filter(Boolean);
+
+  console.log(
+    `  recovery ${attempt}/${MAX_RECOVERY_ATTEMPTS}: replaying ${commits.length} commit(s) on ${originBaseRef()}`,
+  );
+  gitSpawn(["branch", "-f", diagnosticBranch, oldHead], worktreePath);
+  execFileSync("git", ["reset", "--hard", baseSha], {
+    cwd: worktreePath,
+    stdio: "inherit",
+  });
+
+  if (commits.length > 0) {
+    const pick = gitSpawn(["cherry-pick", ...commits], worktreePath);
+    if (pick.status === 0) {
+      return { ok: true, baseSha, recoveryAttempts: attempt };
+    }
+    gitSpawn(["cherry-pick", "--abort"], worktreePath);
+    execFileSync("git", ["reset", "--hard", baseSha], {
+      cwd: worktreePath,
+      stdio: "inherit",
+    });
+    console.log(`  cherry-pick recovery failed; trying net patch replay`);
+  }
+
+  const patch = execFileSync(
+    "git",
+    ["diff", `${oldBase}..${oldHead}`, "--", "."],
+    { cwd: worktreePath, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  );
+  if (!patch.trim()) {
+    return {
+      ok: false,
+      recoveryAttempts: attempt,
+      feedback: [
+        "## Branch recovery found no issue changes",
+        "",
+        `The branch looked polluted or stale, but replay from ${oldBase} to ${oldHead} produced an empty patch.`,
+        "",
+        "Re-read the issue, make the required scoped changes on the fresh branch, commit, and emit `<promise>COMPLETE</promise>`.",
+      ].join("\n"),
+    };
+  }
+
+  const apply = spawnSync("git", ["apply", "--3way", "--index"], {
+    cwd: worktreePath,
+    encoding: "utf8",
+    input: patch,
+  });
+  if (apply.status !== 0) {
+    execFileSync("git", ["reset", "--hard", baseSha], {
+      cwd: worktreePath,
+      stdio: "inherit",
+    });
+    return {
+      ok: false,
+      recoveryAttempts: attempt,
+      feedback: [
+        "## Branch recovery needs coder help",
+        "",
+        `The host could not replay this issue's patch onto the latest ${originBaseRef()}.`,
+        "",
+        `Reason: ${reason}`,
+        "",
+        "Patch replay output:",
+        "```",
+        `${apply.stdout || ""}\n${apply.stderr || ""}`.trim().slice(-3000),
+        "```",
+        "",
+        `A local diagnostic branch was left at \`${diagnosticBranch}\`. Continue from the fresh branch, re-apply only the issue-scoped changes, commit, and emit \`<promise>COMPLETE</promise>\`.`,
+      ].join("\n"),
+    };
+  }
+
+  execFileSync(
+    "git",
+    ["commit", "-m", `recover ${issueBranch} on latest ${baseBranch}`],
+    { cwd: worktreePath, stdio: "inherit" },
+  );
+  return { ok: true, baseSha, recoveryAttempts: attempt };
+}
+
+function maybeRecoverOversizedOrPollutedDiff(
+  worktreePath: string,
+  issue: IssueDetail,
+  issueBranch: string,
+  context: ReviewContext,
+  recoveryAttempts: number,
+): PrepResult {
+  const tooLarge = context.diffBytes > REVIEW_DIFF_MAX_BYTES;
+  const workflowPollution = looksLikeWorkflowPollution(
+    issue,
+    context.changedFiles,
+  );
+  if (!tooLarge && !workflowPollution) {
+    return { ok: true, baseSha: context.baseSha, recoveryAttempts };
+  }
+  if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+    return {
+      ok: false,
+      recoveryAttempts,
+      feedback: tooLarge
+        ? formatDiffTooLargeFeedback(context)
+        : formatWorkflowPollutionFeedback(context),
+    };
+  }
+  const reason = tooLarge
+    ? `review diff is ${context.diffBytes} bytes, above ${REVIEW_DIFF_MAX_BYTES}`
+    : "review diff includes likely workflow-file pollution";
+  return recoverFreshBranch(
+    worktreePath,
+    issueBranch,
+    git(["rev-parse", "HEAD"], worktreePath).trim(),
+    recoveryAttempts,
+    reason,
+    context.diffStat,
+  );
+}
+
+function looksLikeWorkflowPollution(
+  issue: IssueDetail,
+  changedFiles: string[],
+): boolean {
+  const issueText = `${issue.title}\n${issue.body ?? ""}`.toLowerCase();
+  if (issueText.includes("sandcastle") || issueText.includes(".sandcastle")) {
+    return false;
+  }
+  return (
+    changedFiles.some((f) => f.startsWith(".sandcastle/")) &&
+    changedFiles.some((f) => !f.startsWith(".sandcastle/"))
+  );
+}
+
+// The reviewer diff is passed to opencode as a single CLI argument, so the
+// Linux execve argv limit (~128KB system-wide) is a hard technical ceiling —
+// not a preference for small changes. Oversized diffs cannot be reviewed at
+// all, so we ask the coder to split the work rather than reduce ambition.
+function formatDiffTooLargeFeedback(context: ReviewContext): string {
+  return [
+    "## Diff too large to review",
+    "",
+    `The review diff is ${context.diffBytes} bytes, above the ${REVIEW_DIFF_MAX_BYTES} byte limit.`,
+    "",
+    "This is a hard technical constraint: the diff is passed to the reviewer as a single command-line argument and the OS caps argument size. A diff over the limit cannot be reviewed at all.",
+    "",
+    "Remove unrelated or generated changes from the branch. If the issue genuinely requires a change larger than the limit, split it into smaller commits that each stay reviewable, and keep this branch scoped to what fits.",
+    "",
+    "Changed files:",
+    "```",
+    context.changedFiles.join("\n").slice(0, 3000) || "(none)",
+    "```",
+    "",
+    "Diff stat:",
+    "```",
+    context.diffStat.slice(0, 3000),
+    "```",
+  ].join("\n");
+}
+
+function formatWorkflowPollutionFeedback(context: ReviewContext): string {
+  return [
+    "## Diff includes workflow-file pollution",
+    "",
+    "The review diff includes `.sandcastle/` workflow files alongside product files, but this issue does not appear to be about Sandcastle workflow changes.",
+    "",
+    "Remove unrelated workflow changes from the issue branch, keep only this issue's scoped product changes, commit, and emit `<promise>COMPLETE</promise>`.",
+    "",
+    "Changed files:",
+    "```",
+    context.changedFiles.join("\n").slice(0, 3000),
+    "```",
+  ].join("\n");
+}
+
+function pushIssueBranch(
+  worktreePath: string,
+  issueBranch: string,
+  purpose: "review" | "stuck",
+): void {
+  for (let attempt = 1; attempt <= MAX_PUSH_RECOVERY_ATTEMPTS; attempt++) {
+    const localHead = git(["rev-parse", "HEAD"], worktreePath).trim();
+    const lsRemote = spawnSync(
+      "git",
+      ["ls-remote", "--heads", "origin", issueBranch],
+      { cwd: worktreePath, encoding: "utf8" },
+    );
+    if (lsRemote.status !== 0) {
+      throw new Error(
+        `Could not inspect remote ${issueBranch} before ${purpose} push:\n${`${lsRemote.stdout ?? ""}${lsRemote.stderr ?? ""}`.trim()}`,
+      );
+    }
+
+    const remoteLine = (lsRemote.stdout ?? "")
+      .split("\n")
+      .map((line) => line.trim())
+      .find(Boolean);
+    const remoteSha = remoteLine?.split(/\s+/)[0] ?? "";
+
+    if (!remoteSha) {
+      const push = spawnSync(
+        "git",
+        ["push", "-u", "origin", `HEAD:refs/heads/${issueBranch}`],
+        { cwd: worktreePath, encoding: "utf8" },
+      );
+      if (push.status === 0) return;
+      throw new Error(
+        `Could not create remote ${issueBranch} for ${purpose} push:\n${`${push.stdout ?? ""}${push.stderr ?? ""}`.trim()}`,
+      );
+    }
+
+    const fetch = spawnSync("git", ["fetch", "origin", issueBranch], {
+      cwd: worktreePath,
+      encoding: "utf8",
+    });
+    if (fetch.status !== 0) {
+      throw new Error(
+        `Could not fetch remote ${issueBranch} before ${purpose} push:\n${`${fetch.stdout ?? ""}${fetch.stderr ?? ""}`.trim()}`,
+      );
+    }
+
+    if (remoteSha === localHead) {
+      const push = spawnSync(
+        "git",
+        ["push", "-u", "origin", `HEAD:refs/heads/${issueBranch}`],
+        { cwd: worktreePath, encoding: "utf8" },
+      );
+      if (push.status === 0) return;
+      throw new Error(
+        `Could not update remote ${issueBranch} for ${purpose} push:\n${`${push.stdout ?? ""}${push.stderr ?? ""}`.trim()}`,
+      );
+    }
+
+    const fastForward =
+      spawnSync(
+        "git",
+        ["merge-base", "--is-ancestor", remoteSha, localHead],
+        { cwd: worktreePath, encoding: "utf8" },
+      ).status === 0;
+
+    if (fastForward) {
+      const push = spawnSync(
+        "git",
+        ["push", "-u", "origin", `HEAD:refs/heads/${issueBranch}`],
+        { cwd: worktreePath, encoding: "utf8" },
+      );
+      if (push.status === 0) return;
+      if (attempt < MAX_PUSH_RECOVERY_ATTEMPTS) continue;
+      throw new Error(
+        `Could not fast-forward remote ${issueBranch} for ${purpose} push:\n${`${push.stdout ?? ""}${push.stderr ?? ""}`.trim()}`,
+      );
+    }
+
+    const diagnosticBranch = `diagnostic/${issueBranch}-prepush-${Date.now()}`;
+    console.warn(
+      `  remote ${issueBranch} diverged from local HEAD; archiving ${remoteSha.slice(0, 7)} to ${diagnosticBranch} and replacing ${issueBranch} with lease protection`,
+    );
+    const archive = spawnSync(
+      "git",
+      ["push", "origin", `${remoteSha}:refs/heads/${diagnosticBranch}`],
+      { cwd: worktreePath, encoding: "utf8" },
+    );
+    if (archive.status !== 0) {
+      throw new Error(
+        `Could not archive remote ${issueBranch} to ${diagnosticBranch}:\n${`${archive.stdout ?? ""}${archive.stderr ?? ""}`.trim()}`,
+      );
+    }
+
+    const replace = spawnSync(
+      "git",
+      [
+        "push",
+        `--force-with-lease=refs/heads/${issueBranch}:${remoteSha}`,
+        "-u",
+        "origin",
+        `HEAD:refs/heads/${issueBranch}`,
+      ],
+      { cwd: worktreePath, encoding: "utf8" },
+    );
+    if (replace.status === 0) return;
+    if (attempt < MAX_PUSH_RECOVERY_ATTEMPTS) continue;
+    throw new Error(
+      `Could not replace remote ${issueBranch} after archiving ${diagnosticBranch}:\n${`${replace.stdout ?? ""}${replace.stderr ?? ""}`.trim()}`,
+    );
+  }
+}
+
+// Terminal success: push the issue branch to origin and add the `Review`
+// label. The loop never opens the PR, merges, or closes the issue — that is a
+// human's call. The issue stays open so it surfaces as needing a PR.
+function deliverReviewReady(
+  issue: IssueDetail,
+  worktreePath: string,
+  issueBranch: string,
+): void {
+  pushIssueBranch(worktreePath, issueBranch, "review");
+  execFileSync(
+    "gh",
+    [
+      "issue",
+      "comment",
+      String(issue.number),
+      "--body",
+      [
+        `Review-ready: pushed branch \`${issueBranch}\` to origin.`,
+        "",
+        `It passed the validation gate and earned a clean reviewer approval against \`${originBaseRef()}\`. Open a pull request from \`${issueBranch}\` into \`${baseBranch}\` when you're ready.`,
+        "",
+        "The agent loop did not merge or close this issue.",
+      ].join("\n"),
+    ],
+    { stdio: "inherit" },
+  );
+  execFileSync(
+    "gh",
+    ["issue", "edit", String(issue.number), "--add-label", REVIEW_LABEL],
+    { stdio: "inherit" },
+  );
+}
+
+function markStuck(
+  issue: IssueDetail,
+  worktreePath: string,
+  issueBranch: string,
+  options: {
+    lastFeedback: string;
+    roundsUsed?: number;
+    terminalReason?: StuckTerminalReason;
+    headline?: string;
+  },
+): void {
+  try {
+    pushIssueBranch(worktreePath, issueBranch, "stuck");
+  } catch (err) {
+    console.warn(
+      `Could not push ${issueBranch} on stuck — continuing. ${err instanceof Error ? err.message : err}`,
+    );
+  }
+  execFileSync(
+    "gh",
+    [
+      "issue",
+      "comment",
+      String(issue.number),
+      "--body",
+      formatStuckIssueComment({
+        lastFeedback: options.lastFeedback,
+        roundsUsed: options.roundsUsed,
+        maxReviewRounds: MAX_REVIEW_ROUNDS,
+        terminalReason: options.terminalReason,
+        headline: options.headline,
+      }),
+    ],
+    { stdio: "inherit" },
+  );
+  execFileSync(
+    "gh",
+    ["issue", "edit", String(issue.number), "--add-label", STUCK_LABEL],
+    { stdio: "inherit" },
+  );
+}
+
+function dockerSandboxProvider() {
+  return docker({
+    mounts: [...OPENCODE_MOUNTS, ...CACHE_MOUNTS],
+    env: LOOP_CONFIG.cache.sandboxEnv,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Per-issue pipeline
+// ---------------------------------------------------------------------------
+
+async function processIssue(issue: IssueDetail): Promise<void> {
+  console.log(`Picked issue #${issue.number}: ${issue.title}`);
+
+  const issueBranch = `issue-${issue.number}`;
+  const issueComments = flattenComments(issue.comments);
+
+  preflightExistingIssueBranch(issue, issueBranch);
+
+  const sandbox = await sandcastle.createSandbox({
+    sandbox: dockerSandboxProvider(),
+    branch: issueBranch,
+    // Fork fresh from the remote-tracking mainline every time. This ref is
+    // refreshed at startup and re-fetched each round, so issue branches never
+    // build on each other.
+    baseBranch: originBaseRef(),
+    copyToWorktree: COPY_TO_WORKTREE,
+    hooks: {
+      sandbox: {
+        onSandboxReady: SANDBOX_READY_COMMANDS.map((command) => ({ command })),
+      },
+    },
+  });
+  ensureOpencodeGitExclude(sandbox.worktreePath);
+
+  let feedback = "";
+  let lastFeedback = "";
+  let approved = false;
+  let alreadySatisfiedReason = "";
+  let progressState: NoProgressState = initialNoProgressState();
+  let roundsUsed = 0;
+  let terminalReason:
+    | "stuck_rounds_exhausted"
+    | "stuck_no_progress"
+    | "stuck_reviewer_parse_failure"
+    | "stuck_reviewer_incomplete"
+    | "stuck_needs_human_review"
+    | "stuck_livelock"
+    | "blocked" = "stuck_rounds_exhausted";
+  let recoveryAttempts = 0;
+
+  try {
+    for (let round = 1; round <= MAX_REVIEW_ROUNDS; round++) {
+      console.log(
+        `\n--- Round ${round}/${MAX_REVIEW_ROUNDS} for #${issue.number} ---`,
+      );
+      roundsUsed = round;
+
+      let committedCount = 0;
+      const isRework = agentInvocationStageForRound(round) === "rework";
+      let coderResult: Awaited<ReturnType<typeof sandbox.run>>;
+
+      if (isRework) {
+        const reworkUserArgs = {
+          ISSUE_NUMBER: String(issue.number),
+          ISSUE_TITLE: issue.title,
+          ISSUE_BODY: issue.body || "(no body)",
+          REVIEW_FEEDBACK: feedback,
+        };
+        const reworkTemplate = readFileSync(
+          REWORK_USER_PROMPT_FILE.replace(/^\.\//, ""),
+          "utf8",
+        );
+        const rendered = renderSlimMessage(reworkTemplate, reworkUserArgs);
+        const sizeCheck = enforceArgvSizeLimit(rendered);
+        if (!sizeCheck.ok) {
+          feedback = sizeCheck.error;
+          lastFeedback = feedback;
+          continue;
+        }
+
+        writeAgentDefinitionFile(
+          sandbox.worktreePath,
+          REWORK_AGENT_CONFIG.name,
+          buildAgentDefinition(
+            REWORK_AGENT_CONFIG,
+            REWORK_MODEL,
+            readFileSync(
+              REWORK_AGENT_SYSTEM_PROMPT_FILE.replace(/^\.\//, ""),
+              "utf8",
+            ),
+          ),
+        );
+
+        const reworkRunName = `rework #${issue.number} r${round}`;
+        const reworkLivelockWatchdog =
+          createLivelockWatchdogSandcastleRunOptions({
+            logPath: agentRunLogPath(issueBranch, reworkRunName),
+            getWorktreeSnapshot: () =>
+              captureWorktreeProgressSnapshot(sandbox.worktreePath),
+          });
+        try {
+          coderResult = await recordMeasuredAgentRun(
+            {
+              prd: label,
+              issue: issue.number,
+              stage: "rework",
+              agent: REWORK_AGENT_CONFIG.name,
+              round,
+              model: REWORK_MODEL,
+              runName: reworkRunName,
+              worktreePath: sandbox.worktreePath,
+              promptFile: REWORK_USER_PROMPT_FILE,
+              promptArgs: reworkUserArgs,
+            },
+            () =>
+              sandbox.run({
+                name: reworkRunName,
+                agent: sandcastle.opencode(REWORK_MODEL, {
+                  agent: REWORK_AGENT_CONFIG.name,
+                }),
+                maxIterations: CODER_MAX_ITERATIONS,
+                completionSignal: "<promise>COMPLETE</promise>",
+                idleTimeoutSeconds,
+                promptFile: REWORK_USER_PROMPT_FILE,
+                promptArgs: reworkUserArgs,
+                signal: reworkLivelockWatchdog.signal,
+                logging: reworkLivelockWatchdog.logging,
+              }),
+          );
+        } catch (reworkErr) {
+          const control = resolveReworkLivelockControlFlow(reworkErr);
+          if (control.action === "break_to_stuck") {
+            console.log(
+              `  rework livelock on round ${round}; bailing to stuck`,
+            );
+            terminalReason = control.terminalReason;
+            lastFeedback = control.feedback;
+            break;
+          }
+          throw control.error;
+        }
+      } else {
+        const coderUserArgs = {
+          ISSUE_NUMBER: String(issue.number),
+          ISSUE_TITLE: issue.title,
+          ISSUE_BODY: issue.body || "(no body)",
+          ISSUE_COMMENTS: issueComments,
+        };
+        const coderTemplate = readFileSync(
+          CODER_USER_PROMPT_FILE.replace(/^\.\//, ""),
+          "utf8",
+        );
+        const rendered = renderSlimMessage(coderTemplate, coderUserArgs);
+        const sizeCheck = enforceArgvSizeLimit(rendered);
+        if (!sizeCheck.ok) {
+          feedback = sizeCheck.error;
+          lastFeedback = feedback;
+          continue;
+        }
+
+        writeAgentDefinitionFile(
+          sandbox.worktreePath,
+          CODER_AGENT_CONFIG.name,
+          buildAgentDefinition(
+            CODER_AGENT_CONFIG,
+            CODER_MODEL,
+            readFileSync(
+              CODER_AGENT_SYSTEM_PROMPT_FILE.replace(/^\.\//, ""),
+              "utf8",
+            ),
+          ),
+        );
+
+        const coderRunName = `coder #${issue.number} r${round}`;
+        const livelockWatchdog = createLivelockWatchdogSandcastleRunOptions({
+          logPath: agentRunLogPath(issueBranch, coderRunName),
+          getWorktreeSnapshot: () =>
+            captureWorktreeProgressSnapshot(sandbox.worktreePath),
+        });
+        try {
+          coderResult = await recordMeasuredAgentRun(
+            {
+              prd: label,
+              issue: issue.number,
+              stage: "coder",
+              agent: CODER_AGENT_CONFIG.name,
+              round,
+              model: CODER_MODEL,
+              runName: coderRunName,
+              worktreePath: sandbox.worktreePath,
+              promptFile: CODER_USER_PROMPT_FILE,
+              promptArgs: coderUserArgs,
+            },
+            () =>
+              sandbox.run({
+                name: coderRunName,
+                agent: sandcastle.opencode(CODER_MODEL, {
+                  agent: CODER_AGENT_CONFIG.name,
+                }),
+                maxIterations: CODER_MAX_ITERATIONS,
+                completionSignal: "<promise>COMPLETE</promise>",
+                idleTimeoutSeconds,
+                promptFile: CODER_USER_PROMPT_FILE,
+                promptArgs: coderUserArgs,
+                signal: livelockWatchdog.signal,
+                logging: livelockWatchdog.logging,
+              }),
+          );
+        } catch (coderErr) {
+          const control = resolveRound1CoderLivelockControlFlow(coderErr);
+          if (control.action === "continue_with_feedback") {
+            console.log(
+              `  coder livelock on round ${round}; escalating to rework`,
+            );
+            feedback = control.feedback;
+            lastFeedback = feedback;
+            continue;
+          }
+          throw control.error;
+        }
+      }
+
+      const blockedMatch = coderResult.stdout.match(
+        /<blocked>([\s\S]*?)<\/blocked>/,
+      );
+      if (blockedMatch) {
+        const reason = blockedMatch[1]!.trim();
+        console.log(`  coder signaled blocked: ${reason.slice(0, 200)}`);
+        lastFeedback = `Coder signaled blocked on round ${round}:\n\n${reason}`;
+        terminalReason = "blocked";
+        break;
+      }
+
+      const alreadySatisfiedMatch = coderResult.stdout.match(
+        /<already_satisfied>([\s\S]*?)<\/already_satisfied>/,
+      );
+      if (alreadySatisfiedMatch) {
+        const reason = alreadySatisfiedMatch[1]!.trim();
+        const existingAheadCount = countCommitsAheadOfBase(
+          sandbox.worktreePath,
+        );
+        if (existingAheadCount > 0) {
+          console.log(
+            `  coder signaled already_satisfied, but branch has ${existingAheadCount} commit(s) ahead of ${originBaseRef()}; routing through validation/review`,
+          );
+          committedCount = existingAheadCount;
+        } else {
+          console.log(
+            `  coder signaled already_satisfied: ${reason.slice(0, 200)}`,
+          );
+          alreadySatisfiedReason = reason;
+          break;
+        }
+      } else if (coderResult.commits.length === 0) {
+        const uncommitted = git(["status", "-s"], sandbox.worktreePath).trim();
+        if (uncommitted) {
+          console.log(
+            `  coder produced no commits but worktree has uncommitted edits; feeding back commit reminder`,
+          );
+          feedback = [
+            "## You edited files but did not commit",
+            "",
+            "These files have uncommitted changes in the worktree:",
+            "",
+            "```",
+            uncommitted,
+            "```",
+            "",
+            'Edits without a commit are invisible to the host. Sandcastle only sees `git log` history, not the working tree. Run `git add <files>` and `git commit -m "<message>"` to save your work. Then re-verify and emit `<promise>COMPLETE</promise>`.',
+          ].join("\n");
+        } else {
+          const existingAheadCount = countCommitsAheadOfBase(
+            sandbox.worktreePath,
+          );
+          if (existingAheadCount > 0) {
+            // A restarted loop may re-enter an existing issue branch that
+            // already contains committed work from a prior run. Treat that
+            // branch state as the candidate for validation/review instead of
+            // looping forever on "No commits produced".
+            console.log(
+              `  coder produced no new commits, but branch already has ${existingAheadCount} commit(s) ahead of ${originBaseRef()}; validating existing branch state`,
+            );
+            committedCount = existingAheadCount;
+          } else {
+            console.log(
+              `  coder produced no commits and no uncommitted changes; feeding back "no commits" message`,
+            );
+            feedback =
+              "## No commits produced\n\nYour previous run finished without committing any changes. Re-read the issue, then make the required code changes and commit them.";
+          }
+        }
+        if (committedCount === 0) {
+          lastFeedback = feedback;
+          continue;
+        }
+      }
+      if (committedCount === 0) {
+        committedCount = coderResult.commits.length;
+      }
+
+      const dirty = git(["status", "-s"], sandbox.worktreePath).trim();
+      if (dirty) {
+        console.log(
+          `  branch has ${committedCount} new commit(s) but uncommitted edits remain; feeding back cleanup request`,
+        );
+        feedback = [
+          "## Uncommitted changes after commit",
+          "",
+          "Your run produced commits, but the worktree still has uncommitted changes:",
+          "",
+          "```",
+          dirty,
+          "```",
+          "",
+          "Commit the intended issue changes and revert unrelated edits. The host validates and reviews only a clean, committed branch.",
+        ].join("\n");
+        lastFeedback = feedback;
+        continue;
+      }
+
+      console.log(
+        `  branch has ${committedCount} new commit(s); syncing branch for validation/review`,
+      );
+      const prep = prepareBranchForReview(
+        sandbox.worktreePath,
+        issueBranch,
+        recoveryAttempts,
+      );
+      recoveryAttempts = prep.recoveryAttempts;
+      if (!prep.ok) {
+        feedback = prep.feedback;
+        lastFeedback = feedback;
+        continue;
+      }
+
+      let reviewContext = computeReviewContext(
+        sandbox.worktreePath,
+        prep.baseSha,
+      );
+      const recoveryAttemptsBeforeDiffCheck = recoveryAttempts;
+      const recovery = maybeRecoverOversizedOrPollutedDiff(
+        sandbox.worktreePath,
+        issue,
+        issueBranch,
+        reviewContext,
+        recoveryAttempts,
+      );
+      recoveryAttempts = recovery.recoveryAttempts;
+      if (!recovery.ok) {
+        feedback = recovery.feedback;
+        lastFeedback = feedback;
+        continue;
+      }
+      if (
+        recovery.baseSha !== reviewContext.baseSha ||
+        recovery.recoveryAttempts !== recoveryAttemptsBeforeDiffCheck
+      ) {
+        reviewContext = computeReviewContext(
+          sandbox.worktreePath,
+          recovery.baseSha,
+        );
+      }
+      if (reviewContext.diffBytes > REVIEW_DIFF_MAX_BYTES) {
+        feedback = formatDiffTooLargeFeedback(reviewContext);
+        lastFeedback = feedback;
+        const progress = observeFailedRoundFingerprint(
+          progressState,
+          {
+            diffHash: sha1(normalizeForHash(reviewContext.diff)),
+            source: "diff_too_large",
+            signatureHash: sha1(String(REVIEW_DIFF_MAX_BYTES)),
+            signatureSummary: `review diff exceeds ${REVIEW_DIFF_MAX_BYTES} bytes`,
+          },
+          FAILED_ROUND_REPEAT_LIMIT,
+        );
+        progressState = progress.state;
+        if (progress.stalled) {
+          terminalReason = "stuck_no_progress";
+          lastFeedback = formatNoProgressFeedback({
+            round,
+            source: "diff_too_large",
+            repeatedCount: progress.state.repeatCount,
+            signatureSummary: `review diff exceeds ${REVIEW_DIFF_MAX_BYTES} bytes`,
+            lastFeedback: feedback,
+          });
+          break;
+        }
+        continue;
+      }
+      if (looksLikeWorkflowPollution(issue, reviewContext.changedFiles)) {
+        feedback = formatWorkflowPollutionFeedback(reviewContext);
+        lastFeedback = feedback;
+        const progress = observeFailedRoundFingerprint(
+          progressState,
+          {
+            diffHash: sha1(normalizeForHash(reviewContext.diff)),
+            source: "workflow_pollution",
+            signatureHash: sha1(
+              normalizeForHash(reviewContext.changedFiles.join("\n")),
+            ),
+            signatureSummary: "workflow-only files changed outside issue scope",
+          },
+          FAILED_ROUND_REPEAT_LIMIT,
+        );
+        progressState = progress.state;
+        if (progress.stalled) {
+          terminalReason = "stuck_no_progress";
+          lastFeedback = formatNoProgressFeedback({
+            round,
+            source: "workflow_pollution",
+            repeatedCount: progress.state.repeatCount,
+            signatureSummary: "workflow-only files changed outside issue scope",
+            lastFeedback: feedback,
+          });
+          break;
+        }
+        continue;
+      }
+
+      console.log(
+        `  review diff: ${reviewContext.diffBytes} bytes, ${reviewContext.changedFiles.length} file(s), aspects: ${reviewContext.reviewAspects.join(", ")}`,
+      );
+      console.log(`  running validation gate`);
+      const gate = runValidationGate(sandbox.worktreePath, {
+        prd: label,
+        issue: issue.number,
+        round,
+        gate: "issue",
+      });
+      if (!gate.ok) {
+        const validationFingerprint = buildValidationFailureFingerprint(
+          reviewContext.diff,
+          gate.signature,
+        );
+        const validationProgress = observeFailedRoundFingerprint(
+          progressState,
+          validationFingerprint,
+          FAILED_ROUND_REPEAT_LIMIT,
+        );
+        progressState = validationProgress.state;
+        feedback = gate.feedback;
+        lastFeedback = feedback;
+        if (validationProgress.stalled) {
+          console.log(
+            `  no-progress: the same validation failure recurred across rounds; bailing to stuck`,
+          );
+          terminalReason = "stuck_no_progress";
+          lastFeedback = formatNoProgressFeedback({
+            round,
+            source: validationFingerprint.source,
+            repeatedCount: validationProgress.state.repeatCount,
+            signatureSummary: validationFingerprint.signatureSummary,
+            lastFeedback: feedback,
+          });
+          break;
+        }
+        continue;
+      }
+
+      console.log(`  validation green; invoking reviewer`);
+      const reviewerUserArgs = {
+        ISSUE_NUMBER: String(issue.number),
+        ISSUE_TITLE: issue.title,
+        ISSUE_BODY: issue.body || "(no body)",
+        ISSUE_COMMENTS: issueComments,
+        BASE_BRANCH: originBaseRef(),
+        REVIEW_BASE_SHA: reviewContext.baseSha,
+        DIFF: reviewContext.diff,
+        DIFF_BYTES: String(reviewContext.diffBytes),
+        DIFF_MAX_BYTES: String(REVIEW_DIFF_MAX_BYTES),
+        CHANGED_FILES: reviewContext.changedFiles.join("\n") || "(none)",
+        DIFF_STAT: reviewContext.diffStat,
+        REVIEW_ASPECTS: reviewContext.reviewAspects.join(", "),
+        ECOSYSTEMS: reviewContext.ecosystems.join(", ") || "(unknown)",
+      };
+      const reviewerTemplate = readFileSync(
+        REVIEWER_USER_PROMPT_FILE.replace(/^\.\//, ""),
+        "utf8",
+      );
+      const renderedReviewerMessage = renderSlimMessage(
+        reviewerTemplate,
+        reviewerUserArgs,
+      );
+      const reviewerSizeCheck = enforceArgvSizeLimit(renderedReviewerMessage);
+      if (!reviewerSizeCheck.ok) {
+        feedback = reviewerSizeCheck.error;
+        lastFeedback = feedback;
+        const progress = observeFailedRoundFingerprint(
+          progressState,
+          {
+            diffHash: sha1(normalizeForHash(reviewContext.diff)),
+            source: "host_input_limit",
+            signatureHash: sha1(normalizeForHash(reviewerSizeCheck.error)),
+            signatureSummary: "reviewer prompt exceeded argv/input limit",
+          },
+          FAILED_ROUND_REPEAT_LIMIT,
+        );
+        progressState = progress.state;
+        if (progress.stalled) {
+          terminalReason = "stuck_no_progress";
+          lastFeedback = formatNoProgressFeedback({
+            round,
+            source: "host_input_limit",
+            repeatedCount: progress.state.repeatCount,
+            signatureSummary: "reviewer prompt exceeded argv/input limit",
+            lastFeedback: feedback,
+          });
+          break;
+        }
+        continue;
+      }
+
+      writeAgentDefinitionFile(
+        sandbox.worktreePath,
+        REVIEWER_AGENT_CONFIG.name,
+        buildAgentDefinition(
+          REVIEWER_AGENT_CONFIG,
+          REVIEWER_MODEL,
+          readFileSync(
+            REVIEWER_AGENT_SYSTEM_PROMPT_FILE.replace(/^\.\//, ""),
+            "utf8",
+          ),
+        ),
+      );
+
+      const reviewerMaxAttempts = LOOP_CONFIG.reviewer.maxAttempts;
+      let reviewerApproved = false;
+      let reviewerNeedsRework = false;
+      let reviewerTerminalFeedback: string | null = null;
+      for (let attempt = 1; attempt <= reviewerMaxAttempts; attempt++) {
+        const reviewerRunName = buildReviewerAttemptRunName(
+          issue.number,
+          round,
+          attempt,
+        );
+        const reviewerResult = await recordMeasuredAgentRun(
+          {
+            prd: label,
+            issue: issue.number,
+            stage: "reviewer",
+            agent: REVIEWER_AGENT_CONFIG.name,
+            round,
+            model: REVIEWER_MODEL,
+            runName: reviewerRunName,
+            worktreePath: sandbox.worktreePath,
+            promptFile: REVIEWER_USER_PROMPT_FILE,
+            promptArgs: reviewerUserArgs,
+          },
+          () =>
+            sandbox.run({
+              name: reviewerRunName,
+              agent: sandcastle.opencode(REVIEWER_MODEL, {
+                agent: REVIEWER_AGENT_CONFIG.name,
+              }),
+              maxIterations: 1,
+              completionSignal: "</review>",
+              idleTimeoutSeconds,
+              promptFile: REVIEWER_USER_PROMPT_FILE,
+              promptArgs: reviewerUserArgs,
+            }),
+        );
+        const logFilePath =
+          typeof reviewerResult === "object" &&
+          reviewerResult !== null &&
+          "logFilePath" in reviewerResult &&
+          typeof reviewerResult.logFilePath === "string"
+            ? reviewerResult.logFilePath
+            : undefined;
+        const runLogText =
+          logFilePath && existsSync(logFilePath)
+            ? readFileSync(logFilePath, "utf8")
+            : undefined;
+        const acquisition = acquireReviewerResult({
+          stdout: reviewerResult.stdout,
+          runLogText,
+          runLogReadError:
+            logFilePath && !existsSync(logFilePath)
+              ? `missing log file at ${logFilePath}`
+              : undefined,
+          logFilePath,
+        });
+        recordReviewerResult({
+          prd: label,
+          issue: issue.number,
+          round,
+          attempt,
+          maxAttempts: reviewerMaxAttempts,
+          status:
+            acquisition.kind === "verdict"
+              ? acquisition.review.decision
+              : acquisition.kind,
+          resultSource: acquisition.resultSource,
+          logFallbackUsed: acquisition.logFallbackUsed,
+          logFilePath,
+          parseFailureCode:
+            acquisition.kind === "parse_failed" ? acquisition.code : undefined,
+        });
+        if (acquisition.kind === "verdict") {
+          const review = acquisition.review;
+          console.log(`  reviewer decision: ${review.decision}`);
+          if (review.decision === "approved") {
+            approved = true;
+            reviewerApproved = true;
+            break;
+          }
+          if (review.decision === "needs_human_review") {
+            terminalReason = "stuck_needs_human_review";
+            reviewerTerminalFeedback = formatReviewerAcquisitionFeedback({
+              header: "## Reviewer requested human review",
+              round,
+              attempt,
+              maxAttempts: reviewerMaxAttempts,
+              runName: reviewerRunName,
+              reviewBaseSha: reviewContext.baseSha,
+              candidateHeadSha: git(
+                ["rev-parse", "HEAD"],
+                sandbox.worktreePath,
+              ).trim(),
+              candidateTreeSha: treeShaOf("HEAD", sandbox.worktreePath),
+              logFilePath,
+              resultSource: acquisition.resultSource,
+              failureCode: "needs_human_review",
+              excerpt: sanitizeReviewerExcerpt(reviewerResult.stdout),
+              diagnostics: acquisition.diagnostics,
+            });
+            break;
+          }
+          feedback = formatFeedback(review);
+          lastFeedback = feedback;
+          const reviewFingerprint = buildReviewerFailureFingerprint(
+            reviewContext.diff,
+            review,
+          );
+          const progress = observeFailedRoundFingerprint(
+            progressState,
+            reviewFingerprint,
+            FAILED_ROUND_REPEAT_LIMIT,
+          );
+          progressState = progress.state;
+          if (progress.stalled) {
+            terminalReason = "stuck_no_progress";
+            lastFeedback = formatNoProgressFeedback({
+              round,
+              source: reviewFingerprint.source,
+              repeatedCount: progress.state.repeatCount,
+              signatureSummary: reviewFingerprint.signatureSummary,
+              lastFeedback: feedback,
+            });
+            reviewerNeedsRework = false;
+            break;
+          }
+          reviewerNeedsRework = true;
+          break;
+        }
+
+        const terminalHeader =
+          acquisition.kind === "parse_failed"
+            ? "## Reviewer parse failure"
+            : "## Reviewer incomplete";
+        reviewerTerminalFeedback = formatReviewerAcquisitionFeedback({
+          header: terminalHeader,
+          round,
+          attempt,
+          maxAttempts: reviewerMaxAttempts,
+          runName: reviewerRunName,
+          reviewBaseSha: reviewContext.baseSha,
+          candidateHeadSha: git(
+            ["rev-parse", "HEAD"],
+            sandbox.worktreePath,
+          ).trim(),
+          candidateTreeSha: treeShaOf("HEAD", sandbox.worktreePath),
+          logFilePath,
+          resultSource: acquisition.resultSource,
+          failureCode: acquisition.code,
+          excerpt: sanitizeReviewerExcerpt(
+            runLogText ?? reviewerResult.stdout ?? "",
+          ),
+          diagnostics: acquisition.diagnostics,
+        });
+        if (attempt < reviewerMaxAttempts) {
+          console.log(
+            `  reviewer attempt ${attempt}/${reviewerMaxAttempts} failed to produce a valid verdict (${summarizeReviewerAttemptFailure(acquisition)}); retrying`,
+          );
+          continue;
+        }
+        terminalReason =
+          acquisition.kind === "parse_failed"
+            ? "stuck_reviewer_parse_failure"
+            : "stuck_reviewer_incomplete";
+        break;
+      }
+      if (reviewerApproved || approved) {
+        break;
+      }
+      if (terminalReason === "stuck_needs_human_review") {
+        lastFeedback = reviewerTerminalFeedback ?? lastFeedback;
+        break;
+      }
+      if (
+        terminalReason === "stuck_reviewer_parse_failure" ||
+        terminalReason === "stuck_reviewer_incomplete" ||
+        terminalReason === "stuck_no_progress"
+      ) {
+        lastFeedback = reviewerTerminalFeedback ?? lastFeedback;
+        break;
+      }
+      if (reviewerNeedsRework) {
+        continue;
+      }
+    }
+
+    if (alreadySatisfiedReason) {
+      // On a backlog of already-triaged tickets, "no work needed" is
+      // suspicious enough to warrant a human glance rather than an automatic
+      // close. Route it to the stuck lane with an explanatory headline.
+      markStuck(issue, sandbox.worktreePath, issueBranch, {
+        headline: `Coder reported this issue is already satisfied on \`${baseBranch}\`; no code changes were produced. A human should confirm before closing.`,
+        lastFeedback: alreadySatisfiedReason,
+        roundsUsed,
+      });
+      console.log(
+        `Issue #${issue.number} marked ${STUCK_LABEL}: coder reported already satisfied.`,
+      );
+      recordIssueOutcome({
+        prd: label,
+        issue: issue.number,
+        outcome: "already_satisfied",
+        roundsUsed,
+      });
+    } else if (approved) {
+      try {
+        deliverReviewReady(issue, sandbox.worktreePath, issueBranch);
+        console.log(
+          `Issue #${issue.number} is review-ready: branch ${issueBranch} pushed and labelled ${REVIEW_LABEL}.`,
+        );
+        recordIssueOutcome({
+          prd: label,
+          issue: issue.number,
+          outcome: "review_ready",
+          roundsUsed,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `Issue #${issue.number} approved but review-ready delivery failed: ${msg.slice(0, 300)}`,
+        );
+        try {
+          markStuck(issue, sandbox.worktreePath, issueBranch, {
+            headline:
+              "Reviewer approved but the host could not push the branch or apply the Review label. Manual intervention required.",
+            lastFeedback: msg.slice(0, 4000),
+          });
+        } catch (stuckErr) {
+          console.error(
+            `markStuck also failed for #${issue.number}: ${stuckErr instanceof Error ? stuckErr.message : stuckErr}`,
+          );
+        }
+      }
+    } else {
+      const reasonHeader =
+        (lastFeedback || "(no feedback recorded)")
+          .split("\n")
+          .find((l) => l.trim().startsWith("##"))
+          ?.trim()
+          .replace(/^##\s*/, "") ?? "(no recognizable reason header)";
+      console.log(
+        `Issue #${issue.number} stuck after ${roundsUsed} round(s) (${terminalReason}). Reason: ${reasonHeader}`,
+      );
+      const preview = (lastFeedback || "")
+        .split("\n")
+        .slice(0, 12)
+        .map((l) => `    ${l}`)
+        .join("\n");
+      if (preview) {
+        console.log("  Last feedback (first 12 lines):");
+        console.log(preview);
+      }
+      try {
+        markStuck(issue, sandbox.worktreePath, issueBranch, {
+          lastFeedback: lastFeedback || "(no feedback recorded)",
+          roundsUsed,
+          terminalReason,
+        });
+      } catch (stuckErr) {
+        console.error(
+          `markStuck failed for #${issue.number}: ${stuckErr instanceof Error ? stuckErr.message : stuckErr}`,
+        );
+      }
+      recordIssueOutcome({
+        prd: label,
+        issue: issue.number,
+        outcome: terminalReason,
+        roundsUsed,
+      });
+    }
+  } catch (iterErr) {
+    console.error(
+      `Issue #${issue.number} crashed unexpectedly. Continuing to next issue.\n${iterErr instanceof Error ? (iterErr.stack ?? iterErr.message) : iterErr}`,
+    );
+    recordIssueOutcome({
+      prd: label,
+      issue: issue.number,
+      outcome: "crashed",
+      roundsUsed,
+    });
+  } finally {
+    await sandbox.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+
+ensureBaseBranchAvailable();
+ensureLabels();
+
+// Issues handled in this run. A terminal outcome adds the `Review` or
+// `agent-stuck` label (which `pickNextIssue` already excludes), but a crash
+// leaves no label — the skip set stops that issue from wedging the loop.
+const handledIssues = new Set<number>();
+let completedIterations = 0;
+let stopReason: "no_eligible_issue" | "max_iterations" = "no_eligible_issue";
+
+while (true) {
+  if (completedIterations >= MAX_ITERATIONS) {
+    stopReason = "max_iterations";
+    break;
+  }
+  const iteration = completedIterations + 1;
+  console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
+
+  const issue = pickNextIssue(handledIssues);
+  if (!issue) {
+    console.log(`No eligible issues with label '${label}'.`);
+    stopReason = "no_eligible_issue";
+    break;
+  }
+
+  handledIssues.add(issue.number);
+  await processIssue(issue);
+  completedIterations++;
+}
+
+console.log(
+  [
+    "\nBacklog loop stopped.",
+    `Reason: ${stopReason}`,
+    `Label: ${label}`,
+    `Issues processed: ${completedIterations}/${MAX_ITERATIONS}`,
+    `Handled issue numbers: ${[...handledIssues].sort((a, b) => a - b).join(", ") || "(none)"}`,
+  ].join("\n"),
+);
+
+console.log("\nAll done.");

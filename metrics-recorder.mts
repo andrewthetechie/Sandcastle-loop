@@ -172,6 +172,7 @@ export interface IssueOutcomeMetadata {
   issue: number;
   outcome:
     | "merged"
+    | "review_ready"
     | "already_satisfied"
     | "stuck_rounds_exhausted"
     | "stuck_no_progress"

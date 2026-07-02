@@ -1,6 +1,6 @@
 The public loop code is running on ubuntu@10.10.0.218. You have access via SSH.
 
-The loop is running in ~/lawncare-saas on 10.10.0.218. 
+The loop is running in ~/lawncare-saas on 10.10.0.218.
 
 ## Language
 
@@ -36,6 +36,22 @@ _Avoid_: Extra review round, retry round, final loop
 A single agent run that remains active but repeats the same operation without making observable progress toward completion. It is distinct from an issue that fails across multiple review rounds.
 _Avoid_: No-progress issue, stuck round, idle timeout
 
+**Issue-level no-progress**:
+A terminal condition in which completed issue rounds reproduce the same candidate diff and the same actionable failed-check outcome. It is detected across coder/rework attempts only after the applicable host check, validation gate, or review gate has returned, and is distinct from an active agent invocation repeating tool calls.
+_Avoid_: Agent invocation livelock, reviewer parse failure, reviewer incomplete
+
 **Rework escalation**:
 A retry of an issue attempt using the rework agent after the initial coder attempt fails, is rejected, or hits an agent invocation livelock. It may use the same model as the coder or a distinct configured rework model.
 _Avoid_: Coder retry, model escalation, reviewer retry
+
+**Backlog-clearer loop**:
+A loop that processes independent, already-triaged issues sharing one label. Each issue gets its own branch forked fresh from the mainline and is delivered on its own; issues never build on each other and are never merged by the loop. Distinct from the PRD loop, which drives a set of sequential issues toward one accumulating PRD branch.
+_Avoid_: PRD loop, extra review loop, sequential issue loop
+
+**Review-ready issue**:
+A backlog issue whose branch passed the validation gate and earned a clean reviewer approval. The loop signals this by adding the `Review` label and pushing the issue branch to origin; the issue stays open and a human opens the pull request. It is neither merged nor closed by the loop.
+_Avoid_: Merged issue, completed PRD issue, approved-and-merged
+
+**Backlog issue eligibility**:
+The condition for the backlog-clearer loop to pick an issue: open, carrying the target label, and carrying neither `Review` nor `agent-stuck`. The target label is never removed, so eligibility is expressed purely by the absence of the terminal labels.
+_Avoid_: Open issue, unprocessed issue, queue membership
