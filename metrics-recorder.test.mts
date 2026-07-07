@@ -1,11 +1,40 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { chdir, cwd } from "node:process";
 import { test } from "node:test";
 import {
   buildIssueOutcomeRecord,
   buildMeasuredAgentRunRecord,
   buildReviewerResultRecord,
   buildValidationRunRecord,
+  recordMeasuredAgentRun,
 } from "./metrics-recorder.mts";
+
+interface AgentStepCall {
+  stage: string;
+  agent?: string;
+  model?: string;
+  worktreePath?: string;
+  activeLogPath?: string;
+}
+
+/**
+ * Run `body` with cwd pointed at a throwaway dir so the metric append lands in a
+ * temp `.sandcastle/metrics/runs.jsonl` instead of the repo's.
+ */
+async function withTempCwd(body: () => Promise<void>): Promise<void> {
+  const previous = cwd();
+  const dir = mkdtempSync(join(tmpdir(), "metrics-recorder-"));
+  chdir(dir);
+  try {
+    await body();
+  } finally {
+    chdir(previous);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 test("buildValidationRunRecord computes elapsed and tags the kind", () => {
   const record = buildValidationRunRecord(
@@ -158,6 +187,65 @@ test("buildIssueOutcomeRecord records reviewer terminal outcomes distinctly", ()
     roundsUsed: 1,
   });
   assert.equal(humanReview.outcome, "stuck_needs_human_review");
+});
+
+test("recordMeasuredAgentRun reports the agent step exactly once on success", async () => {
+  await withTempCwd(async () => {
+    const calls: AgentStepCall[] = [];
+    const result = await recordMeasuredAgentRun(
+      {
+        prd: 4,
+        issue: 7,
+        stage: "coder",
+        agent: "coder",
+        round: 1,
+        model: "anthropic/claude-sonnet-4-5",
+        runName: "prd-004-issue-007-coder",
+        worktreePath: "/worktree",
+        activeLogPath: "/repo/.sandcastle/tui/logs/coder.log",
+      },
+      async () => "run-value",
+      { beginAgentStep: (input) => calls.push(input) },
+    );
+
+    assert.equal(result, "run-value");
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0], {
+      stage: "coder",
+      agent: "coder",
+      model: "anthropic/claude-sonnet-4-5",
+      worktreePath: "/worktree",
+      activeLogPath: "/repo/.sandcastle/tui/logs/coder.log",
+    });
+  });
+});
+
+test("recordMeasuredAgentRun reports the agent step once even when the run throws", async () => {
+  await withTempCwd(async () => {
+    let calls = 0;
+    await assert.rejects(
+      recordMeasuredAgentRun(
+        {
+          prd: 4,
+          stage: "reviewer",
+          agent: "reviewer",
+          round: 1,
+          model: "glm",
+          runName: "reviewer #7 r1 a1",
+        },
+        async () => {
+          throw new Error("agent boom");
+        },
+        {
+          beginAgentStep: () => {
+            calls += 1;
+          },
+        },
+      ),
+      /agent boom/,
+    );
+    assert.equal(calls, 1);
+  });
 });
 
 test("buildReviewerResultRecord captures attempt metadata and result source", () => {

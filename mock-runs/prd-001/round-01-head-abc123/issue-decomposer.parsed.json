@@ -1,0 +1,25 @@
+{
+  "kind": "followup_issues",
+  "status": "issues",
+  "summary": "Converted the actionable finding into one follow-up issue.",
+  "issues": [
+    {
+      "title": "Extract review orchestration helper",
+      "body": "## Context\nCreate a focused helper.\n\n## Acceptance Criteria\n- Session orchestration is isolated.\n\n## Provenance\n- code_quality CQ-001",
+      "priority": "high",
+      "source_findings": [
+        {
+          "reviewer": "code_quality",
+          "finding_id": "CQ-001",
+          "axis": "code_quality",
+          "title": "Extract review orchestration helper"
+        }
+      ],
+      "files": [
+        "run-prd-extra-reviews.mts"
+      ],
+      "dedupe_key": "extract-review-orchestration-helper-cq-001"
+    }
+  ],
+  "needs_human_review_reason": ""
+}

@@ -32,6 +32,14 @@ const EXPECTED_SYSTEM_PROMPT = [
   "- Change dependency manifests except for the missing-dependency rule below.",
   "- Delete or rewrite an existing `import`, `use`, or `require` just to silence an unresolved-module error.",
   "",
+  "## Host-only database validation",
+  "",
+  "Full PostgreSQL validation is executed by the host, not this sandbox. Host-validation feedback is diagnostic evidence only.",
+  "",
+  "Never run `pg-ensure`, `pg_ctl`, `postgres`, `docker`, `sudo`, `su`, or `alembic upgrade` in the sandbox. Do not start, reset, configure, or administer PostgreSQL here.",
+  "",
+  "Make only the source or test change indicated by the feedback. Run only targeted non-database validation; the host will rerun the full gate after your commit.",
+  "",
   "# Completion",
   "",
   "When `git log -1 --stat` shows your fix and `git status -s` is empty, emit `<promise>COMPLETE</promise>` on its own line and stop.",
@@ -106,6 +114,14 @@ test("rework agent system prompt contains only the static rework instructions", 
   assert.match(systemPrompt, /## Missing dependency/);
   assert.doesNotMatch(systemPrompt, /\{\{/);
   assert.doesNotMatch(systemPrompt, /# Findings to address/);
+});
+
+test("rework agent treats PostgreSQL validation as host-only", () => {
+  const systemPrompt = readFileSync(SYSTEM_PROMPT_PATH, "utf8");
+
+  assert.match(systemPrompt, /Host-only database validation/);
+  assert.match(systemPrompt, /Never run .*pg-ensure.*pg_ctl.*alembic upgrade/i);
+  assert.match(systemPrompt, /host will rerun the full gate/i);
 });
 
 test("rework user prompt contains only the slim findings and issue-body template", () => {

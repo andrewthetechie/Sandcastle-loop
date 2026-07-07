@@ -1,0 +1,23 @@
+{
+  "kind": "parse_failure",
+  "reviewer": "code_quality",
+  "decision": "needs_human_review",
+  "summary": "Missing <extra_review>...</extra_review> block.",
+  "findings": [],
+  "parse_failure": {
+    "parser": "code_quality_extra_review",
+    "expected_tag": "extra_review",
+    "code": "missing_tag",
+    "summary": "Missing <extra_review>...</extra_review> block.",
+    "details": [
+      {
+        "code": "missing_tag",
+        "path": "$",
+        "message": "Expected exactly one <extra_review>...</extra_review> block.",
+        "expected": "<extra_review>...</extra_review>",
+        "actual": "no complete tag block"
+      }
+    ],
+    "stdout_preview": "still not tagged json"
+  }
+}

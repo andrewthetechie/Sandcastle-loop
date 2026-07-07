@@ -20,6 +20,7 @@ import {
 } from "./extra-review-parsers.mts";
 import type {
   CodeQualityExtraReviewParseResult,
+  ExtraReviewParseFailure,
   FollowupIssuesParseResult,
   TwoAxisExtraReviewParseResult,
 } from "./extra-review-contracts.mts";
@@ -97,7 +98,25 @@ export interface ExtraReviewSandboxRunInput {
   idleTimeoutSeconds: number;
   promptFile: string;
   promptArgs: Record<string, string>;
+  /**
+   * Optional Sandcastle `LoggingOption` (kept structural as `unknown` so this
+   * module stays free of a Sandcastle runtime import). The PRD v4 loop supplies a
+   * `{ type: "file", path, onAgentStreamEvent }` here so extra-review agents also
+   * produce a Companion-TUI working log.
+   */
+  logging?: unknown;
 }
+
+/**
+ * Optional per-session hook the instrumented loop passes so extra-review agents
+ * emit a Companion-TUI working log. Returns the working-log path (recorded in the
+ * agent-step snapshot) and the Sandcastle `logging` option to feed `sandbox.run`.
+ */
+export type RunSessionAgentHook = (info: {
+  session: ExtraReviewSessionKind;
+  runName: string;
+  worktreePath: string;
+}) => { activeLogPath?: string; logging?: unknown } | undefined;
 
 export interface ExtraReviewSandboxRunResult {
   stdout: string;
@@ -178,6 +197,12 @@ export interface RunSequentialExtraReviewSessionsInput {
   readDirtyStatus?: ExtraReviewDirtyStatusReader;
   writeArtifacts?: ExtraReviewArtifactWriter;
   logger?: ExtraReviewSessionLogger;
+  /**
+   * Optional Companion-TUI working-log hook. Default undefined leaves existing
+   * callers (and tests) unchanged.
+   */
+  onAgentSession?: RunSessionAgentHook;
+  maxAcquisitionAttempts?: number;
 }
 
 export interface ExtraReviewDirtyWorktreeWarning {
@@ -224,6 +249,7 @@ export async function runSequentialExtraReviewSessions(
   const writeArtifacts = input.writeArtifacts ?? writeExtraReviewRoundArtifacts;
   const readDirtyStatus = input.readDirtyStatus ?? readGitDirtyStatus;
   const logger = input.logger ?? console;
+  const maxAcquisitionAttempts = input.maxAcquisitionAttempts ?? 1;
 
   const definitions: Record<ExtraReviewSessionKind, ExtraReviewSessionDefinition> = {
     code_quality:
@@ -259,14 +285,23 @@ export async function runSequentialExtraReviewSessions(
     return sandbox;
   };
 
-  {
-    const sandbox = await createSessionSandbox("code_quality");
-    try {
+  outputs.codeReview = await runSessionWithAcquisitionRetries<CodeReviewOutput>({
+    attempts: maxAcquisitionAttempts,
+    session: "code_quality",
+    createSessionSandbox,
+    readDirtyStatus,
+    logger,
+    warnings: dirtyWarnings,
+    ignoredPaths: reviewerSandboxInputPaths(input.reviewInputs),
+    isAcceptable: (parsed) =>
+      parsed.kind === "extra_review" && parsed.decision !== "needs_human_review",
+    onInvocationError: (message): CodeReviewOutput =>
+      invocationParseFailure("code_quality", message) as CodeReviewOutput,
+    run: async (sandbox, attempt) => {
       syncReviewerInputsToSandbox(sandbox.worktreePath, input.reviewInputs);
-
-      const codeReview = await runCodeQualityReview({
+      return runCodeQualityReview({
         prd: input.prd,
-        round: input.round,
+        round: withAttemptRound(input.round, attempt),
         sandbox,
         createAgent: input.createAgent,
         session: "code_quality",
@@ -274,31 +309,34 @@ export async function runSequentialExtraReviewSessions(
         writeAgentDefinition: input.writeAgentDefinition,
         idleTimeoutSeconds,
         promptArgs: sharedReviewerPromptArgs(input.reviewInputs.metadata),
-        definition: definitions.code_quality,
+        definition: withAttemptDefinition(
+          definitions.code_quality,
+          attempt,
+          maxAcquisitionAttempts,
+        ),
+        onAgentSession: input.onAgentSession,
       });
-      outputs.codeReview = codeReview;
-      recordDirtyWarning({
-        session: "code_quality",
-        sandbox,
-        readDirtyStatus,
-        logger,
-        warnings: dirtyWarnings,
-        ignoredPaths: reviewerSandboxInputPaths(input.reviewInputs),
-      });
-      checkpoint("failure");
-    } finally {
-      await sandbox.close();
-    }
-  }
+    },
+  });
+  checkpoint("failure");
 
-  {
-    const sandbox = await createSessionSandbox("two_axis");
-    try {
+  outputs.twoAxisReview = await runSessionWithAcquisitionRetries<TwoAxisOutput>({
+    attempts: maxAcquisitionAttempts,
+    session: "two_axis",
+    createSessionSandbox,
+    readDirtyStatus,
+    logger,
+    warnings: dirtyWarnings,
+    ignoredPaths: reviewerSandboxInputPaths(input.reviewInputs),
+    isAcceptable: (parsed) =>
+      parsed.kind === "extra_review" && parsed.decision !== "needs_human_review",
+    onInvocationError: (message): TwoAxisOutput =>
+      invocationParseFailure("two_axis", message) as TwoAxisOutput,
+    run: async (sandbox, attempt) => {
       syncReviewerInputsToSandbox(sandbox.worktreePath, input.reviewInputs);
-
-      const twoAxisReview = await runTwoAxisReview({
+      return runTwoAxisReview({
         prd: input.prd,
-        round: input.round,
+        round: withAttemptRound(input.round, attempt),
         sandbox,
         createAgent: input.createAgent,
         session: "two_axis",
@@ -306,35 +344,39 @@ export async function runSequentialExtraReviewSessions(
         writeAgentDefinition: input.writeAgentDefinition,
         idleTimeoutSeconds,
         promptArgs: sharedReviewerPromptArgs(input.reviewInputs.metadata),
-        definition: definitions.two_axis,
+        definition: withAttemptDefinition(
+          definitions.two_axis,
+          attempt,
+          maxAcquisitionAttempts,
+        ),
+        onAgentSession: input.onAgentSession,
       });
-      outputs.twoAxisReview = twoAxisReview;
-      recordDirtyWarning({
-        session: "two_axis",
-        sandbox,
-        readDirtyStatus,
-        logger,
-        warnings: dirtyWarnings,
-        ignoredPaths: reviewerSandboxInputPaths(input.reviewInputs),
-      });
-      checkpoint("failure");
-    } finally {
-      await sandbox.close();
-    }
-  }
+    },
+  });
+  checkpoint("failure");
 
-  {
-    const sandbox = await createSessionSandbox("issue_decomposer");
-    try {
+  outputs.issueDecomposer = await runSessionWithAcquisitionRetries<IssueDecomposerOutput>({
+    attempts: maxAcquisitionAttempts,
+    session: "issue_decomposer",
+    createSessionSandbox,
+    readDirtyStatus,
+    logger,
+    warnings: dirtyWarnings,
+    ignoredPaths: () => decomposerSandboxInputPaths(input.reviewInputs, outputs),
+    isAcceptable: (parsed) =>
+      parsed.kind === "followup_issues" && parsed.status !== "needs_human_review",
+    onInvocationError: (message): IssueDecomposerOutput =>
+      invocationParseFailure("issue_decomposer", message) as IssueDecomposerOutput,
+    run: async (sandbox, attempt) => {
       syncDecomposerInputsToSandbox(
         sandbox.worktreePath,
         input.reviewInputs,
         outputs,
       );
 
-      const issueDecomposer = await runIssueDecomposer({
+      return runIssueDecomposer({
         prd: input.prd,
-        round: input.round,
+        round: withAttemptRound(input.round, attempt),
         sandbox,
         createAgent: input.createAgent,
         session: "issue_decomposer",
@@ -345,35 +387,29 @@ export async function runSequentialExtraReviewSessions(
           input.reviewInputs.metadata,
           input.reviewInputs.paths,
         ),
-        definition: definitions.issue_decomposer,
+        definition: withAttemptDefinition(
+          definitions.issue_decomposer,
+          attempt,
+          maxAcquisitionAttempts,
+        ),
+        onAgentSession: input.onAgentSession,
       });
-      outputs.issueDecomposer = issueDecomposer;
-      recordDirtyWarning({
-        session: "issue_decomposer",
-        sandbox,
-        readDirtyStatus,
-        logger,
-        warnings: dirtyWarnings,
-        ignoredPaths: decomposerSandboxInputPaths(input.reviewInputs, outputs),
-      });
+    },
+  });
 
-      const stopReason = decideExtraReviewSessionStopReason(outputs);
-      checkpoint(stopReason);
+  const stopReason = decideExtraReviewSessionStopReason(outputs);
+  checkpoint(stopReason);
 
-      return {
-        reviewBranch,
-        sandboxBaseBranch,
-        worktreePath: lastWorktreePath,
-        outputs,
-        dirtyWarnings,
-        stopReason,
-        stopDetails: stopDetailsForWarnings(dirtyWarnings),
-        artifactWrite: artifactWrite!,
-      };
-    } finally {
-      await sandbox.close();
-    }
-  }
+  return {
+    reviewBranch,
+    sandboxBaseBranch,
+    worktreePath: lastWorktreePath,
+    outputs,
+    dirtyWarnings,
+    stopReason,
+    stopDetails: stopDetailsForOutputs(outputs, dirtyWarnings),
+    artifactWrite: artifactWrite!,
+  };
 }
 
 export function sharedReviewerPromptArgs(
@@ -616,6 +652,7 @@ async function runCodeQualityReview(input: {
   idleTimeoutSeconds: number;
   promptArgs: Record<string, string>;
   definition: ExtraReviewSessionDefinition;
+  onAgentSession?: RunSessionAgentHook;
 }): Promise<CodeReviewOutput> {
   const raw = await runSession(input, input.definition);
   return {
@@ -639,6 +676,7 @@ async function runTwoAxisReview(input: {
   idleTimeoutSeconds: number;
   promptArgs: Record<string, string>;
   definition: ExtraReviewSessionDefinition;
+  onAgentSession?: RunSessionAgentHook;
 }): Promise<TwoAxisOutput> {
   const raw = await runSession(input, input.definition);
   return {
@@ -662,6 +700,7 @@ async function runIssueDecomposer(input: {
   idleTimeoutSeconds: number;
   promptArgs: Record<string, string>;
   definition: ExtraReviewSessionDefinition;
+  onAgentSession?: RunSessionAgentHook;
 }): Promise<IssueDecomposerOutput> {
   const raw = await runSession(input, input.definition);
   return {
@@ -685,6 +724,7 @@ async function runSession(
     }) => void;
     idleTimeoutSeconds: number;
     promptArgs: Record<string, string>;
+    onAgentSession?: RunSessionAgentHook;
   },
   definition: ExtraReviewSessionDefinition,
 ): Promise<string> {
@@ -702,16 +742,23 @@ async function runSession(
     });
   }
   const promptFile = input.agentEntry?.promptFile ?? definition.promptFile;
+  const workingLog = input.onAgentSession?.({
+    session: input.session,
+    runName: definition.runName,
+    worktreePath: input.sandbox.worktreePath,
+  });
   const result = await recordMeasuredAgentRun(
     {
       prd: metricPrd(input.prd),
       stage: definition.kind,
+      agent: input.agentEntry?.agentName ?? definition.kind,
       round: metricRound(input.round),
       model: definition.model,
       runName: definition.runName,
       worktreePath: input.sandbox.worktreePath,
       promptFile,
       promptArgs: input.promptArgs,
+      activeLogPath: workingLog?.activeLogPath,
     },
     () =>
       input.sandbox.run({
@@ -724,9 +771,143 @@ async function runSession(
         idleTimeoutSeconds: input.idleTimeoutSeconds,
         promptFile,
         promptArgs: input.promptArgs,
+        logging: workingLog?.logging,
       }),
   );
   return result.stdout;
+}
+
+async function runSessionWithAcquisitionRetries<Output extends { raw: string; parsed: unknown }>(input: {
+  attempts: number;
+  session: ExtraReviewSessionKind;
+  createSessionSandbox(session: ExtraReviewSessionKind): Promise<ExtraReviewSandbox>;
+  readDirtyStatus: ExtraReviewDirtyStatusReader;
+  logger: ExtraReviewSessionLogger;
+  warnings: ExtraReviewDirtyWorktreeWarning[];
+  ignoredPaths: readonly string[] | ((output: Output) => readonly string[]);
+  isAcceptable(parsed: Output["parsed"]): boolean;
+  onInvocationError(message: string): Output;
+  run(sandbox: ExtraReviewSandbox, attempt: number): Promise<Output>;
+}): Promise<Output> {
+  let last: Output | undefined;
+
+  for (let attempt = 1; attempt <= input.attempts; attempt += 1) {
+    const sandbox = await input.createSessionSandbox(input.session);
+    try {
+      try {
+        const output = await input.run(sandbox, attempt);
+        last = output;
+        recordDirtyWarning({
+          session: input.session,
+          sandbox,
+          readDirtyStatus: input.readDirtyStatus,
+          logger: input.logger,
+          warnings: input.warnings,
+          ignoredPaths:
+            typeof input.ignoredPaths === "function"
+              ? input.ignoredPaths(output)
+              : input.ignoredPaths,
+        });
+        if (input.isAcceptable(output.parsed)) return output;
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          /requires writeAgentDefinition/u.test(error.message)
+        ) {
+          throw error;
+        }
+        last = input.onInvocationError(
+          `attempt ${attempt}: invocation error: ${describeError(error)}`,
+        );
+      }
+    } finally {
+      await sandbox.close();
+    }
+  }
+
+  return last ?? input.onInvocationError("session produced no output");
+}
+
+function withAttemptDefinition(
+  definition: ExtraReviewSessionDefinition,
+  attempt: number,
+  maxAttempts: number,
+): ExtraReviewSessionDefinition {
+  if (maxAttempts <= 1) return definition;
+  return {
+    ...definition,
+    runName: `${definition.runName} a${attempt}`,
+  };
+}
+
+function withAttemptRound(
+  round: ExtraReviewRoundArtifactIdentity,
+  attempt: number,
+): ExtraReviewRoundArtifactIdentity {
+  return attempt === 1
+    ? round
+    : {
+        ...round,
+        id: round.id ? `${round.id}-a${attempt}` : undefined,
+      };
+}
+
+function invocationParseFailure(
+  session: ExtraReviewSessionKind,
+  message: string,
+): CodeReviewOutput | TwoAxisOutput | IssueDecomposerOutput {
+  const parseFailure: ExtraReviewParseFailure = {
+    parser:
+      session === "code_quality"
+        ? "code_quality_extra_review"
+        : session === "two_axis"
+          ? "two_axis_extra_review"
+          : "followup_issues",
+    expected_tag: session === "issue_decomposer" ? "followup_issues" : "extra_review",
+    code: "missing_tag",
+    summary: message,
+    details: [{ code: "missing_tag", path: "$", message }],
+    stdout_preview: "",
+  };
+
+  if (session === "code_quality") {
+    return {
+      raw: "",
+      parsed: {
+        kind: "parse_failure",
+        reviewer: "code_quality",
+        decision: "needs_human_review",
+        summary: message,
+        findings: [],
+        parse_failure: parseFailure,
+      },
+    };
+  }
+  if (session === "two_axis") {
+    return {
+      raw: "",
+      parsed: {
+        kind: "parse_failure",
+        reviewer: "two_axis",
+        decision: "needs_human_review",
+        summary: message,
+        standards_findings: [],
+        spec_findings: [],
+        parse_failure: parseFailure,
+      },
+    };
+  }
+  return {
+    raw: "",
+    parsed: {
+      kind: "parse_failure",
+      status: "needs_human_review",
+      summary: message,
+      issues: [],
+      needs_human_review_reason: message,
+      parse_failure: parseFailure,
+    },
+  };
 }
 
 function metricPrd(prd: ExtraReviewPrdArtifactIdentity): number | string {
@@ -784,6 +965,39 @@ function stopDetailsForWarnings(
   dirtyWarnings: ExtraReviewDirtyWorktreeWarning[],
 ): string[] {
   return dirtyWarnings.map((warning) => warning.message);
+}
+
+function stopDetailsForOutputs(
+  outputs: ExtraReviewRoundOutputArtifacts,
+  dirtyWarnings: ExtraReviewDirtyWorktreeWarning[],
+): string[] {
+  const details = [...stopDetailsForWarnings(dirtyWarnings)];
+  const parsedOutputs = [
+    outputs.codeReview?.parsed,
+    outputs.twoAxisReview?.parsed,
+    outputs.issueDecomposer?.parsed,
+  ];
+
+  for (const parsed of parsedOutputs) {
+    if (!parsed) continue;
+    if ("kind" in parsed && parsed.kind === "parse_failure") {
+      details.push(parsed.parse_failure.summary);
+      continue;
+    }
+    if ("decision" in parsed && parsed.decision === "needs_human_review") {
+      details.push(parsed.summary);
+      continue;
+    }
+    if ("status" in parsed && parsed.status === "needs_human_review") {
+      details.push(parsed.needs_human_review_reason || parsed.summary);
+    }
+  }
+
+  return [...new Set(details.filter(Boolean))];
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function formatDirtyWarning(

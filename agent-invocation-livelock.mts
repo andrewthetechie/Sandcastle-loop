@@ -207,7 +207,7 @@ export function resolveRound1CoderLivelockEscalation(
     action: "escalate_to_rework",
     feedback: control.feedback,
     nextRound,
-    nextStage: agentInvocationStageForRound(nextRound),
+    nextStage: "rework",
   };
 }
 
@@ -232,7 +232,7 @@ export function resolveReworkLivelockControlFlow(
 export interface LivelockWatchdogSandcastleRunOptions {
   abortController: AbortController;
   signal: AbortSignal;
-  logging: Extract<LoggingOption, { type: "file" }>;
+  logging: LoggingOption;
 }
 
 /** Sandcastle `run()` options for an agent invocation protected by the watchdog. */
@@ -240,6 +240,12 @@ export function createLivelockWatchdogSandcastleRunOptions(input: {
   logPath: string;
   getWorktreeSnapshot: () => WorktreeProgressSnapshot;
   threshold?: number;
+  /**
+   * Optional sink for every stream event, forwarded alongside the livelock
+   * detector. The Companion TUI passes its working-log sink here so coder/rework
+   * produce a working log without adding a new seam.
+   */
+  onStreamEvent?: (event: unknown) => void;
 }): LivelockWatchdogSandcastleRunOptions {
   const abortController = new AbortController();
   return {
@@ -252,6 +258,7 @@ export function createLivelockWatchdogSandcastleRunOptions(input: {
         abortController,
         getWorktreeSnapshot: input.getWorktreeSnapshot,
         threshold: input.threshold,
+        onStreamEvent: input.onStreamEvent,
       }),
     },
   };

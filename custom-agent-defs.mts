@@ -93,6 +93,28 @@ export const DECOMPOSER_AGENT_CONFIG: CustomAgentConfig = {
   },
 };
 
+export const INITIAL_ISSUE_DECOMPOSER_AGENT_CONFIG: CustomAgentConfig = {
+  name: "initial-issue-decomposer",
+  description: "Turns one parent issue into implementation-ready child issue drafts",
+  temperature: 0.3,
+  permission: {
+    edit: "deny",
+    bash: "deny",
+    ...DENY_ONLY_PERMISSION,
+  },
+};
+
+export const SUBTASK_READINESS_AGENT_CONFIG: CustomAgentConfig = {
+  name: "subtask-readiness",
+  description: "Readiness-gates one generated child issue before implementation",
+  temperature: 0.1,
+  permission: {
+    edit: "deny",
+    bash: "deny",
+    ...DENY_ONLY_PERMISSION,
+  },
+};
+
 function buildBashPermission(bash: CustomAgentBashPermission): string[] {
   if (typeof bash === "string") {
     return [`  bash: ${bash}`];

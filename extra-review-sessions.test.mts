@@ -156,11 +156,11 @@ test("runs reviewer sessions then decomposer with isolated prompt args", async (
   });
   assert.equal("DIFF_PATH" in runCalls[2]!.promptArgs, false);
 
-  assert.equal(result.outputs.codeReview?.parsed.kind, "extra_review");
-  assert.equal(result.outputs.codeReview?.parsed.reviewer, "code_quality");
-  assert.equal(result.outputs.twoAxisReview?.parsed.kind, "extra_review");
-  assert.equal(result.outputs.twoAxisReview?.parsed.reviewer, "two_axis");
-  assert.equal(result.outputs.issueDecomposer?.parsed.kind, "followup_issues");
+  assert.equal(result.outputs.codeReview?.parsed?.kind, "extra_review");
+  assert.equal(result.outputs.codeReview?.parsed?.reviewer, "code_quality");
+  assert.equal(result.outputs.twoAxisReview?.parsed?.kind, "extra_review");
+  assert.equal(result.outputs.twoAxisReview?.parsed?.reviewer, "two_axis");
+  assert.equal(result.outputs.issueDecomposer?.parsed?.kind, "followup_issues");
   assert.equal(result.stopReason, "success");
   assert.equal(closeCalls.length, 3);
 
@@ -455,6 +455,79 @@ test("default artifact writer persists raw and parsed session artifacts", async 
   }
 });
 
+test("maxAcquisitionAttempts retries an invalid code-quality attempt with a fresh run name", async () => {
+  const reviewInputs = fixtureReviewInputs("mock-runs");
+  const runCalls: ExtraReviewSandboxRunInput[] = [];
+  const createCalls: ExtraReviewSandboxCreateInput[] = [];
+  const stdoutQueue = [
+    "not tagged json",
+    codeQualityStdout(),
+    twoAxisStdout(),
+    issueDecomposerStdout(),
+  ];
+
+  const result = await runSequentialExtraReviewSessions({
+    prd: { number: 1, label: "prd-001" },
+    round: { id: "round-01-head-abc123", number: 1 },
+    reviewInputs,
+    completedPrdBranch: "prd-001",
+    maxAcquisitionAttempts: 2,
+    createAgent: (model) => ({ model }),
+    createSandbox: (input) => {
+      createCalls.push(input);
+      return mockSandbox({
+        runCalls,
+        closeCalls: [],
+        stdout: stdoutQueue,
+      });
+    },
+    readDirtyStatus: () => "",
+  });
+
+  assert.equal(result.stopReason, "success");
+  assert.deepEqual(
+    runCalls.map((call) => call.name),
+    [
+      "extra code-quality review a1",
+      "extra code-quality review a2",
+      "extra two-axis review a1",
+      "extra issue decomposer a1",
+    ],
+  );
+  assert.equal(createCalls.length, 4);
+});
+
+test("maxAcquisitionAttempts exhausts invalid attempts without publishing a trustworthy result", async () => {
+  const reviewInputs = fixtureReviewInputs("mock-runs");
+  const runCalls: ExtraReviewSandboxRunInput[] = [];
+  const stdoutQueue = [
+    "not tagged json",
+    "still not tagged json",
+    twoAxisStdout(),
+    issueDecomposerStdout(),
+  ];
+
+  const result = await runSequentialExtraReviewSessions({
+    prd: { number: 1, label: "prd-001" },
+    round: { id: "round-01-head-abc123", number: 1 },
+    reviewInputs,
+    completedPrdBranch: "prd-001",
+    maxAcquisitionAttempts: 2,
+    createAgent: (model) => ({ model }),
+    createSandbox: () =>
+      mockSandbox({
+        runCalls,
+        closeCalls: [],
+        stdout: stdoutQueue,
+      }),
+    readDirtyStatus: () => "",
+  });
+
+  assert.equal(result.stopReason, "parse_failure");
+  assert.match(result.stopDetails.join("\n"), /missing tag|missing <extra_review>|not tagged|attempt/i);
+  assert.equal(runCalls.length, 4);
+});
+
 function mockSandbox(input: {
   runCalls: ExtraReviewSandboxRunInput[];
   closeCalls: string[];
@@ -471,7 +544,7 @@ function mockSandbox(input: {
       input.onRun?.(call, worktreePath);
       const stdout = input.stdout.shift();
       assert.equal(typeof stdout, "string", "mock stdout should be queued");
-      return { stdout };
+      return { stdout: stdout! };
     },
     close() {
       input.closeCalls.push("close");

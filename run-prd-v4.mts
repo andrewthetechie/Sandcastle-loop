@@ -73,6 +73,15 @@ import {
   type ReviewFinding,
   type ReviewResult,
 } from "./reviewer-result.mts";
+import {
+  runPerBranchEngine,
+  type EngineCoderResult,
+  type EngineReviewerAcquisitionResult,
+  type PerBranchEngineOutcome,
+  type PerBranchEnginePolicy,
+  type PerBranchTask,
+} from "./per-branch-engine.mts";
+import { PRD_V4_ENGINE_POLICY } from "./per-branch-policy.mts";
 import { loadSandcastleLoopConfig } from "./sandcastle-loop-config.mts";
 import {
   createLivelockWatchdogSandcastleRunOptions,
@@ -80,6 +89,8 @@ import {
   resolveRound1CoderLivelockControlFlow,
   resolveReworkLivelockControlFlow,
 } from "./agent-invocation-livelock.mts";
+import { tuiEmitter } from "./tui-emitter.mts";
+import { tuiWorkingLogPath } from "./tui-status.mts";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -124,11 +135,12 @@ const LABEL_PREFIX = "prd"; // -> label `prd-<N>`, base branch `prd-<N>`
 const STUCK_LABEL = "agent-stuck";
 
 // Loop bounds
-const MAX_REVIEW_ROUNDS = 5; // coder<->reviewer attempts per issue (lowered from 10)
-const FAILED_ROUND_REPEAT_LIMIT = 3; // stop after seed + 3 identical repeats
+const MAX_REVIEW_ROUNDS = PRD_V4_ENGINE_POLICY.maxReviewRounds; // coder<->reviewer attempts per issue (lowered from 10)
+const FAILED_ROUND_REPEAT_LIMIT =
+  PRD_V4_ENGINE_POLICY.failedRoundRepeatLimit;
 const MAX_ITERATIONS = 50; // outer-loop safety cap
-const CODER_MAX_ITERATIONS = 30; // per coder invocation
-const MAX_RECOVERY_ATTEMPTS = 2; // branch-hygiene recovery attempts per issue
+const CODER_MAX_ITERATIONS = PRD_V4_ENGINE_POLICY.coderMaxIterations;
+const MAX_RECOVERY_ATTEMPTS = PRD_V4_ENGINE_POLICY.maxRecoveryAttempts;
 const MAX_PUSH_RECOVERY_ATTEMPTS = 2; // remote issue-branch push recovery
 
 // Idle timeout for the agent (sandcastle fails the run if stdout is silent
@@ -153,7 +165,11 @@ const REVIEW_DIFF_EXCLUDES: string[] = [...EXTRA_REVIEW_INPUT_DIFF_EXCLUDES];
 // Hard cap on the reviewer diff (bytes). Linux execve argv limit is ~128KB
 // system-wide and opencode passes the whole prompt as a single CLI arg, so
 // keep this well under that with headroom for the rest of the prompt.
-const REVIEW_DIFF_MAX_BYTES = 60_000;
+const REVIEW_DIFF_MAX_BYTES = PRD_V4_ENGINE_POLICY.reviewDiffMaxBytes;
+const PRD_V4_RUN_ENGINE_POLICY: PerBranchEnginePolicy = {
+  ...PRD_V4_ENGINE_POLICY,
+  reviewerMaxAttempts: LOOP_CONFIG.reviewer.maxAttempts,
+};
 
 // `gh pr merge` strategy flag. Repos may disable certain strategies in
 // branch protection; use whichever your repo allows.
@@ -281,6 +297,10 @@ if (prdMatches.length > 1) {
 const prdPath = join(PRD_DIR, prdMatches[0]!);
 const prdBody = readFileSync(prdPath, "utf8");
 console.log(`Loaded PRD: ${prdPath}`);
+
+// Companion TUI: begin emitting the read-only status snapshot for this loop.
+// Side-effect-only; a failure here can never affect loop control flow.
+tuiEmitter.startLoop({ loopType: "prd", loopId: prdLabel });
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -743,7 +763,13 @@ function flattenComments(comments: IssueComment[]): string {
 
 type GateResult =
   | { ok: true }
-  | { ok: false; feedback: string; signature: string };
+  | {
+      ok: false;
+      feedback: string;
+      signature: string;
+      command: string;
+      exitCode: number;
+    };
 
 function summarizeFailureOutput(output: string): string {
   const lines = output
@@ -809,7 +835,9 @@ function runValidationGate(
     gate: "issue" | "base";
   },
 ): GateResult {
+  const hostStepName = context.gate === "base" ? "base_validation" : "validation";
   for (const [index, cmd] of VALIDATION_COMMANDS.entries()) {
+    tuiEmitter.beginHostStep(hostStepName, cmd);
     console.log(`  $ ${cmd}`);
     const startedMs = Date.now();
     const result = spawnSync(cmd, {
@@ -845,6 +873,8 @@ function runValidationGate(
       return {
         ok: false,
         signature: `${cmd} :: ${summary}`,
+        command: cmd,
+        exitCode: result.status ?? 1,
         feedback: [
           "## Validation failed",
           "",
@@ -1563,6 +1593,606 @@ function approveAndMerge(
   }
 }
 
+async function runPrdV4IssueViaSharedEngine(input: {
+  issue: IssueDetail;
+  issueBranch: string;
+  issueComments: string;
+}): Promise<{
+  outcome: PerBranchEngineOutcome;
+  worktreePath: string;
+  approvedTreeSha: string;
+  closeSandbox(): Promise<void>;
+}> {
+  const { issue, issueBranch, issueComments } = input;
+  const task: PerBranchTask = {
+    number: issue.number,
+    title: issue.title,
+    body: issue.body,
+    comments: issueComments,
+    branch: issueBranch,
+    baseRef: originPrdRef(),
+  };
+  let sandbox: Awaited<ReturnType<typeof sandcastle.createSandbox>> | null =
+    null;
+  let recoveryAttempts = 0;
+  let approvedTreeSha = "";
+  let announcedRound = 0;
+
+  const requireSandbox = () => {
+    if (!sandbox) {
+      throw new Error(`Sandbox not initialized for ${issueBranch}`);
+    }
+    return sandbox;
+  };
+
+  const announceRound = (round: number) => {
+    if (announcedRound === round) return;
+    announcedRound = round;
+    console.log(`\n--- Round ${round}/${MAX_REVIEW_ROUNDS} for #${issue.number} ---`);
+    tuiEmitter.setRound({ current: round, max: MAX_REVIEW_ROUNDS });
+  };
+
+  const outcome = await runPerBranchEngine({
+    task,
+    policy: PRD_V4_RUN_ENGINE_POLICY,
+    deps: {
+      async createSandbox() {
+        tuiEmitter.beginHostStep("sandbox_setup", issueBranch);
+        sandbox = await sandcastle.createSandbox({
+          sandbox: dockerSandboxProvider(),
+          branch: issueBranch,
+          baseBranch: `origin/${prdBranch}`,
+          copyToWorktree: COPY_TO_WORKTREE,
+          hooks: {
+            sandbox: {
+              onSandboxReady: SANDBOX_READY_COMMANDS.map((command) => ({
+                command,
+              })),
+            },
+          },
+        });
+        ensureOpencodeGitExclude(sandbox.worktreePath);
+        return {
+          worktreePath: sandbox.worktreePath,
+          async close() {
+            // Shared engine closes its sandbox in finally, but merge/stuck
+            // routing in this file still needs the worktree afterwards.
+          },
+        };
+      },
+      async preCoderRebaseGuard() {
+        return { ok: true };
+      },
+      async invokeCoder({
+        round,
+        feedback,
+        isRework,
+        maxIterations,
+      }): Promise<EngineCoderResult> {
+        announceRound(round);
+        const activeSandbox = requireSandbox();
+
+        if (isRework) {
+          const reworkUserArgs = {
+            ISSUE_NUMBER: String(issue.number),
+            ISSUE_TITLE: issue.title,
+            ISSUE_BODY: issue.body || "(no body)",
+            REVIEW_FEEDBACK: feedback,
+          };
+          const reworkTemplate = readFileSync(
+            REWORK_USER_PROMPT_FILE.replace(/^\.\//, ""),
+            "utf8",
+          );
+          const rendered = renderSlimMessage(reworkTemplate, reworkUserArgs);
+          const sizeCheck = enforceArgvSizeLimit(rendered);
+          if (!sizeCheck.ok) {
+            return { kind: "failed", feedback: sizeCheck.error };
+          }
+
+          writeAgentDefinitionFile(
+            activeSandbox.worktreePath,
+            REWORK_AGENT_CONFIG.name,
+            buildAgentDefinition(
+              REWORK_AGENT_CONFIG,
+              REWORK_MODEL,
+              readFileSync(
+                REWORK_AGENT_SYSTEM_PROMPT_FILE.replace(/^\.\//, ""),
+                "utf8",
+              ),
+            ),
+          );
+
+          const reworkRunName = `rework #${issue.number} r${round}`;
+          const reworkActiveLogPath = tuiWorkingLogPath(reworkRunName);
+          const reworkLivelockWatchdog =
+            createLivelockWatchdogSandcastleRunOptions({
+              logPath: agentRunLogPath(issueBranch, reworkRunName),
+              getWorktreeSnapshot: () =>
+                captureWorktreeProgressSnapshot(activeSandbox.worktreePath),
+              onStreamEvent: tuiEmitter.workingLogSink(reworkActiveLogPath),
+            });
+          try {
+            const reworkResult: Awaited<ReturnType<typeof activeSandbox.run>> =
+              await recordMeasuredAgentRun(
+              {
+                prd: prdNumber,
+                issue: issue.number,
+                stage: "rework",
+                agent: REWORK_AGENT_CONFIG.name,
+                round,
+                model: REWORK_MODEL,
+                runName: reworkRunName,
+                worktreePath: activeSandbox.worktreePath,
+                promptFile: REWORK_USER_PROMPT_FILE,
+                promptArgs: reworkUserArgs,
+                activeLogPath: reworkActiveLogPath,
+              },
+              () =>
+                activeSandbox.run({
+                  name: reworkRunName,
+                  agent: sandcastle.opencode(REWORK_MODEL, {
+                    agent: REWORK_AGENT_CONFIG.name,
+                  }),
+                  maxIterations,
+                  completionSignal: "<promise>COMPLETE</promise>",
+                  idleTimeoutSeconds,
+                  promptFile: REWORK_USER_PROMPT_FILE,
+                  promptArgs: reworkUserArgs,
+                  signal: reworkLivelockWatchdog.signal,
+                  logging: reworkLivelockWatchdog.logging,
+                }),
+            );
+            const blockedMatch = reworkResult.stdout.match(
+              /<blocked>([\s\S]*?)<\/blocked>/,
+            );
+            if (blockedMatch) {
+              return {
+                kind: "blocked",
+                feedback: `Coder signaled blocked on round ${round}:\n\n${blockedMatch[1]!.trim()}`,
+              };
+            }
+            if (reworkResult.commits.length === 0) {
+              const uncommitted = git(
+                ["status", "-s"],
+                activeSandbox.worktreePath,
+              ).trim();
+              if (uncommitted) {
+                return {
+                  kind: "failed",
+                  feedback: [
+                    "## You edited files but did not commit",
+                    "",
+                    "These files have uncommitted changes in the worktree:",
+                    "",
+                    "```",
+                    uncommitted,
+                    "```",
+                    "",
+                    'Edits without a commit are invisible to the host. Sandcastle only sees `git log` history, not the working tree. Run `git add <files>` and `git commit -m "<message>"` to save your work. Then re-verify and emit `<promise>COMPLETE</promise>`.',
+                  ].join("\n"),
+                };
+              }
+              return {
+                kind: "failed",
+                feedback:
+                  "## No commits produced\n\nYour previous run finished without committing any changes. Re-read the issue and the PRD, then make the required code changes and commit them.",
+              };
+            }
+            const dirty = git(["status", "-s"], activeSandbox.worktreePath).trim();
+            if (dirty) {
+              return {
+                kind: "failed",
+                feedback: [
+                  "## Uncommitted changes after commit",
+                  "",
+                  "Your run produced commits, but the worktree still has uncommitted changes:",
+                  "",
+                  "```",
+                  dirty,
+                  "```",
+                  "",
+                  "Commit the intended issue changes and revert unrelated edits. The host validates and reviews only a clean, committed branch.",
+                ].join("\n"),
+              };
+            }
+            return {
+              kind: "committed",
+              committedCount: reworkResult.commits.length,
+            };
+          } catch (reworkErr) {
+            const control = resolveReworkLivelockControlFlow(reworkErr);
+            if (control.action === "break_to_stuck") {
+              return { kind: "livelock", feedback: control.feedback };
+            }
+            throw control.error;
+          }
+        }
+
+        const coderUserArgs = {
+          ISSUE_NUMBER: String(issue.number),
+          ISSUE_TITLE: issue.title,
+          ISSUE_BODY: issue.body || "(no body)",
+          ISSUE_COMMENTS: issueComments,
+        };
+        const coderTemplate = readFileSync(
+          CODER_USER_PROMPT_FILE.replace(/^\.\//, ""),
+          "utf8",
+        );
+        const rendered = renderSlimMessage(coderTemplate, coderUserArgs);
+        const sizeCheck = enforceArgvSizeLimit(rendered);
+        if (!sizeCheck.ok) {
+          return { kind: "failed", feedback: sizeCheck.error };
+        }
+
+        writeAgentDefinitionFile(
+          activeSandbox.worktreePath,
+          CODER_AGENT_CONFIG.name,
+          buildAgentDefinition(
+            CODER_AGENT_CONFIG,
+            CODER_MODEL,
+            readFileSync(
+              CODER_AGENT_SYSTEM_PROMPT_FILE.replace(/^\.\//, ""),
+              "utf8",
+            ),
+          ),
+        );
+
+        const coderRunName = `coder #${issue.number} r${round}`;
+        const coderActiveLogPath = tuiWorkingLogPath(coderRunName);
+        const livelockWatchdog = createLivelockWatchdogSandcastleRunOptions({
+          logPath: agentRunLogPath(issueBranch, coderRunName),
+          getWorktreeSnapshot: () =>
+            captureWorktreeProgressSnapshot(activeSandbox.worktreePath),
+          onStreamEvent: tuiEmitter.workingLogSink(coderActiveLogPath),
+        });
+        try {
+            const coderResult: Awaited<ReturnType<typeof activeSandbox.run>> =
+              await recordMeasuredAgentRun(
+              {
+                prd: prdNumber,
+                issue: issue.number,
+              stage: "coder",
+              agent: CODER_AGENT_CONFIG.name,
+              round,
+              model: CODER_MODEL,
+              runName: coderRunName,
+              worktreePath: activeSandbox.worktreePath,
+              promptFile: CODER_USER_PROMPT_FILE,
+              promptArgs: coderUserArgs,
+              activeLogPath: coderActiveLogPath,
+            },
+            () =>
+              activeSandbox.run({
+                name: coderRunName,
+                agent: sandcastle.opencode(CODER_MODEL, {
+                  agent: CODER_AGENT_CONFIG.name,
+                }),
+                maxIterations,
+                completionSignal: "<promise>COMPLETE</promise>",
+                idleTimeoutSeconds,
+                promptFile: CODER_USER_PROMPT_FILE,
+                promptArgs: coderUserArgs,
+                signal: livelockWatchdog.signal,
+                logging: livelockWatchdog.logging,
+              }),
+          );
+          const blockedMatch = coderResult.stdout.match(
+            /<blocked>([\s\S]*?)<\/blocked>/,
+          );
+          if (blockedMatch) {
+            return {
+              kind: "blocked",
+              feedback: `Coder signaled blocked on round ${round}:\n\n${blockedMatch[1]!.trim()}`,
+            };
+          }
+
+          const alreadySatisfiedMatch = coderResult.stdout.match(
+            /<already_satisfied>([\s\S]*?)<\/already_satisfied>/,
+          );
+          let committedCount = coderResult.commits.length;
+          if (alreadySatisfiedMatch) {
+            const reason = alreadySatisfiedMatch[1]!.trim();
+            const existingAheadCount = countCommitsAheadOfBase(
+              activeSandbox.worktreePath,
+            );
+            if (existingAheadCount > 0) {
+              committedCount = existingAheadCount;
+            } else {
+              return { kind: "already_satisfied", evidence: reason };
+            }
+          } else if (committedCount === 0) {
+            const uncommitted = git(
+              ["status", "-s"],
+              activeSandbox.worktreePath,
+            ).trim();
+            if (uncommitted) {
+              return {
+                kind: "failed",
+                feedback: [
+                  "## You edited files but did not commit",
+                  "",
+                  "These files have uncommitted changes in the worktree:",
+                  "",
+                  "```",
+                  uncommitted,
+                  "```",
+                  "",
+                  'Edits without a commit are invisible to the host. Sandcastle only sees `git log` history, not the working tree. Run `git add <files>` and `git commit -m "<message>"` to save your work. Then re-verify and emit `<promise>COMPLETE</promise>`.',
+                ].join("\n"),
+              };
+            }
+            const existingAheadCount = countCommitsAheadOfBase(
+              activeSandbox.worktreePath,
+            );
+            if (existingAheadCount > 0) {
+              committedCount = existingAheadCount;
+            } else {
+              return {
+                kind: "failed",
+                feedback:
+                  "## No commits produced\n\nYour previous run finished without committing any changes. Re-read the issue and the PRD, then make the required code changes and commit them.",
+              };
+            }
+          }
+
+          const dirty = git(["status", "-s"], activeSandbox.worktreePath).trim();
+          if (dirty) {
+            return {
+              kind: "failed",
+              feedback: [
+                "## Uncommitted changes after commit",
+                "",
+                "Your run produced commits, but the worktree still has uncommitted changes:",
+                "",
+                "```",
+                dirty,
+                "```",
+                "",
+                "Commit the intended issue changes and revert unrelated edits. The host validates and reviews only a clean, committed branch.",
+              ].join("\n"),
+            };
+          }
+
+          return { kind: "committed", committedCount };
+        } catch (coderErr) {
+          const control = resolveRound1CoderLivelockControlFlow(coderErr);
+          if (control.action === "continue_with_feedback") {
+            return { kind: "failed", feedback: control.feedback };
+          }
+          throw control.error;
+        }
+      },
+      async prepareBranchForReview() {
+        const activeSandbox = requireSandbox();
+        const prep = prepareBranchForReview(
+          activeSandbox.worktreePath,
+          issueBranch,
+          recoveryAttempts,
+        );
+        recoveryAttempts = prep.recoveryAttempts;
+        if (!prep.ok) {
+          return { ok: false, feedback: prep.feedback, recoverable: false };
+        }
+        const context = computeReviewContext(
+          activeSandbox.worktreePath,
+          prep.baseSha,
+        );
+        const recovery = maybeRecoverOversizedOrPollutedDiff(
+          activeSandbox.worktreePath,
+          issue,
+          issueBranch,
+          context,
+          recoveryAttempts,
+        );
+        recoveryAttempts = recovery.recoveryAttempts;
+        if (!recovery.ok) {
+          return { ok: false, feedback: recovery.feedback, recoverable: false };
+        }
+        return { ok: true, reviewedBaseSha: recovery.baseSha };
+      },
+      async recoverBranch() {
+        return {
+          ok: false,
+          feedback:
+            "Shared engine requested branch recovery after adapter recovery had already completed.",
+        };
+      },
+      async computeReviewContext({ reviewedBaseSha }) {
+        const activeSandbox = requireSandbox();
+        const context = computeReviewContext(
+          activeSandbox.worktreePath,
+          reviewedBaseSha,
+        );
+        approvedTreeSha = treeShaOf("HEAD", activeSandbox.worktreePath);
+        console.log(
+          `  review diff: ${context.diffBytes} bytes, ${context.changedFiles.length} file(s), aspects: ${context.reviewAspects.join(", ")}`,
+        );
+        return context;
+      },
+      async runValidation({ round }) {
+        announceRound(round);
+        const activeSandbox = requireSandbox();
+        console.log(`  running validation gate`);
+        const gate = runValidationGate(activeSandbox.worktreePath, {
+          prd: prdNumber,
+          issue: issue.number,
+          round,
+          gate: "issue",
+        });
+        if (!gate.ok) {
+          return {
+            ok: false,
+            command: gate.command,
+            exitCode: gate.exitCode,
+            feedback: gate.feedback,
+          };
+        }
+        console.log(`  validation green; invoking reviewer`);
+        return { ok: true };
+      },
+      async acquireReviewer({ round, attempt, context }) {
+        announceRound(round);
+        const activeSandbox = requireSandbox();
+        const reviewerUserArgs = {
+          ISSUE_NUMBER: String(issue.number),
+          ISSUE_TITLE: issue.title,
+          ISSUE_BODY: issue.body || "(no body)",
+          ISSUE_COMMENTS: issueComments,
+          BASE_BRANCH: originPrdRef(),
+          REVIEW_BASE_SHA: context.baseSha,
+          DIFF: context.diff,
+          DIFF_BYTES: String(context.diffBytes),
+          DIFF_MAX_BYTES: String(REVIEW_DIFF_MAX_BYTES),
+          CHANGED_FILES: context.changedFiles.join("\n") || "(none)",
+          DIFF_STAT: context.diffStat,
+          REVIEW_ASPECTS: context.reviewAspects.join(", "),
+          ECOSYSTEMS: context.ecosystems.join(", ") || "(unknown)",
+        };
+        const reviewerTemplate = readFileSync(
+          REVIEWER_USER_PROMPT_FILE.replace(/^\.\//, ""),
+          "utf8",
+        );
+        const renderedReviewerMessage = renderSlimMessage(
+          reviewerTemplate,
+          reviewerUserArgs,
+        );
+        const reviewerSizeCheck = enforceArgvSizeLimit(renderedReviewerMessage);
+        if (!reviewerSizeCheck.ok) {
+          return {
+            kind: "incomplete",
+            code: "host_input_limit",
+            resultSource: "none",
+            logFallbackUsed: false,
+            diagnostics: [reviewerSizeCheck.error],
+            excerpt: reviewerSizeCheck.error,
+          } satisfies EngineReviewerAcquisitionResult;
+        }
+
+        writeAgentDefinitionFile(
+          activeSandbox.worktreePath,
+          REVIEWER_AGENT_CONFIG.name,
+          buildAgentDefinition(
+            REVIEWER_AGENT_CONFIG,
+            REVIEWER_MODEL,
+            readFileSync(
+              REVIEWER_AGENT_SYSTEM_PROMPT_FILE.replace(/^\.\//, ""),
+              "utf8",
+            ),
+          ),
+        );
+
+        const reviewerRunName = buildReviewerAttemptRunName(
+          issue.number,
+          round,
+          attempt,
+        );
+        const reviewerActiveLogPath = tuiWorkingLogPath(reviewerRunName);
+        const reviewerResult: Awaited<ReturnType<typeof activeSandbox.run>> =
+          await recordMeasuredAgentRun(
+          {
+            prd: prdNumber,
+            issue: issue.number,
+            stage: "reviewer",
+            agent: REVIEWER_AGENT_CONFIG.name,
+            round,
+            model: REVIEWER_MODEL,
+            runName: reviewerRunName,
+            worktreePath: activeSandbox.worktreePath,
+            promptFile: REVIEWER_USER_PROMPT_FILE,
+            promptArgs: reviewerUserArgs,
+            activeLogPath: reviewerActiveLogPath,
+          },
+          () =>
+            activeSandbox.run({
+              name: reviewerRunName,
+              agent: sandcastle.opencode(REVIEWER_MODEL, {
+                agent: REVIEWER_AGENT_CONFIG.name,
+              }),
+              maxIterations: 1,
+              completionSignal: "</review>",
+              idleTimeoutSeconds,
+              promptFile: REVIEWER_USER_PROMPT_FILE,
+              promptArgs: reviewerUserArgs,
+              logging: {
+                type: "file",
+                path: agentRunLogPath(issueBranch, reviewerRunName),
+                onAgentStreamEvent:
+                  tuiEmitter.workingLogSink(reviewerActiveLogPath),
+              },
+            }),
+        );
+        const logFilePath =
+          typeof reviewerResult === "object" &&
+          reviewerResult !== null &&
+          "logFilePath" in reviewerResult &&
+          typeof reviewerResult.logFilePath === "string"
+            ? reviewerResult.logFilePath
+            : undefined;
+        const runLogText =
+          logFilePath && existsSync(logFilePath)
+            ? readFileSync(logFilePath, "utf8")
+            : undefined;
+        const acquisition = acquireReviewerResult({
+          stdout: reviewerResult.stdout,
+          runLogText,
+          runLogReadError:
+            logFilePath && !existsSync(logFilePath)
+              ? `missing log file at ${logFilePath}`
+              : undefined,
+          logFilePath,
+        });
+        recordReviewerResult({
+          prd: prdNumber,
+          issue: issue.number,
+          round,
+          attempt,
+          maxAttempts: PRD_V4_RUN_ENGINE_POLICY.reviewerMaxAttempts,
+          status:
+            acquisition.kind === "verdict"
+              ? acquisition.review.decision
+              : acquisition.kind,
+          resultSource: acquisition.resultSource,
+          logFallbackUsed: acquisition.logFallbackUsed,
+          logFilePath,
+          parseFailureCode:
+            acquisition.kind === "parse_failed" ? acquisition.code : undefined,
+        });
+        if (acquisition.kind !== "verdict") {
+          console.log(
+            `  reviewer attempt ${attempt}/${PRD_V4_RUN_ENGINE_POLICY.reviewerMaxAttempts} failed to produce a valid verdict (${summarizeReviewerAttemptFailure(acquisition)});${attempt < PRD_V4_RUN_ENGINE_POLICY.reviewerMaxAttempts ? " retrying" : ""}`,
+          );
+        } else {
+          console.log(`  reviewer decision: ${acquisition.review.decision}`);
+        }
+        return {
+          ...acquisition,
+          excerpt: runLogText ?? reviewerResult.stdout,
+        } satisfies EngineReviewerAcquisitionResult;
+      },
+      currentHeadSha() {
+        return git(["rev-parse", "HEAD"], requireSandbox().worktreePath).trim();
+      },
+      currentTreeSha() {
+        return treeShaOf("HEAD", requireSandbox().worktreePath);
+      },
+      onHostStep(name, detail) {
+        tuiEmitter.beginHostStep(name, detail);
+      },
+    },
+  });
+
+  const worktreePath = requireSandbox().worktreePath;
+
+  return {
+    outcome,
+    worktreePath,
+    approvedTreeSha,
+    async closeSandbox() {
+      await sandbox?.close();
+    },
+  };
+}
+
 function markStuck(
   issue: IssueDetail,
   worktreePath: string,
@@ -1643,10 +2273,13 @@ async function processNormalIssueIteration(context: {
 }): Promise<NormalIssueIterationResult> {
   const iteration = context.completedIterations + 1;
   console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
+  tuiEmitter.setPhase("normal_issue");
+  tuiEmitter.setIteration({ current: iteration, max: MAX_ITERATIONS });
 
   const issue = pickNextIssue();
   if (!issue) {
     console.log(`No eligible issues with label '${prdLabel}'.`);
+    tuiEmitter.clearTicket();
     return { kind: "no_eligible_issue" };
   }
 
@@ -1654,752 +2287,29 @@ async function processNormalIssueIteration(context: {
 
   const issueBranch = `${prdBranch}-issue-${issue.number}`;
   const issueComments = flattenComments(issue.comments);
+  tuiEmitter.setTicket({
+    number: issue.number,
+    title: issue.title,
+    branch: issueBranch,
+  });
 
   preflightExistingIssueBranch(issue, issueBranch);
 
-  const sandbox = await sandcastle.createSandbox({
-    sandbox: dockerSandboxProvider(),
-    branch: issueBranch,
-    // Use the remote-tracking ref as the fork point. This is always current
-    // after the post-merge `git fetch origin <prdBranch>`, and avoids relying
-    // on the local prdBranch being up-to-date (which it can't be if it's
-    // checked out in the host repo).
-    baseBranch: `origin/${prdBranch}`,
-    copyToWorktree: COPY_TO_WORKTREE,
-    hooks: {
-      sandbox: {
-        onSandboxReady: SANDBOX_READY_COMMANDS.map((command) => ({ command })),
-      },
-    },
-  });
-  ensureOpencodeGitExclude(sandbox.worktreePath);
-
-  let feedback = "";
-  let lastFeedback = "";
-  let approved = false;
-  let alreadySatisfiedReason = "";
-  let reviewedBaseSha = "";
-  let approvedTreeSha = "";
-  let progressState: NoProgressState = initialNoProgressState();
   let roundsUsed = 0;
-  let terminalReason:
-    | "stuck_rounds_exhausted"
-    | "stuck_no_progress"
-    | "stuck_reviewer_parse_failure"
-    | "stuck_reviewer_incomplete"
-    | "stuck_needs_human_review"
-    | "stuck_livelock"
-    | "blocked" = "stuck_rounds_exhausted";
-  let recoveryAttempts = 0;
-  let hostOnlyReview = false;
-  let hostOnlyReviewAttempts = 0;
-
+  let shared: Awaited<ReturnType<typeof runPrdV4IssueViaSharedEngine>> | null =
+    null;
   try {
-    for (let round = 1; round <= MAX_REVIEW_ROUNDS; round++) {
-      console.log(
-        `\n--- Round ${round}/${MAX_REVIEW_ROUNDS} for #${issue.number} ---`,
-      );
-      roundsUsed = round;
+    shared = await runPrdV4IssueViaSharedEngine({
+      issue,
+      issueBranch,
+      issueComments,
+    });
+    const { outcome, worktreePath, approvedTreeSha } = shared;
+    roundsUsed = outcome.roundsUsed;
 
-      let committedCount = 0;
-      if (hostOnlyReview) {
-        console.log(
-          `  base advanced after review; re-syncing and re-reviewing without invoking coder`,
-        );
-        hostOnlyReview = false;
-        committedCount = Number.parseInt(
-          git(
-            ["rev-list", "--count", `${originPrdRef()}..HEAD`],
-            sandbox.worktreePath,
-          ).trim() || "0",
-          10,
-        );
-      } else {
-        const isRework = agentInvocationStageForRound(round) === "rework";
-        let coderResult: Awaited<ReturnType<typeof sandbox.run>>;
-
-        if (isRework) {
-          const reworkUserArgs = {
-            ISSUE_NUMBER: String(issue.number),
-            ISSUE_TITLE: issue.title,
-            ISSUE_BODY: issue.body || "(no body)",
-            REVIEW_FEEDBACK: feedback,
-          };
-          const reworkTemplate = readFileSync(
-            REWORK_USER_PROMPT_FILE.replace(/^\.\//, ""),
-            "utf8",
-          );
-          const rendered = renderSlimMessage(reworkTemplate, reworkUserArgs);
-          const sizeCheck = enforceArgvSizeLimit(rendered);
-          if (!sizeCheck.ok) {
-            feedback = sizeCheck.error;
-            lastFeedback = feedback;
-            continue;
-          }
-
-          writeAgentDefinitionFile(
-            sandbox.worktreePath,
-            REWORK_AGENT_CONFIG.name,
-            buildAgentDefinition(
-              REWORK_AGENT_CONFIG,
-              REWORK_MODEL,
-              readFileSync(
-                REWORK_AGENT_SYSTEM_PROMPT_FILE.replace(/^\.\//, ""),
-                "utf8",
-              ),
-            ),
-          );
-
-          const reworkRunName = `rework #${issue.number} r${round}`;
-          const reworkLivelockWatchdog =
-            createLivelockWatchdogSandcastleRunOptions({
-              logPath: agentRunLogPath(issueBranch, reworkRunName),
-              getWorktreeSnapshot: () =>
-                captureWorktreeProgressSnapshot(sandbox.worktreePath),
-            });
-          try {
-            coderResult = await recordMeasuredAgentRun(
-              {
-                prd: prdNumber,
-                issue: issue.number,
-                stage: "rework",
-                agent: REWORK_AGENT_CONFIG.name,
-                round,
-                model: REWORK_MODEL,
-                runName: reworkRunName,
-                worktreePath: sandbox.worktreePath,
-                promptFile: REWORK_USER_PROMPT_FILE,
-                promptArgs: reworkUserArgs,
-              },
-              () =>
-                sandbox.run({
-                  name: reworkRunName,
-                  agent: sandcastle.opencode(REWORK_MODEL, {
-                    agent: REWORK_AGENT_CONFIG.name,
-                  }),
-                  maxIterations: CODER_MAX_ITERATIONS,
-                  completionSignal: "<promise>COMPLETE</promise>",
-                  idleTimeoutSeconds,
-                  promptFile: REWORK_USER_PROMPT_FILE,
-                  promptArgs: reworkUserArgs,
-                  signal: reworkLivelockWatchdog.signal,
-                  logging: reworkLivelockWatchdog.logging,
-                }),
-            );
-          } catch (reworkErr) {
-            const control = resolveReworkLivelockControlFlow(reworkErr);
-            if (control.action === "break_to_stuck") {
-              console.log(
-                `  rework livelock on round ${round}; bailing to stuck`,
-              );
-              terminalReason = control.terminalReason;
-              lastFeedback = control.feedback;
-              break;
-            }
-            throw control.error;
-          }
-        } else {
-          const coderUserArgs = {
-            ISSUE_NUMBER: String(issue.number),
-            ISSUE_TITLE: issue.title,
-            ISSUE_BODY: issue.body || "(no body)",
-            ISSUE_COMMENTS: issueComments,
-          };
-          const coderTemplate = readFileSync(
-            CODER_USER_PROMPT_FILE.replace(/^\.\//, ""),
-            "utf8",
-          );
-          const rendered = renderSlimMessage(coderTemplate, coderUserArgs);
-          const sizeCheck = enforceArgvSizeLimit(rendered);
-          if (!sizeCheck.ok) {
-            feedback = sizeCheck.error;
-            lastFeedback = feedback;
-            continue;
-          }
-
-          writeAgentDefinitionFile(
-            sandbox.worktreePath,
-            CODER_AGENT_CONFIG.name,
-            buildAgentDefinition(
-              CODER_AGENT_CONFIG,
-              CODER_MODEL,
-              readFileSync(
-                CODER_AGENT_SYSTEM_PROMPT_FILE.replace(/^\.\//, ""),
-                "utf8",
-              ),
-            ),
-          );
-
-          const coderRunName = `coder #${issue.number} r${round}`;
-          const livelockWatchdog = createLivelockWatchdogSandcastleRunOptions({
-            logPath: agentRunLogPath(issueBranch, coderRunName),
-            getWorktreeSnapshot: () =>
-              captureWorktreeProgressSnapshot(sandbox.worktreePath),
-          });
-          try {
-            coderResult = await recordMeasuredAgentRun(
-              {
-                prd: prdNumber,
-                issue: issue.number,
-                stage: "coder",
-                agent: CODER_AGENT_CONFIG.name,
-                round,
-                model: CODER_MODEL,
-                runName: coderRunName,
-                worktreePath: sandbox.worktreePath,
-                promptFile: CODER_USER_PROMPT_FILE,
-                promptArgs: coderUserArgs,
-              },
-              () =>
-                sandbox.run({
-                  name: coderRunName,
-                  agent: sandcastle.opencode(CODER_MODEL, {
-                    agent: CODER_AGENT_CONFIG.name,
-                  }),
-                  maxIterations: CODER_MAX_ITERATIONS,
-                  completionSignal: "<promise>COMPLETE</promise>",
-                  idleTimeoutSeconds,
-                  promptFile: CODER_USER_PROMPT_FILE,
-                  promptArgs: coderUserArgs,
-                  signal: livelockWatchdog.signal,
-                  logging: livelockWatchdog.logging,
-                }),
-            );
-          } catch (coderErr) {
-            const control = resolveRound1CoderLivelockControlFlow(coderErr);
-            if (control.action === "continue_with_feedback") {
-              console.log(
-                `  coder livelock on round ${round}; escalating to rework`,
-              );
-              feedback = control.feedback;
-              lastFeedback = feedback;
-              continue;
-            }
-            throw control.error;
-          }
-        }
-
-        const blockedMatch = coderResult.stdout.match(
-          /<blocked>([\s\S]*?)<\/blocked>/,
-        );
-        if (blockedMatch) {
-          const reason = blockedMatch[1]!.trim();
-          console.log(`  coder signaled blocked: ${reason.slice(0, 200)}`);
-          lastFeedback = `Coder signaled blocked on round ${round}:\n\n${reason}`;
-          terminalReason = "blocked";
-          break;
-        }
-
-        const alreadySatisfiedMatch = coderResult.stdout.match(
-          /<already_satisfied>([\s\S]*?)<\/already_satisfied>/,
-        );
-        if (alreadySatisfiedMatch) {
-          const reason = alreadySatisfiedMatch[1]!.trim();
-          const existingAheadCount = countCommitsAheadOfBase(
-            sandbox.worktreePath,
-          );
-          if (existingAheadCount > 0) {
-            console.log(
-              `  coder signaled already_satisfied, but branch has ${existingAheadCount} commit(s) ahead of ${originPrdRef()}; routing through validation/review/merge`,
-            );
-            committedCount = existingAheadCount;
-          } else {
-            console.log(
-              `  coder signaled already_satisfied: ${reason.slice(0, 200)}`,
-            );
-            alreadySatisfiedReason = reason;
-            break;
-          }
-        } else if (coderResult.commits.length === 0) {
-          // Distinguish "did nothing" from "edited but forgot to commit"
-          const uncommitted = git(
-            ["status", "-s"],
-            sandbox.worktreePath,
-          ).trim();
-          if (uncommitted) {
-            console.log(
-              `  coder produced no commits but worktree has uncommitted edits; feeding back commit reminder`,
-            );
-            feedback = [
-              "## You edited files but did not commit",
-              "",
-              "These files have uncommitted changes in the worktree:",
-              "",
-              "```",
-              uncommitted,
-              "```",
-              "",
-              'Edits without a commit are invisible to the host. Sandcastle only sees `git log` history, not the working tree. Run `git add <files>` and `git commit -m "<message>"` to save your work. Then re-verify and emit `<promise>COMPLETE</promise>`.',
-            ].join("\n");
-          } else {
-            const existingAheadCount = countCommitsAheadOfBase(
-              sandbox.worktreePath,
-            );
-            if (existingAheadCount > 0) {
-              // A restarted loop may re-enter an existing issue branch that
-              // already contains committed work from a prior run. Treat that
-              // branch state as the candidate for validation/review instead of
-              // looping forever on "No commits produced".
-              console.log(
-                `  coder produced no new commits, but branch already has ${existingAheadCount} commit(s) ahead of ${originPrdRef()}; validating existing branch state`,
-              );
-              committedCount = existingAheadCount;
-            } else {
-              console.log(
-                `  coder produced no commits and no uncommitted changes; feeding back "no commits" message`,
-              );
-              feedback =
-                "## No commits produced\n\nYour previous run finished without committing any changes. Re-read the issue and the PRD, then make the required code changes and commit them.";
-            }
-          }
-          if (committedCount === 0) {
-            lastFeedback = feedback;
-            continue;
-          }
-        }
-        if (committedCount === 0) {
-          committedCount = coderResult.commits.length;
-        }
-      }
-
-      const dirty = git(["status", "-s"], sandbox.worktreePath).trim();
-      if (dirty) {
-        console.log(
-          `  branch has ${committedCount} new commit(s) but uncommitted edits remain; feeding back cleanup request`,
-        );
-        feedback = [
-          "## Uncommitted changes after commit",
-          "",
-          "Your run produced commits, but the worktree still has uncommitted changes:",
-          "",
-          "```",
-          dirty,
-          "```",
-          "",
-          "Commit the intended issue changes and revert unrelated edits. The host validates and reviews only a clean, committed branch.",
-        ].join("\n");
-        lastFeedback = feedback;
-        continue;
-      }
-
-      console.log(
-        `  branch has ${committedCount} new commit(s); syncing branch for validation/review`,
-      );
-      const prep = prepareBranchForReview(
-        sandbox.worktreePath,
-        issueBranch,
-        recoveryAttempts,
-      );
-      recoveryAttempts = prep.recoveryAttempts;
-      if (!prep.ok) {
-        feedback = prep.feedback;
-        lastFeedback = feedback;
-        continue;
-      }
-
-      let reviewContext = computeReviewContext(
-        sandbox.worktreePath,
-        prep.baseSha,
-      );
-      const recoveryAttemptsBeforeDiffCheck = recoveryAttempts;
-      const recovery = maybeRecoverOversizedOrPollutedDiff(
-        sandbox.worktreePath,
-        issue,
-        issueBranch,
-        reviewContext,
-        recoveryAttempts,
-      );
-      recoveryAttempts = recovery.recoveryAttempts;
-      if (!recovery.ok) {
-        feedback = recovery.feedback;
-        lastFeedback = feedback;
-        continue;
-      }
-      if (
-        recovery.baseSha !== reviewContext.baseSha ||
-        recovery.recoveryAttempts !== recoveryAttemptsBeforeDiffCheck
-      ) {
-        reviewContext = computeReviewContext(
-          sandbox.worktreePath,
-          recovery.baseSha,
-        );
-      }
-      if (reviewContext.diffBytes > REVIEW_DIFF_MAX_BYTES) {
-        feedback = formatDiffTooLargeFeedback(reviewContext);
-        lastFeedback = feedback;
-        const progress = observeFailedRoundFingerprint(
-          progressState,
-          {
-            diffHash: sha1(normalizeForHash(reviewContext.diff)),
-            source: "diff_too_large",
-            signatureHash: sha1(String(REVIEW_DIFF_MAX_BYTES)),
-            signatureSummary: `review diff exceeds ${REVIEW_DIFF_MAX_BYTES} bytes`,
-          },
-          FAILED_ROUND_REPEAT_LIMIT,
-        );
-        progressState = progress.state;
-        if (progress.stalled) {
-          terminalReason = "stuck_no_progress";
-          lastFeedback = formatNoProgressFeedback({
-            round,
-            source: "diff_too_large",
-            repeatedCount: progress.state.repeatCount,
-            signatureSummary: `review diff exceeds ${REVIEW_DIFF_MAX_BYTES} bytes`,
-            lastFeedback: feedback,
-          });
-          break;
-        }
-        continue;
-      }
-      if (looksLikeWorkflowPollution(issue, reviewContext.changedFiles)) {
-        feedback = formatWorkflowPollutionFeedback(reviewContext);
-        lastFeedback = feedback;
-        const progress = observeFailedRoundFingerprint(
-          progressState,
-          {
-            diffHash: sha1(normalizeForHash(reviewContext.diff)),
-            source: "workflow_pollution",
-            signatureHash: sha1(normalizeForHash(reviewContext.changedFiles.join("\n"))),
-            signatureSummary: "workflow-only files changed outside issue scope",
-          },
-          FAILED_ROUND_REPEAT_LIMIT,
-        );
-        progressState = progress.state;
-        if (progress.stalled) {
-          terminalReason = "stuck_no_progress";
-          lastFeedback = formatNoProgressFeedback({
-            round,
-            source: "workflow_pollution",
-            repeatedCount: progress.state.repeatCount,
-            signatureSummary: "workflow-only files changed outside issue scope",
-            lastFeedback: feedback,
-          });
-          break;
-        }
-        continue;
-      }
-
-      console.log(
-        `  review diff: ${reviewContext.diffBytes} bytes, ${reviewContext.changedFiles.length} file(s), aspects: ${reviewContext.reviewAspects.join(", ")}`,
-      );
-      console.log(`  running validation gate`);
-      const gate = runValidationGate(sandbox.worktreePath, {
-        prd: prdNumber,
-        issue: issue.number,
-        round,
-        gate: "issue",
-      });
-      if (!gate.ok) {
-        const validationFingerprint = buildValidationFailureFingerprint(
-          reviewContext.diff,
-          gate.signature,
-        );
-        const validationProgress = observeFailedRoundFingerprint(
-          progressState,
-          validationFingerprint,
-          FAILED_ROUND_REPEAT_LIMIT,
-        );
-        progressState = validationProgress.state;
-        feedback = gate.feedback;
-        lastFeedback = feedback;
-        if (validationProgress.stalled) {
-          console.log(
-            `  no-progress: the same validation failure recurred across rounds; bailing to stuck`,
-          );
-          terminalReason = "stuck_no_progress";
-          lastFeedback = formatNoProgressFeedback({
-            round,
-            source: validationFingerprint.source,
-            repeatedCount: validationProgress.state.repeatCount,
-            signatureSummary: validationFingerprint.signatureSummary,
-            lastFeedback: feedback,
-          });
-          break;
-        }
-        continue;
-      }
-
-      console.log(`  validation green; invoking reviewer`);
-      const reviewerUserArgs = {
-        ISSUE_NUMBER: String(issue.number),
-        ISSUE_TITLE: issue.title,
-        ISSUE_BODY: issue.body || "(no body)",
-        ISSUE_COMMENTS: issueComments,
-        BASE_BRANCH: originPrdRef(),
-        REVIEW_BASE_SHA: reviewContext.baseSha,
-        DIFF: reviewContext.diff,
-        DIFF_BYTES: String(reviewContext.diffBytes),
-        DIFF_MAX_BYTES: String(REVIEW_DIFF_MAX_BYTES),
-        CHANGED_FILES: reviewContext.changedFiles.join("\n") || "(none)",
-        DIFF_STAT: reviewContext.diffStat,
-        REVIEW_ASPECTS: reviewContext.reviewAspects.join(", "),
-        ECOSYSTEMS: reviewContext.ecosystems.join(", ") || "(unknown)",
-      };
-      const reviewerTemplate = readFileSync(
-        REVIEWER_USER_PROMPT_FILE.replace(/^\.\//, ""),
-        "utf8",
-      );
-      const renderedReviewerMessage = renderSlimMessage(
-        reviewerTemplate,
-        reviewerUserArgs,
-      );
-      const reviewerSizeCheck = enforceArgvSizeLimit(renderedReviewerMessage);
-      if (!reviewerSizeCheck.ok) {
-        feedback = reviewerSizeCheck.error;
-        lastFeedback = feedback;
-        const progress = observeFailedRoundFingerprint(
-          progressState,
-          {
-            diffHash: sha1(normalizeForHash(reviewContext.diff)),
-            source: "host_input_limit",
-            signatureHash: sha1(normalizeForHash(reviewerSizeCheck.error)),
-            signatureSummary: "reviewer prompt exceeded argv/input limit",
-          },
-          FAILED_ROUND_REPEAT_LIMIT,
-        );
-        progressState = progress.state;
-        if (progress.stalled) {
-          terminalReason = "stuck_no_progress";
-          lastFeedback = formatNoProgressFeedback({
-            round,
-            source: "host_input_limit",
-            repeatedCount: progress.state.repeatCount,
-            signatureSummary: "reviewer prompt exceeded argv/input limit",
-            lastFeedback: feedback,
-          });
-          break;
-        }
-        continue;
-      }
-
-      writeAgentDefinitionFile(
-        sandbox.worktreePath,
-        REVIEWER_AGENT_CONFIG.name,
-        buildAgentDefinition(
-          REVIEWER_AGENT_CONFIG,
-          REVIEWER_MODEL,
-          readFileSync(
-            REVIEWER_AGENT_SYSTEM_PROMPT_FILE.replace(/^\.\//, ""),
-            "utf8",
-          ),
-        ),
-      );
-
-      const reviewerMaxAttempts = LOOP_CONFIG.reviewer.maxAttempts;
-      let reviewerApproved = false;
-      let reviewerNeedsRework = false;
-      let reviewerTerminalFeedback: string | null = null;
-      for (let attempt = 1; attempt <= reviewerMaxAttempts; attempt++) {
-        const reviewerRunName = buildReviewerAttemptRunName(
-          issue.number,
-          round,
-          attempt,
-        );
-        const reviewerResult = await recordMeasuredAgentRun(
-          {
-            prd: prdNumber,
-            issue: issue.number,
-            stage: "reviewer",
-            agent: REVIEWER_AGENT_CONFIG.name,
-            round,
-            model: REVIEWER_MODEL,
-            runName: reviewerRunName,
-            worktreePath: sandbox.worktreePath,
-            promptFile: REVIEWER_USER_PROMPT_FILE,
-            promptArgs: reviewerUserArgs,
-          },
-          () =>
-            sandbox.run({
-              name: reviewerRunName,
-              agent: sandcastle.opencode(REVIEWER_MODEL, {
-                agent: REVIEWER_AGENT_CONFIG.name,
-              }),
-              maxIterations: 1,
-              completionSignal: "</review>",
-              idleTimeoutSeconds,
-              promptFile: REVIEWER_USER_PROMPT_FILE,
-              promptArgs: reviewerUserArgs,
-            }),
-        );
-        const logFilePath =
-          typeof reviewerResult === "object" &&
-          reviewerResult !== null &&
-          "logFilePath" in reviewerResult &&
-          typeof reviewerResult.logFilePath === "string"
-            ? reviewerResult.logFilePath
-            : undefined;
-        const runLogText =
-          logFilePath && existsSync(logFilePath)
-            ? readFileSync(logFilePath, "utf8")
-            : undefined;
-        const acquisition = acquireReviewerResult({
-          stdout: reviewerResult.stdout,
-          runLogText,
-          runLogReadError:
-            logFilePath && !existsSync(logFilePath)
-              ? `missing log file at ${logFilePath}`
-              : undefined,
-          logFilePath,
-        });
-        recordReviewerResult({
-          prd: prdNumber,
-          issue: issue.number,
-          round,
-          attempt,
-          maxAttempts: reviewerMaxAttempts,
-          status:
-            acquisition.kind === "verdict"
-              ? acquisition.review.decision
-              : acquisition.kind,
-          resultSource: acquisition.resultSource,
-          logFallbackUsed: acquisition.logFallbackUsed,
-          logFilePath,
-          parseFailureCode:
-            acquisition.kind === "parse_failed" ? acquisition.code : undefined,
-        });
-        if (acquisition.kind === "verdict") {
-          const review = acquisition.review;
-          console.log(`  reviewer decision: ${review.decision}`);
-          if (review.decision === "approved") {
-            const currentBaseSha = fetchOriginPrd(sandbox.worktreePath);
-            if (currentBaseSha !== reviewContext.baseSha) {
-              if (hostOnlyReviewAttempts < 2) {
-                hostOnlyReviewAttempts++;
-                hostOnlyReview = true;
-                round--;
-                console.log(
-                  `  ${originPrdRef()} advanced after review; running host-only re-review attempt ${hostOnlyReviewAttempts}/2`,
-                );
-              } else {
-                feedback = [
-                  "## Base branch keeps advancing after review",
-                  "",
-                  `${originPrdRef()} advanced from reviewed base ${reviewContext.baseSha} to ${currentBaseSha} after validation/review completed.`,
-                  "",
-                  "The host already retried re-sync/re-validation/re-review twice. Continue from the current branch and emit `<promise>COMPLETE</promise>` so the host can try again.",
-                ].join("\n");
-                lastFeedback = feedback;
-              }
-              reviewerApproved = false;
-              reviewerNeedsRework = false;
-              reviewerTerminalFeedback = null;
-              break;
-            }
-            reviewedBaseSha = reviewContext.baseSha;
-            approvedTreeSha = treeShaOf("HEAD", sandbox.worktreePath);
-            approved = true;
-            reviewerApproved = true;
-            break;
-          }
-          if (review.decision === "needs_human_review") {
-            terminalReason = "stuck_needs_human_review";
-            reviewerTerminalFeedback = formatReviewerAcquisitionFeedback({
-              header: "## Reviewer requested human review",
-              round,
-              attempt,
-              maxAttempts: reviewerMaxAttempts,
-              runName: reviewerRunName,
-              reviewBaseSha: reviewContext.baseSha,
-              candidateHeadSha: git(
-                ["rev-parse", "HEAD"],
-                sandbox.worktreePath,
-              ).trim(),
-              candidateTreeSha: treeShaOf("HEAD", sandbox.worktreePath),
-              logFilePath,
-              resultSource: acquisition.resultSource,
-              failureCode: "needs_human_review",
-              excerpt: sanitizeReviewerExcerpt(reviewerResult.stdout),
-              diagnostics: acquisition.diagnostics,
-            });
-            break;
-          }
-          feedback = formatFeedback(review);
-          lastFeedback = feedback;
-          const reviewFingerprint = buildReviewerFailureFingerprint(
-            reviewContext.diff,
-            review,
-          );
-          const progress = observeFailedRoundFingerprint(
-            progressState,
-            reviewFingerprint,
-            FAILED_ROUND_REPEAT_LIMIT,
-          );
-          progressState = progress.state;
-          if (progress.stalled) {
-            terminalReason = "stuck_no_progress";
-            lastFeedback = formatNoProgressFeedback({
-              round,
-              source: reviewFingerprint.source,
-              repeatedCount: progress.state.repeatCount,
-              signatureSummary: reviewFingerprint.signatureSummary,
-              lastFeedback: feedback,
-            });
-            reviewerNeedsRework = false;
-            break;
-          }
-          reviewerNeedsRework = true;
-          break;
-        }
-
-        const terminalHeader =
-          acquisition.kind === "parse_failed"
-            ? "## Reviewer parse failure"
-            : "## Reviewer incomplete";
-        reviewerTerminalFeedback = formatReviewerAcquisitionFeedback({
-          header: terminalHeader,
-          round,
-          attempt,
-          maxAttempts: reviewerMaxAttempts,
-          runName: reviewerRunName,
-          reviewBaseSha: reviewContext.baseSha,
-          candidateHeadSha: git(["rev-parse", "HEAD"], sandbox.worktreePath).trim(),
-          candidateTreeSha: treeShaOf("HEAD", sandbox.worktreePath),
-          logFilePath,
-          resultSource: acquisition.resultSource,
-          failureCode: acquisition.code,
-          excerpt: sanitizeReviewerExcerpt(
-            runLogText ?? reviewerResult.stdout ?? "",
-          ),
-          diagnostics: acquisition.diagnostics,
-        });
-        if (attempt < reviewerMaxAttempts) {
-          console.log(
-            `  reviewer attempt ${attempt}/${reviewerMaxAttempts} failed to produce a valid verdict (${summarizeReviewerAttemptFailure(acquisition)}); retrying`,
-          );
-          continue;
-        }
-        terminalReason =
-          acquisition.kind === "parse_failed"
-            ? "stuck_reviewer_parse_failure"
-            : "stuck_reviewer_incomplete";
-        break;
-      }
-      if (reviewerApproved || approved) {
-        break;
-      }
-      if (terminalReason === "stuck_needs_human_review") {
-        lastFeedback = reviewerTerminalFeedback ?? lastFeedback;
-        break;
-      }
-      if (
-        terminalReason === "stuck_reviewer_parse_failure" ||
-        terminalReason === "stuck_reviewer_incomplete" ||
-        terminalReason === "stuck_no_progress"
-      ) {
-        lastFeedback = reviewerTerminalFeedback ?? lastFeedback;
-        break;
-      }
-      if (reviewerNeedsRework) {
-        continue;
-      }
-      if (hostOnlyReview) {
-        continue;
-      }
-    }
-
-    if (alreadySatisfiedReason) {
+    if (outcome.kind === "already_satisfied") {
       try {
-        closeIssueAsAlreadySatisfied(issue, alreadySatisfiedReason);
+        closeIssueAsAlreadySatisfied(issue, outcome.evidence);
         console.log(
           `Issue #${issue.number} closed as already satisfied on ${prdBranch}.`,
         );
@@ -2407,7 +2317,7 @@ async function processNormalIssueIteration(context: {
           prd: prdNumber,
           issue: issue.number,
           outcome: "already_satisfied",
-          roundsUsed,
+          roundsUsed: outcome.roundsUsed,
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -2415,9 +2325,9 @@ async function processNormalIssueIteration(context: {
           `Issue #${issue.number} was reported as already satisfied, but close step failed: ${msg.slice(0, 300)}`,
         );
         try {
-          markStuck(issue, sandbox.worktreePath, issueBranch, {
+          markStuck(issue, worktreePath, issueBranch, {
             headline: `Coder reported the issue is already satisfied on ${prdBranch}, but the host could not close it automatically.`,
-            lastFeedback: `${alreadySatisfiedReason}\n\n${msg.slice(0, 4000)}`,
+            lastFeedback: `${outcome.evidence}\n\n${msg.slice(0, 4000)}`,
           });
         } catch (stuckErr) {
           console.error(
@@ -2425,21 +2335,17 @@ async function processNormalIssueIteration(context: {
           );
         }
       }
-    } else if (approved) {
+    } else if (outcome.kind === "approved") {
       try {
-        approveAndMerge(
-          issue,
-          sandbox.worktreePath,
-          issueBranch,
-          reviewedBaseSha,
-        );
+        tuiEmitter.beginHostStep("merge", issueBranch);
+        approveAndMerge(issue, worktreePath, issueBranch, outcome.reviewedBaseSha);
         lastValidatedTreeSha = approvedTreeSha;
         console.log(`Issue #${issue.number} merged into ${prdBranch}.`);
         recordIssueOutcome({
           prd: prdNumber,
           issue: issue.number,
           outcome: "merged",
-          roundsUsed,
+          roundsUsed: outcome.roundsUsed,
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -2447,7 +2353,7 @@ async function processNormalIssueIteration(context: {
           `Issue #${issue.number} approved but merge step failed: ${msg.slice(0, 300)}`,
         );
         try {
-          markStuck(issue, sandbox.worktreePath, issueBranch, {
+          markStuck(issue, worktreePath, issueBranch, {
             headline:
               "Reviewer approved but the host could not complete the merge. Manual intervention required.",
             lastFeedback: msg.slice(0, 4000),
@@ -2458,17 +2364,17 @@ async function processNormalIssueIteration(context: {
           );
         }
       }
-    } else {
+    } else if (outcome.kind === "stuck") {
       const reasonHeader =
-        (lastFeedback || "(no feedback recorded)")
+        (outcome.lastFeedback || "(no feedback recorded)")
           .split("\n")
           .find((l) => l.trim().startsWith("##"))
           ?.trim()
           .replace(/^##\s*/, "") ?? "(no recognizable reason header)";
       console.log(
-        `Issue #${issue.number} stuck after ${roundsUsed} round(s) (${terminalReason}). Reason: ${reasonHeader}`,
+        `Issue #${issue.number} stuck after ${outcome.roundsUsed} round(s) (${outcome.reason}). Reason: ${reasonHeader}`,
       );
-      const preview = (lastFeedback || "")
+      const preview = (outcome.lastFeedback || "")
         .split("\n")
         .slice(0, 12)
         .map((l) => `    ${l}`)
@@ -2478,10 +2384,10 @@ async function processNormalIssueIteration(context: {
         console.log(preview);
       }
       try {
-        markStuck(issue, sandbox.worktreePath, issueBranch, {
-          lastFeedback: lastFeedback || "(no feedback recorded)",
-          roundsUsed,
-          terminalReason,
+        markStuck(issue, worktreePath, issueBranch, {
+          lastFeedback: outcome.lastFeedback || "(no feedback recorded)",
+          roundsUsed: outcome.roundsUsed,
+          terminalReason: outcome.reason,
         });
       } catch (stuckErr) {
         console.error(
@@ -2491,8 +2397,18 @@ async function processNormalIssueIteration(context: {
       recordIssueOutcome({
         prd: prdNumber,
         issue: issue.number,
-        outcome: terminalReason,
-        roundsUsed,
+        outcome: outcome.reason,
+        roundsUsed: outcome.roundsUsed,
+      });
+    } else {
+      console.error(
+        `Iteration ${iteration} for #${issue.number} crashed unexpectedly. Continuing to next issue.\n${outcome.error}`,
+      );
+      recordIssueOutcome({
+        prd: prdNumber,
+        issue: issue.number,
+        outcome: "crashed",
+        roundsUsed: outcome.roundsUsed,
       });
     }
   } catch (iterErr) {
@@ -2506,7 +2422,7 @@ async function processNormalIssueIteration(context: {
       roundsUsed,
     });
   } finally {
-    await sandbox.close();
+    await shared?.closeSandbox();
   }
 
   return { kind: "processed_issue", issueNumber: issue.number };
@@ -2571,6 +2487,12 @@ async function runExtraReviewRound(input: {
     console.log(
       `Reviewing ${extraReviewBaseSha.slice(0, 7)}..${reviewedHeadSha.slice(0, 7)} on ${prdBranch}`,
     );
+    tuiEmitter.setPhase("extra_review");
+    tuiEmitter.setExtraReviewRound({
+      current: round.number,
+      max: MAX_EXTRA_REVIEW_ROUNDS,
+    });
+    tuiEmitter.clearTicket();
 
     const reviewInputs = writeCompletedBranchReviewInputs({
       prd: {
@@ -2596,6 +2518,17 @@ async function runExtraReviewRound(input: {
       idleTimeoutSeconds,
       copyToWorktree: COPY_TO_WORKTREE,
       hooks: sandboxReadyHooks(),
+      onAgentSession: ({ runName }) => {
+        const activeLogPath = tuiWorkingLogPath(runName);
+        return {
+          activeLogPath,
+          logging: {
+            type: "file",
+            path: agentRunLogPath(prdBranch, runName),
+            onAgentStreamEvent: tuiEmitter.workingLogSink(activeLogPath),
+          },
+        };
+      },
       createSandbox: (sandboxInput) =>
         sandcastle.createSandbox({
           sandbox: dockerSandboxProvider(),
@@ -2867,6 +2800,9 @@ const mainLoopResult = await runBoundedExtraReviewMainLoop({
   runNormalIssueIteration: processNormalIssueIteration,
   runExtraReviewRound,
 });
+
+// Companion TUI: write the terminal snapshot with the clean stop reason.
+tuiEmitter.stop(mainLoopResult.reason);
 
 console.log(
   [

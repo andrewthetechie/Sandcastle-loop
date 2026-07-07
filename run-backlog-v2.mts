@@ -63,6 +63,8 @@ import {
   resolveRound1CoderLivelockControlFlow,
   resolveReworkLivelockControlFlow,
 } from "./agent-invocation-livelock.mts";
+import { tuiEmitter } from "./tui-emitter.mts";
+import { tuiWorkingLogPath } from "./tui-status.mts";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -202,6 +204,15 @@ console.log(
   ].join("\n"),
 );
 logCoderReworkModelStartupWarning(CODER_MODEL, REWORK_MODEL);
+
+// Companion TUI: begin emitting the read-only status snapshot for this loop.
+// Side-effect-only; a failure here can never affect loop control flow. The
+// backlog loop stays in the normal_issue phase (no extra-review tier).
+tuiEmitter.startLoop({
+  loopType: "backlog",
+  loopId: labels.join(","),
+  phase: "normal_issue",
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -745,6 +756,7 @@ function runValidationGate(
   },
 ): GateResult {
   for (const [index, cmd] of VALIDATION_COMMANDS.entries()) {
+    tuiEmitter.beginHostStep("validation", cmd);
     console.log(`  $ ${cmd}`);
     const startedMs = Date.now();
     const result = spawnSync(cmd, {
@@ -1508,9 +1520,15 @@ async function processIssue(issue: IssueDetail): Promise<void> {
 
   const issueBranch = `issue-${issue.number}`;
   const issueComments = flattenComments(issue.comments);
+  tuiEmitter.setTicket({
+    number: issue.number,
+    title: issue.title,
+    branch: issueBranch,
+  });
 
   preflightExistingIssueBranch(issue, issueBranch);
 
+  tuiEmitter.beginHostStep("sandbox_setup", issueBranch);
   const sandbox = await sandcastle.createSandbox({
     sandbox: dockerSandboxProvider(),
     branch: issueBranch,
@@ -1550,12 +1568,14 @@ async function processIssue(issue: IssueDetail): Promise<void> {
         `\n--- Round ${round}/${MAX_REVIEW_ROUNDS} for #${issue.number} ---`,
       );
       roundsUsed = round;
+      tuiEmitter.setRound({ current: round, max: MAX_REVIEW_ROUNDS });
 
       // Pre-coder rebase guard — only on round 1 (always the coder, never rework).
       // On restart, a re-picked issue re-enters at round 1, so this is exactly
       // "before the coder resumes." A conflict here is terminal; we do not
       // attempt auto-recovery.
       if (round === 1) {
+        tuiEmitter.beginHostStep("branch_prep", issueBranch);
         const guard = rebaseStaleIssueBranchBeforeCoder(
           sandbox.worktreePath,
           issueBranch,
@@ -1604,11 +1624,13 @@ async function processIssue(issue: IssueDetail): Promise<void> {
         );
 
         const reworkRunName = `rework #${issue.number} r${round}`;
+        const reworkActiveLogPath = tuiWorkingLogPath(reworkRunName);
         const reworkLivelockWatchdog =
           createLivelockWatchdogSandcastleRunOptions({
             logPath: agentRunLogPath(issueBranch, reworkRunName),
             getWorktreeSnapshot: () =>
               captureWorktreeProgressSnapshot(sandbox.worktreePath),
+            onStreamEvent: tuiEmitter.workingLogSink(reworkActiveLogPath),
           });
         try {
           coderResult = await recordMeasuredAgentRun(
@@ -1623,6 +1645,7 @@ async function processIssue(issue: IssueDetail): Promise<void> {
               worktreePath: sandbox.worktreePath,
               promptFile: REWORK_USER_PROMPT_FILE,
               promptArgs: reworkUserArgs,
+              activeLogPath: reworkActiveLogPath,
             },
             () =>
               sandbox.run({
@@ -1684,10 +1707,12 @@ async function processIssue(issue: IssueDetail): Promise<void> {
         );
 
         const coderRunName = `coder #${issue.number} r${round}`;
+        const coderActiveLogPath = tuiWorkingLogPath(coderRunName);
         const livelockWatchdog = createLivelockWatchdogSandcastleRunOptions({
           logPath: agentRunLogPath(issueBranch, coderRunName),
           getWorktreeSnapshot: () =>
             captureWorktreeProgressSnapshot(sandbox.worktreePath),
+          onStreamEvent: tuiEmitter.workingLogSink(coderActiveLogPath),
         });
         try {
           coderResult = await recordMeasuredAgentRun(
@@ -1702,6 +1727,7 @@ async function processIssue(issue: IssueDetail): Promise<void> {
               worktreePath: sandbox.worktreePath,
               promptFile: CODER_USER_PROMPT_FILE,
               promptArgs: coderUserArgs,
+              activeLogPath: coderActiveLogPath,
             },
             () =>
               sandbox.run({
@@ -1833,6 +1859,7 @@ async function processIssue(issue: IssueDetail): Promise<void> {
       console.log(
         `  branch has ${committedCount} new commit(s); syncing branch for validation/review`,
       );
+      tuiEmitter.beginHostStep("branch_prep", issueBranch);
       const prep = prepareBranchForReview(
         sandbox.worktreePath,
         issueBranch,
@@ -2045,6 +2072,7 @@ async function processIssue(issue: IssueDetail): Promise<void> {
           round,
           attempt,
         );
+        const reviewerActiveLogPath = tuiWorkingLogPath(reviewerRunName);
         const reviewerResult = await recordMeasuredAgentRun(
           {
             prd: label,
@@ -2057,6 +2085,7 @@ async function processIssue(issue: IssueDetail): Promise<void> {
             worktreePath: sandbox.worktreePath,
             promptFile: REVIEWER_USER_PROMPT_FILE,
             promptArgs: reviewerUserArgs,
+            activeLogPath: reviewerActiveLogPath,
           },
           () =>
             sandbox.run({
@@ -2069,6 +2098,15 @@ async function processIssue(issue: IssueDetail): Promise<void> {
               idleTimeoutSeconds,
               promptFile: REVIEWER_USER_PROMPT_FILE,
               promptArgs: reviewerUserArgs,
+              // Reuse Sandcastle file logging as the reviewer run log
+              // (acquireReviewerResult reads logFilePath) while also feeding the
+              // Companion-TUI working-log sink.
+              logging: {
+                type: "file",
+                path: agentRunLogPath(issueBranch, reviewerRunName),
+                onAgentStreamEvent:
+                  tuiEmitter.workingLogSink(reviewerActiveLogPath),
+              },
             }),
         );
         const logFilePath =
@@ -2241,6 +2279,7 @@ async function processIssue(issue: IssueDetail): Promise<void> {
       });
     } else if (approved) {
       try {
+        tuiEmitter.beginHostStep("deliver_review_ready", issueBranch);
         deliverReviewReady(issue, sandbox.worktreePath, issueBranch);
         console.log(
           `Issue #${issue.number} is review-ready: branch ${issueBranch} pushed and labelled ${REVIEW_LABEL}.`,
@@ -2341,10 +2380,12 @@ while (true) {
   }
   const iteration = completedIterations + 1;
   console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
+  tuiEmitter.setIteration({ current: iteration, max: MAX_ITERATIONS });
 
   const issue = pickNextIssue(handledIssues);
   if (!issue) {
     console.log(`No eligible issues with label(s) '${labels.join(", ")}'.`);
+    tuiEmitter.clearTicket();
     stopReason = "no_eligible_issue";
     break;
   }
@@ -2353,6 +2394,9 @@ while (true) {
   await processIssue(issue);
   completedIterations++;
 }
+
+// Companion TUI: write the terminal snapshot with the clean stop reason.
+tuiEmitter.stop(stopReason);
 
 console.log(
   [

@@ -23,6 +23,14 @@ Do not write narration or commentary before your first tool call. Begin with a `
 - Change dependency manifests except for the missing-dependency rule below.
 - Delete or rewrite an existing `import`, `use`, or `require` just to silence an unresolved-module error.
 
+## Host-only database validation
+
+Full PostgreSQL validation is executed by the host, not this sandbox. Host-validation feedback is diagnostic evidence only.
+
+Never run `pg-ensure`, `pg_ctl`, `postgres`, `docker`, `sudo`, `su`, or `alembic upgrade` in the sandbox. Do not start, reset, configure, or administer PostgreSQL here.
+
+Make only the source or test change indicated by the feedback. Run only targeted non-database validation; the host will rerun the full gate after your commit.
+
 # Completion
 
 When `git log -1 --stat` shows your fix and `git status -s` is empty, emit `<promise>COMPLETE</promise>` on its own line and stop.

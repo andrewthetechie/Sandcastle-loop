@@ -1,0 +1,26 @@
+{
+  "name": "sandcastle-loop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Autonomous Sandcastle PRD/backlog loops and the read-only Companion TUI.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit --allowImportingTsExtensions --module nodenext --moduleResolution nodenext --target es2022 --types node types/ai-hero-sandcastle.d.ts per-branch-policy.mts per-branch-engine.mts backlog-v3-issue-as-prd-*.mts issue-as-prd-*.mts verified-host-mutation.mts subtask-readiness.mts run-backlog-v3.mts run-prd-v4.mts extra-review-*.mts github-issues.mts reviewer-result.mts metrics-recorder.mts loop-progress.mts escalation-review-trigger.mts backlog-v3-issue-as-prd-*.test.mts issue-as-prd-*.test.mts verified-host-mutation.test.mts subtask-readiness.test.mts run-backlog-v3-static.test.mts extra-review-sessions.test.mts",
+    "build": "esbuild run-backlog-v3.mts run-prd-v4.mts tui-companion.mts --bundle --format=esm --platform=node --external:@ai-hero/sandcastle --external:@ai-hero/sandcastle/sandboxes/docker --external:react-devtools-core --outdir=/tmp/public-loop-build-check",
+    "tui": "tsx tui-companion.mts",
+    "test": "tsx --test *.test.mts"
+  },
+  "dependencies": {
+    "ink": "^7.1.0",
+    "react": "^19.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "@types/react": "^19.2.17",
+    "tsx": "^4.22.5",
+    "typescript": "^6.0.3"
+  }
+}

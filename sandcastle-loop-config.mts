@@ -8,6 +8,8 @@ export interface SandcastleLoopRoleModels {
   coder: string;
   rework: string;
   reviewer: string;
+  initialIssueDecomposer: string;
+  subtaskReadiness: string;
   codeQuality: string;
   twoAxis: string;
   issueDecomposer: string;
@@ -34,6 +36,9 @@ export interface SandcastleLoopConfig {
   reviewer?: {
     maxAttempts?: number;
   };
+  issueAsPrd?: {
+    parentCommentMaxBytes?: number;
+  };
 }
 
 export interface ResolvedSandcastleLoopCacheMount {
@@ -51,6 +56,9 @@ export interface ResolvedSandcastleLoopConfig {
   reviewer: {
     maxAttempts: number;
   };
+  issueAsPrd: {
+    parentCommentMaxBytes: number;
+  };
   cache: {
     root: string;
     mounts: ResolvedSandcastleLoopCacheMount[];
@@ -65,6 +73,8 @@ const DEFAULT_MODELS: SandcastleLoopRoleModels = {
   coder: "strix/qwen3.6-35b-a3b-8bit",
   rework: "strix/qwen3.6-35b-a3b-8bit",
   reviewer: "zai-coding-plan/glm-5.1",
+  initialIssueDecomposer: "zai-coding-plan/glm-5.1",
+  subtaskReadiness: "zai-coding-plan/glm-5.1",
   codeQuality: "zai-coding-plan/glm-5.1",
   twoAxis: "zai-coding-plan/glm-5.1",
   issueDecomposer: "zai-coding-plan/glm-5.1",
@@ -79,6 +89,7 @@ const DEFAULT_VALIDATION_COMMANDS = [
 
 const DEFAULT_SETUP_COMMANDS = ["npm install"];
 const DEFAULT_REVIEWER_MAX_ATTEMPTS = 2;
+const DEFAULT_PARENT_COMMENT_MAX_BYTES = 32_000;
 
 export async function loadSandcastleLoopConfig(
   repoRoot: string,
@@ -100,13 +111,21 @@ export async function loadSandcastleLoopConfig(
     mounts: userConfig.cache?.mounts ?? [],
   });
   const env = userConfig.cache?.env ?? {};
+  const configuredModels = {
+    ...DEFAULT_MODELS,
+    ...(userConfig.models ?? {}),
+  };
+  const resolvedReviewerModel = configuredModels.reviewer;
 
   return {
     configPath,
     loadedConfig: existsSync(configPath),
     models: {
-      ...DEFAULT_MODELS,
-      ...(userConfig.models ?? {}),
+      ...configuredModels,
+      initialIssueDecomposer:
+        userConfig.models?.initialIssueDecomposer ?? resolvedReviewerModel,
+      subtaskReadiness:
+        userConfig.models?.subtaskReadiness ?? resolvedReviewerModel,
     },
     validationCommands:
       userConfig.validationCommands ?? [...DEFAULT_VALIDATION_COMMANDS],
@@ -114,6 +133,11 @@ export async function loadSandcastleLoopConfig(
     reviewer: {
       maxAttempts:
         userConfig.reviewer?.maxAttempts ?? DEFAULT_REVIEWER_MAX_ATTEMPTS,
+    },
+    issueAsPrd: {
+      parentCommentMaxBytes:
+        userConfig.issueAsPrd?.parentCommentMaxBytes ??
+        DEFAULT_PARENT_COMMENT_MAX_BYTES,
     },
     cache: {
       root: cacheRoot,
@@ -251,6 +275,23 @@ function validateConfig(
       ) {
         throw new Error(
           `${configPath}: reviewer.maxAttempts must be an integer from 1 through 5`,
+        );
+      }
+    }
+  }
+  if (config.issueAsPrd !== undefined) {
+    if (!isRecord(config.issueAsPrd)) {
+      throw new Error(`${configPath}: issueAsPrd must be an object`);
+    }
+    if (config.issueAsPrd.parentCommentMaxBytes !== undefined) {
+      const parentCommentMaxBytes = config.issueAsPrd.parentCommentMaxBytes;
+      if (
+        typeof parentCommentMaxBytes !== "number" ||
+        !Number.isInteger(parentCommentMaxBytes) ||
+        parentCommentMaxBytes < 1
+      ) {
+        throw new Error(
+          `${configPath}: issueAsPrd.parentCommentMaxBytes must be a positive integer`,
         );
       }
     }

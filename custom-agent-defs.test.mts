@@ -5,8 +5,10 @@ import {
   CODE_QUALITY_AGENT_CONFIG,
   CODER_AGENT_CONFIG,
   DECOMPOSER_AGENT_CONFIG,
+  INITIAL_ISSUE_DECOMPOSER_AGENT_CONFIG,
   REVIEWER_AGENT_CONFIG,
   REWORK_AGENT_CONFIG,
+  SUBTASK_READINESS_AGENT_CONFIG,
   TWO_AXIS_AGENT_CONFIG,
   buildAgentDefinition,
 } from "./custom-agent-defs.mts";
@@ -65,7 +67,7 @@ BODY`,
   );
 });
 
-test("all six configs emit expected values and shared deny permissions", () => {
+test("all eight configs emit expected values and shared deny permissions", () => {
   const cases = [
     {
       config: CODER_AGENT_CONFIG,
@@ -101,6 +103,18 @@ test("all six configs emit expected values and shared deny permissions", () => {
       config: DECOMPOSER_AGENT_CONFIG,
       description: "Turns review findings into follow-up PRD issue drafts",
       temperature: 0.3,
+      edit: "deny",
+    },
+    {
+      config: INITIAL_ISSUE_DECOMPOSER_AGENT_CONFIG,
+      description: "Turns one parent issue into implementation-ready child issue drafts",
+      temperature: 0.3,
+      edit: "deny",
+    },
+    {
+      config: SUBTASK_READINESS_AGENT_CONFIG,
+      description: "Readiness-gates one generated child issue before implementation",
+      temperature: 0.1,
       edit: "deny",
     },
   ] as const;

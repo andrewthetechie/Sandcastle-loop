@@ -1,4 +1,5 @@
 export const MAX_EXTRA_REVIEW_ROUNDS = 2;
+export const ISSUE_AS_PRD_MAX_EXTRA_REVIEW_ROUNDS = 1;
 export const REVIEW_FOLLOW_UP_LABEL = "ai-review-followup";
 
 export const EXTRA_CODE_REVIEW_MODEL = "zai-coding-plan/glm-5.1";

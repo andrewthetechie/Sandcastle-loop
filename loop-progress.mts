@@ -8,6 +8,10 @@ export type FailedRoundSource =
   | "branch_hygiene"
   | "missing_commit"
   | "host_input_limit"
+  | "review_input_limit"
+  | "reviewer_parse_failure"
+  | "reviewer_incomplete"
+  | "branch_prep"
   | "livelock";
 
 export interface FailedRoundFingerprint {

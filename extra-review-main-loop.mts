@@ -39,6 +39,7 @@ export interface ExtraReviewRoundResult {
 
 export type ExtraReviewMainLoopStopReason =
   | ExtraReviewRoundStopReason
+  | "clean_drain"
   | "max_extra_review_rounds"
   | "iteration_cap_exhausted"
   | "stuck_issues"

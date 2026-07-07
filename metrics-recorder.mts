@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { tuiEmitter } from "./tui-emitter.mts";
 
 export interface MeasuredAgentRunMetadata {
   prd: number | string;
@@ -12,6 +13,27 @@ export interface MeasuredAgentRunMetadata {
   worktreePath?: string;
   promptFile?: string;
   promptArgs?: Record<string, string>;
+  /**
+   * Loop-owned working-log file for this agent step (Companion TUI). When set,
+   * the agent-step snapshot points the TUI at this file. Undefined for callers
+   * that do not run the TUI-instrumented loops.
+   */
+  activeLogPath?: string;
+}
+
+/**
+ * The agent-step chokepoint reports a single Companion-TUI agent step per run.
+ * Injectable so tests can assert it fires exactly once without the singleton or
+ * a real sandbox; defaults to the shared emitter (a no-op until `startLoop`).
+ */
+export interface RecordMeasuredAgentRunDeps {
+  beginAgentStep?: (input: {
+    stage: string;
+    agent?: string;
+    model?: string;
+    worktreePath?: string;
+    activeLogPath?: string;
+  }) => void;
 }
 
 export interface MeasuredAgentRunResult {
@@ -55,7 +77,20 @@ export function buildMeasuredAgentRunRecord(
 export async function recordMeasuredAgentRun<T>(
   metadata: MeasuredAgentRunMetadata,
   run: () => Promise<T>,
+  deps: RecordMeasuredAgentRunDeps = {},
 ): Promise<T> {
+  const beginAgentStep =
+    deps.beginAgentStep ?? ((input) => tuiEmitter.beginAgentStep(input));
+  // Report the Companion-TUI agent step once, at the single seam both loops route
+  // every agent run through. Emission is a no-op until a loop calls startLoop().
+  beginAgentStep({
+    stage: metadata.stage,
+    agent: metadata.agent,
+    model: metadata.model,
+    worktreePath: metadata.worktreePath,
+    activeLogPath: metadata.activeLogPath,
+  });
+
   const startedAt = new Date();
   const startedMs = startedAt.getTime();
   const runId = [

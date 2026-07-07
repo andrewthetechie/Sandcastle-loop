@@ -7,6 +7,13 @@ import type {
 } from "./extra-review-contracts.mts";
 
 export type JsonRecord = Record<string, unknown>;
+type FailureDetailLike = {
+  code: string;
+  path: string;
+  message: string;
+  expected?: string;
+  actual?: string;
+};
 
 export interface TaggedJsonObject {
   value: JsonRecord;
@@ -167,7 +174,7 @@ export function exactKeys(
   record: JsonRecord,
   keys: readonly string[],
   path: string,
-  details: ParseFailureDetail[],
+  details: FailureDetailLike[],
 ): void {
   const keySet = new Set(keys);
   for (const key of Object.keys(record)) {
@@ -187,7 +194,7 @@ export function nonEmptyStringField(
   record: JsonRecord,
   key: string,
   path: string,
-  details: ParseFailureDetail[],
+  details: FailureDetailLike[],
 ): string | undefined {
   const value = stringField(record, key, path, details);
   if (typeof value !== "string") return undefined;
@@ -208,7 +215,7 @@ export function stringField(
   record: JsonRecord,
   key: string,
   path: string,
-  details: ParseFailureDetail[],
+  details: FailureDetailLike[],
 ): string | undefined {
   if (!hasOwn(record, key)) {
     missingField(path, details);
@@ -227,7 +234,7 @@ export function exactStringField<Expected extends string>(
   key: string,
   expected: Expected,
   path: string,
-  details: ParseFailureDetail[],
+  details: FailureDetailLike[],
 ): Expected | undefined {
   const value = stringField(record, key, path, details);
   if (value === undefined) return undefined;
@@ -249,7 +256,7 @@ export function enumField<Allowed extends readonly string[]>(
   key: string,
   allowed: Allowed,
   path: string,
-  details: ParseFailureDetail[],
+  details: FailureDetailLike[],
 ): Allowed[number] | undefined {
   const value = stringField(record, key, path, details);
   if (value === undefined) return undefined;
@@ -273,7 +280,7 @@ export function integerRangeField(
   min: number,
   max: number,
   path: string,
-  details: ParseFailureDetail[],
+  details: FailureDetailLike[],
 ): number | undefined {
   if (!hasOwn(record, key)) {
     missingField(path, details);
@@ -301,7 +308,7 @@ export function stringArrayField(
   record: JsonRecord,
   key: string,
   path: string,
-  details: ParseFailureDetail[],
+  details: FailureDetailLike[],
 ): string[] | undefined {
   if (!hasOwn(record, key)) {
     missingField(path, details);
@@ -336,7 +343,7 @@ export function stringArrayField(
 
 export function missingField(
   path: string,
-  details: ParseFailureDetail[],
+  details: FailureDetailLike[],
 ): void {
   details.push({
     code: "missing_required_field",
@@ -351,7 +358,7 @@ export function invalidType(
   path: string,
   expected: string,
   value: unknown,
-  details: ParseFailureDetail[],
+  details: FailureDetailLike[],
 ): void {
   details.push({
     code: "invalid_field_type",
