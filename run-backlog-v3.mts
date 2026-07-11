@@ -138,6 +138,7 @@ import {
   extractSingleTaggedOutput,
 } from "./issue-as-prd-sessions.mts";
 import { runSubtaskReadinessBatch } from "./subtask-readiness.mts";
+import { formatCompactSiblingSummary } from "./subtask-readiness-body.mts";
 import { runAggregateValidation } from "./issue-as-prd-validation.mts";
 import { runIssueAsPrdExtraReview } from "./issue-as-prd-extra-review.mts";
 import { runIssueAsPrdParent } from "./issue-as-prd-orchestrator.mts";
@@ -3301,7 +3302,7 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
                 ACCUMULATION_HEAD_SHA: accumulationSha,
                 SUBTASK_TITLE: child.title,
                 ACTIVE_SIBLINGS: activeSiblings
-                  .map((sibling) => `#${sibling.number}: ${sibling.title}\n${sibling.body}`)
+                  .map((sibling) => formatCompactSiblingSummary(sibling))
                   .join("\n\n"),
                 PARENT_CONTEXT: parentContext.rendered,
                 SUBTASK_BODY: child.body,
@@ -3330,7 +3331,7 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
                     ACCUMULATION_HEAD_SHA: accumulationSha,
                     SUBTASK_TITLE: child.title,
                     ACTIVE_SIBLINGS: activeSiblings
-                      .map((sibling) => `#${sibling.number}: ${sibling.title}\n${sibling.body}`)
+                      .map((sibling) => formatCompactSiblingSummary(sibling))
                       .join("\n\n"),
                     PARENT_CONTEXT: parentContext.rendered,
                     SUBTASK_BODY: child.body,
@@ -3514,7 +3515,7 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
                       ACCUMULATION_HEAD_SHA: accumulationSha,
                       SUBTASK_TITLE: child.title,
                       ACTIVE_SIBLINGS: activeSiblings
-                        .map((sibling) => `#${sibling.number}: ${sibling.title}\n${sibling.body}`)
+                        .map((sibling) => formatCompactSiblingSummary(sibling))
                         .join("\n\n"),
                       PARENT_CONTEXT: input.normalizedContext.rendered,
                       SUBTASK_BODY: child.body,
@@ -3543,7 +3544,7 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
                           ACCUMULATION_HEAD_SHA: accumulationSha,
                           SUBTASK_TITLE: child.title,
                           ACTIVE_SIBLINGS: activeSiblings
-                            .map((sibling) => `#${sibling.number}: ${sibling.title}\n${sibling.body}`)
+                            .map((sibling) => formatCompactSiblingSummary(sibling))
                             .join("\n\n"),
                           PARENT_CONTEXT: input.normalizedContext.rendered,
                           SUBTASK_BODY: child.body,

@@ -177,6 +177,15 @@ test("backlog-v3 direct-parent work now targets the accumulation branch", () => 
   assert.doesNotMatch(source, /issue-\$\{input\.parent\.number\}-direct-parent/);
 });
 
+test("backlog-v3 formats readiness siblings compactly and excludes the child under evaluation", () => {
+  assert.match(source, /import \{ formatCompactSiblingSummary \} from "\.\/subtask-readiness-body\.mts";/);
+  assert.match(source, /formatCompactSiblingSummary\(sibling\)/);
+  assert.doesNotMatch(
+    source,
+    /\`#\$\{sibling\.number\}: \$\{sibling\.title\}\\n\$\{sibling\.body\}\`/,
+  );
+});
+
 test("older runners remain outside the Issue-as-PRD outer-loop wiring", () => {
   if (prdV4) {
     assert.doesNotMatch(prdV4, /runIssueAsPrdParent\(/);
