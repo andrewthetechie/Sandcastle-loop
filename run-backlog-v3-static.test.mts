@@ -11,8 +11,12 @@ test("backlog-v3 routes the outer loop through Issue-as-PRD acquisition and orch
   assert.match(source, /async function acquireNextIssueAsPrdParentForLoop\(/);
   assert.match(source, /async function processIssueAsPrdParent\(/);
   assert.match(source, /const skippedAmbiguousParentNumbers = new Set<number>\(\);/);
-  assert.match(source, /const parent = await acquireNextIssueAsPrdParentForLoop\(\);/);
-  assert.match(source, /const processed = await processIssueAsPrdParent\(parent\);/);
+  assert.match(source, /parent = await acquireNextIssueAsPrdParentForLoop\(\);/);
+  assert.match(source, /processed = await processIssueAsPrdParent\(parent\);/);
+  // One parent's host-side crash must not kill the whole loop: the iteration
+  // body is guarded and the crashed parent is quarantined for the run.
+  assert.match(source, /Processing parent #\$\{parentNumber\} crashed; skipping it for this run\./);
+  assert.match(source, /skippedAmbiguousParentNumbers\.add\(parentNumber\);/);
   assert.doesNotMatch(source, /const handledIssues = new Set<number>\(\)/);
 });
 

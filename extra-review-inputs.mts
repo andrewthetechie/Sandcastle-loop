@@ -22,6 +22,12 @@ export const EXTRA_REVIEW_INPUT_DIFF_EXCLUDES: readonly string[] = [
   ":(exclude)**/poetry.lock",
   ":(exclude)**/uv.lock",
   ":(exclude)**/Cargo.lock",
+  // Generated API client (openapi-typescript emits `*.gen.ts` with a
+  // "Do not make direct changes" header). It is machine-written, is not a
+  // review target, and its bulk pushes otherwise-reviewable diffs past the
+  // argv size cap — see issue #1217 (61222B diff, 7423B of which was
+  // types.gen.ts).
+  ":(exclude)**/*.gen.ts",
 ];
 
 export interface ExtraReviewInputPrd

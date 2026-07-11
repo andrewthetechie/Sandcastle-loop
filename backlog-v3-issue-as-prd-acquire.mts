@@ -10,7 +10,9 @@ import {
 } from "./backlog-v3-issue-as-prd-resume.mts";
 import type { ObservedParentRecoveryState } from "./issue-as-prd-state-contracts.mts";
 import {
+  nextParentState,
   parseParentStateComment,
+  renderParentStateComment,
   type IssueAsPrdParentState,
 } from "./issue-as-prd-state.mts";
 import { ISSUE_AS_PRD_STATE_MARKER } from "./issue-parent-context.mts";
@@ -54,6 +56,14 @@ export interface AcquireNextIssueAsPrdParentDeps extends FreshParentClaimDeps {
   listOpenParents(): Promise<readonly IssueAsPrdParentCandidate[]> | readonly IssueAsPrdParentCandidate[];
   viewParent(parentNumber: number): Promise<GitHubIssueRecord> | GitHubIssueRecord;
   observeRecovery(parent: GitHubIssueRecord): Promise<ObservedParentRecoveryState> | ObservedParentRecoveryState;
+  updateStateComment(input: {
+    commentId: number;
+    body: string;
+  }): Promise<void> | void;
+  removeStuckLabelFromOpenChildren(input: {
+    parentNumber: number;
+    queueLabel: string;
+  }): Promise<void> | void;
 }
 
 export async function acquireNextIssueAsPrdParent(input: {
@@ -104,11 +114,19 @@ export async function acquireNextIssueAsPrdParent(input: {
     case "create":
       return claimParentAndConfirm(parent, input, deps);
     case "resume":
+      // A fresh-selected parent only reconciles as resumable when its
+      // recorded phase is terminal (in-progress phases require the
+      // agent-in-progress label, which fresh selection excludes). A recorded
+      // 'failed' phase with the stuck label gone means a human requeued the
+      // parent by removing agent-stuck — adopt it instead of skipping it.
+      if (reconciled.state.phase === "failed") {
+        return requeueFailedParent(parent, reconciled, input, deps);
+      }
       return {
         kind: "ownership_ambiguous",
         parent,
         diagnostics: [
-          `Fresh-selected parent #${parent.number} unexpectedly reconciled as resumable.`,
+          `Fresh-selected parent #${parent.number} unexpectedly reconciled as resumable (phase '${reconciled.state.phase}').`,
         ],
         normalizedContext: reconciled.normalizedContext,
       };
@@ -120,6 +138,71 @@ export async function acquireNextIssueAsPrdParent(input: {
         normalizedContext: reconciled.normalizedContext,
       };
   }
+}
+
+// Requeue a parent whose durable state records 'failed' but whose agent-stuck
+// label has been removed (the human gesture for "retry this"). Rewind the
+// durable phase to 'claimed' — the orchestrator resumes published children
+// from there and re-decomposes an empty queue — re-add the in-progress label,
+// and unstick open children so the drain retries them too.
+//
+// Ordering: label first, state comment second. If the run dies in between,
+// the parent reads as failed-with-in-progress-label, which the next run
+// repairs through the existing terminal_label_repair path (back to a clean
+// stuck state) instead of wedging as ownership-ambiguous.
+async function requeueFailedParent(
+  parent: GitHubIssueRecord,
+  reconciled: Extract<ResumableParentState, { kind: "resume" }>,
+  input: { maxCommentBytes: number },
+  deps: AcquireNextIssueAsPrdParentDeps,
+): Promise<AcquireNextIssueAsPrdParentResult> {
+  const requeuedState = nextParentState({
+    previous: reconciled.state,
+    now: deps.now(),
+    next: {
+      ...reconciled.state,
+      phase: "claimed",
+      partialCauseChildNumber: null,
+      rebaseConflictDiagnostics: [],
+    },
+  });
+  await deps.addInProgressLabel(parent.number);
+  await deps.updateStateComment({
+    commentId: reconciled.commentId,
+    body: renderParentStateComment(requeuedState),
+  });
+  await deps.removeStuckLabelFromOpenChildren({
+    parentNumber: parent.number,
+    queueLabel: requeuedState.queueLabel,
+  });
+
+  const refreshedParent = await deps.viewParent(parent.number);
+  const refreshedObserved = await deps.observeRecovery(refreshedParent);
+  const refreshedReconciled = reconcileResumableIssueAsPrdParent({
+    parent: refreshedParent,
+    observed: refreshedObserved,
+    maxCommentBytes: input.maxCommentBytes,
+  });
+  if (refreshedReconciled.kind !== "resume") {
+    return {
+      kind: "ownership_ambiguous",
+      parent: refreshedParent,
+      diagnostics: [
+        `Requeued failed parent #${parent.number} did not reconcile as resumable after repair.`,
+        ...(refreshedReconciled.kind === "disagreement"
+          ? refreshedReconciled.diagnostics
+          : []),
+      ],
+      normalizedContext: refreshedReconciled.normalizedContext,
+    };
+  }
+  return {
+    kind: "resumed",
+    parent: refreshedParent,
+    commentId: refreshedReconciled.commentId,
+    state: refreshedReconciled.state,
+    normalizedContext: refreshedReconciled.normalizedContext,
+  };
 }
 
 async function claimParentAndConfirm(

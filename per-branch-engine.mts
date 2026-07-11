@@ -3,6 +3,7 @@ import {
   observeFailedRoundFingerprint,
   sha1,
   type FailedRoundFingerprint,
+  type NoProgressState,
 } from "./loop-progress.mts";
 import type { StuckTerminalReason } from "./mark-stuck-comment.mts";
 import {
@@ -191,25 +192,46 @@ export async function runPerBranchEngine(
         deps.onHostStep?.("branch_prep", task.branch);
         const guard = await deps.preCoderRebaseGuard({ task, sandbox });
         if (!guard.ok) {
-          return stuckOutcome(
-            deps,
-            sandbox,
-            "stuck_rebase_conflict",
-            guard.feedback,
-            round,
-          );
+          // A stale branch that no longer rebases cleanly is agent-resolvable:
+          // hand the guard's findings to the coder as round-1 rework feedback
+          // instead of declaring the issue stuck before any agent has run.
+          feedback = guard.feedback;
+          lastFeedback = feedback;
         }
       }
 
       if (!hostOnlyReview) {
-        const coderResult = await deps.invokeCoder({
-          task,
-          sandbox,
-          round,
-          feedback,
-          isRework: round > 1,
-          maxIterations: policy.coderMaxIterations,
-        });
+        let coderResult: EngineCoderResult;
+        try {
+          coderResult = await deps.invokeCoder({
+            task,
+            sandbox,
+            round,
+            feedback,
+            isRework: round > 1 || feedback !== "",
+            maxIterations: policy.coderMaxIterations,
+          });
+        } catch (error) {
+          const crash = observeAgentInvocationCrash(
+            progressState,
+            "coder",
+            round,
+            error,
+            policy.failedRoundRepeatLimit,
+          );
+          progressState = crash.state;
+          feedback = crash.feedback;
+          lastFeedback = feedback;
+          if (crash.stalled) {
+            return {
+              kind: "crashed",
+              headSha: safeHeadSha(deps, sandbox),
+              error: crash.error,
+              roundsUsed: round,
+            };
+          }
+          continue;
+        }
         switch (coderResult.kind) {
           case "already_satisfied":
             return {
@@ -359,13 +381,42 @@ export async function runPerBranchEngine(
 
       let repeatRoundWithoutCoder = false;
       for (let attempt = 1; attempt <= policy.reviewerMaxAttempts; attempt++) {
-        const acquisition = await deps.acquireReviewer({
-          task,
-          sandbox,
-          round,
-          attempt,
-          context: reviewContext,
-        });
+        let acquisition: EngineReviewerAcquisitionResult;
+        try {
+          acquisition = await deps.acquireReviewer({
+            task,
+            sandbox,
+            round,
+            attempt,
+            context: reviewContext,
+          });
+        } catch (error) {
+          const crash = observeAgentInvocationCrash(
+            progressState,
+            "reviewer",
+            round,
+            error,
+            policy.failedRoundRepeatLimit,
+          );
+          progressState = crash.state;
+          feedback = crash.feedback;
+          lastFeedback = feedback;
+          if (crash.stalled) {
+            return {
+              kind: "crashed",
+              headSha: safeHeadSha(deps, sandbox),
+              error: crash.error,
+              roundsUsed: round,
+            };
+          }
+          if (attempt < policy.reviewerMaxAttempts) continue;
+          // Attempts exhausted on an infrastructure crash, not a review
+          // verdict: repeat the round host-only so the reviewer gets a fresh
+          // attempt budget without re-running the coder on unchanged work.
+          hostOnlyReview = true;
+          repeatRoundWithoutCoder = true;
+          break;
+        }
         if (acquisition.kind === "verdict") {
           const review = acquisition.review;
           if (review.decision === "approved") {
@@ -576,6 +627,53 @@ function safeHeadSha(deps: PerBranchEngineDeps, sandbox: EngineSandbox): string 
   } catch {
     return "";
   }
+}
+
+// A thrown agent invocation (opencode exiting non-zero, an idle timeout, a
+// transient provider failure) is usually recoverable by simply running the
+// agent again. Track the crash as a failed-round fingerprint so retries stop
+// once the identical crash keeps repeating — that is a persistent
+// infrastructure failure and genuinely terminal.
+function observeAgentInvocationCrash(
+  state: NoProgressState,
+  stage: "coder" | "reviewer",
+  round: number,
+  error: unknown,
+  repeatLimit: number,
+): {
+  state: NoProgressState;
+  stalled: boolean;
+  error: string;
+  feedback: string;
+} {
+  const message = sanitizeCrashError(error);
+  const progress = observeFailedRoundFingerprint(
+    state,
+    {
+      diffHash: sha1(`agent-invocation-crash:${stage}`),
+      source: "agent_invocation_crash",
+      signatureHash: sha1(normalizeForHash(message)),
+      signatureSummary: normalizeSignatureSummary(message),
+    },
+    repeatLimit,
+  );
+  return {
+    state: progress.state,
+    stalled: progress.stalled,
+    error: message,
+    feedback: [
+      "## Agent invocation crashed",
+      "",
+      `The ${stage} agent process failed on round ${round} before completing. This was a host/agent infrastructure failure, not feedback about the code.`,
+      "",
+      "Error:",
+      "```",
+      message.slice(0, 2000),
+      "```",
+      "",
+      "No code changes are required in response to this error. Continue the issue from the current branch state.",
+    ].join("\n"),
+  };
 }
 
 function sanitizeCrashError(error: unknown): string {

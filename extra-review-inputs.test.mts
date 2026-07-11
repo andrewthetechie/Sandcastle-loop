@@ -95,6 +95,7 @@ test("completed-branch input writer persists full file-backed review inputs", ()
       ":(exclude)**/poetry.lock",
       ":(exclude)**/uv.lock",
       ":(exclude)**/Cargo.lock",
+      ":(exclude)**/*.gen.ts",
     ]);
   });
 });

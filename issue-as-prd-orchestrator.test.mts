@@ -225,6 +225,74 @@ test("initial already_satisfied closes only after empty-diff verification", asyn
 
   assert.equal(result.kind, "parent_stuck");
   assert.ok(deps.events.includes("close-already-satisfied:101"));
+  // The children were pre-published, so the only decomposition run is the
+  // one recovery attempt the starved queue earned before sticking.
+  assert.equal(
+    deps.events.filter((event) => event === "acquire-initial").length,
+    1,
+  );
+});
+
+test("starved child queue re-decomposes once and drains the fresh children", async () => {
+  const deps = createDeps({
+    state: state({ phase: "initial_ready" }),
+    initialDecomposition: successIssues([initialDraft("Child A")]),
+    childOutcomes: new Map([[101, approved(sha("1"), sha("2"))]]),
+    integratedHeads: new Map([[101, sha("2")]]),
+    fullReview: { kind: "reviewed", followupDrafts: [], artifactPaths: [] },
+  });
+
+  const result = await runIssueAsPrdParent(input({ state: deps.state }), deps);
+
+  assert.equal(result.kind, "clean_delivery");
+  assert.equal(
+    deps.events.filter((event) => event === "acquire-initial").length,
+    1,
+  );
+  assert.deepEqual(deps.childEngineBases, [
+    { childNumber: 101, accumulationSha: sha("1"), source: "initial" },
+  ]);
+});
+
+test("direct parent already_satisfied with verified empty diff completes the parent", async () => {
+  const deps = createDeps({
+    initialDecomposition: successNoWork(),
+    directParentOutcome: alreadySatisfied(sha("1"), sha("1"), "feature already on base"),
+    initialAlreadySatisfied: { ok: true, empty: true, evidence: "trees match" },
+  });
+
+  const result = await runIssueAsPrdParent(input(), deps);
+
+  assert.deepEqual(result, {
+    kind: "parent_already_complete",
+    accumulationHeadSha: sha("1"),
+    evidence: "feature already on base\n\ntrees match",
+  });
+});
+
+test("terminal recorded phase refuses to run instead of falling through to delivery", async () => {
+  const deps = createDeps({ state: state({ phase: "failed" }) });
+
+  const result = await runIssueAsPrdParent(input({ state: deps.state }), deps);
+
+  assert.equal(result.kind, "ownership_ambiguous");
+  if (result.kind !== "ownership_ambiguous") return;
+  assert.match(result.reason, /terminal phase 'failed'/);
+  assert.deepEqual(deps.events, []);
+});
+
+test("direct parent already_satisfied with a non-empty diff stays parent_stuck", async () => {
+  const deps = createDeps({
+    initialDecomposition: successNoWork(),
+    directParentOutcome: alreadySatisfied(sha("1"), sha("2"), "claimed done"),
+    initialAlreadySatisfied: { ok: true, empty: false, evidence: "" },
+  });
+
+  const result = await runIssueAsPrdParent(input(), deps);
+
+  assert.equal(result.kind, "parent_stuck");
+  if (result.kind !== "parent_stuck") return;
+  assert.equal(result.reason, "direct_parent_already_satisfied");
 });
 
 test("follow-up already_satisfied becomes partial delivery and never runs a second full review", async () => {

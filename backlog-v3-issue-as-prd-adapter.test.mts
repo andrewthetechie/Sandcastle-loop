@@ -107,6 +107,24 @@ test("terminal action mapping covers clean, partial, stuck, and ownership ambigu
 
   assert.deepEqual(
     terminalActionForParentResult({
+      kind: "parent_already_complete",
+      accumulationHeadSha: "a",
+      evidence: "trees match",
+    }),
+    {
+      kind: "close_complete",
+      labelPlan: {
+        remove: ["agent-in-progress"],
+        add: [],
+        deleteQueueLabel: true,
+      },
+      shouldStopLoop: false,
+      evidence: "trees match",
+    },
+  );
+
+  assert.deepEqual(
+    terminalActionForParentResult({
       kind: "ownership_ambiguous",
       reason: "state disagreement",
       diagnostics: ["multiple state comments"],

@@ -99,7 +99,19 @@ test("decideDrainState returns parent_stuck_empty for an initial stuck child wit
     accumulationHeadSha: "same",
   });
 
-  assert.deepEqual(result, { kind: "parent_stuck_empty" });
+  assert.deepEqual(result, { kind: "parent_stuck_empty", openStuckNumbers: [7] });
+});
+
+test("decideDrainState returns queue_starved_empty when no open children remain and nothing integrated", () => {
+  const queueLabel = parentQueueLabel(42);
+  const result = decideDrainState({
+    openIssues: [issue(7, [queueLabel], "CLOSED")],
+    queueLabel,
+    fullParentReviewBaseSha: "same",
+    accumulationHeadSha: "same",
+  });
+
+  assert.deepEqual(result, { kind: "queue_starved_empty" });
 });
 
 test("decideDrainState returns partial_review for a stuck child after integrated work exists", () => {

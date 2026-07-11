@@ -17,3 +17,35 @@ test("marks database gate feedback as host-only and redacts runnable host comman
   assert.doesNotMatch(feedback, /bash \.sandcastle\/pg-ensure\.sh/);
   assert.doesNotMatch(feedback, /pg_ctl: could not start server/);
 });
+
+test("surfaces the pytest failure even when alembic migration logs would fill the truncation window", () => {
+  // Reproduces issues #1210/#1212/#1214: the gate concatenates stdout+stderr,
+  // so pytest's failure report (stdout) precedes alembic's ~35 successful
+  // per-migration log lines (stderr). The old `.slice(-4000)` kept only the
+  // migration noise; the coder never saw why validation failed and got stuck.
+  const pytestStdout = [
+    "=================================== FAILURES ===================================",
+    "____________ TestPublicInvoiceView.test_valid_token_returns_invoice ____________",
+    "    raise HTTPException(status_code=404, detail='Invoice not found')",
+    "E   fastapi.exceptions.HTTPException: 404: Invoice not found",
+    "=========================== short test summary info ============================",
+    "FAILED tests/test_invoice_lifecycle.py::TestPublicInvoiceView::test_valid_token_returns_invoice_with_visits - fastapi.exceptions.HTTPException: 404: Invoice not found",
+    "================= 2 failed, 324 passed, 102 warnings in 11.27s ==================",
+  ].join("\n");
+  const alembicStderr = Array.from({ length: 35 }, (_, i) =>
+    `INFO  [alembic.runtime.migration] Running upgrade ${String(i).padStart(
+      3,
+      "0",
+    )} -> ${String(i + 1).padStart(3, "0")}, Some descriptive migration name that pads the line out to a realistic width.`,
+  ).join("\n");
+
+  const feedback = formatHostValidationFailureFeedback({
+    output: `${pytestStdout}\n${alembicStderr}`,
+  });
+
+  assert.match(feedback, /404: Invoice not found/);
+  assert.match(feedback, /FAILED tests\/test_invoice_lifecycle\.py/);
+  assert.match(feedback, /2 failed, 324 passed/);
+  // The migration success noise must not be what the coder sees.
+  assert.doesNotMatch(feedback, /Running upgrade 03[0-4] -> 03[1-5]/);
+});

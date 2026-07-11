@@ -369,20 +369,86 @@ test("needs human review becomes stuck", async () => {
   assert.equal(result.reason, "stuck_needs_human_review");
 });
 
-test("round-one rebase conflict becomes terminal stuck", async () => {
-  const { deps } = buildDeps();
+test("round-one rebase conflict is handed to the coder as rework feedback", async () => {
+  const { deps, calls } = buildDeps();
   deps.preCoderRebaseGuard = async () => ({
     ok: false,
     feedback: "## Rebase conflict with base branch",
   });
   const result = await runPerBranchEngine({ task: TASK, policy: POLICY, deps });
-  assert.deepEqual(result, {
-    kind: "stuck",
-    reason: "stuck_rebase_conflict",
-    headSha: "head-1",
-    lastFeedback: "## Rebase conflict with base branch",
-    roundsUsed: 1,
+  assert.equal(result.kind, "approved");
+  assert.deepEqual(calls.invokeCoder, [
+    {
+      round: 1,
+      isRework: true,
+      feedback: "## Rebase conflict with base branch",
+    },
+  ]);
+});
+
+test("coder invocation throw is retried on the next round with crash feedback", async () => {
+  const { deps, calls } = buildDeps();
+  const scriptedCoder = deps.invokeCoder;
+  let invocations = 0;
+  deps.invokeCoder = async (input) => {
+    invocations++;
+    if (invocations === 1) {
+      calls.invokeCoder.push({
+        round: input.round,
+        isRework: input.isRework,
+        feedback: input.feedback,
+      });
+      throw new Error("opencode exited with code 1");
+    }
+    return scriptedCoder(input);
+  };
+  const result = await runPerBranchEngine({ task: TASK, policy: POLICY, deps });
+  assert.equal(result.kind, "approved");
+  assert.equal(calls.invokeCoder.length, 2);
+  assert.equal(calls.invokeCoder[1]!.round, 2);
+  assert.equal(calls.invokeCoder[1]!.isRework, true);
+  assert.match(calls.invokeCoder[1]!.feedback, /## Agent invocation crashed/);
+  assert.match(calls.invokeCoder[1]!.feedback, /opencode exited with code 1/);
+});
+
+test("persistently identical coder crash returns crashed after the repeat limit", async () => {
+  const { deps, calls } = buildDeps();
+  deps.invokeCoder = async () => {
+    calls.invokeCoder.push({ round: 0, isRework: false, feedback: "" });
+    throw new Error("opencode exited with code 1");
+  };
+  const result = await runPerBranchEngine({ task: TASK, policy: POLICY, deps });
+  assert.equal(result.kind, "crashed");
+  if (result.kind !== "crashed") return;
+  assert.match(result.error, /opencode exited with code 1/);
+  // rounds 1..N crash identically; the engine stops once the identical crash
+  // has repeated failedRoundRepeatLimit times instead of burning all rounds.
+  assert.equal(calls.invokeCoder.length, POLICY.failedRoundRepeatLimit + 1);
+});
+
+test("reviewer invocation throw retries attempts then repeats the round host-only", async () => {
+  const { deps, calls } = buildDeps({
+    prep: [
+      { ok: true, reviewedBaseSha: "base-1" },
+      { ok: true, reviewedBaseSha: "base-1" },
+    ],
+    validation: [{ ok: true }, { ok: true }],
   });
+  let reviewerInvocations = 0;
+  deps.acquireReviewer = async (input) => {
+    calls.acquireReviewer.push({ round: input.round, attempt: input.attempt });
+    reviewerInvocations++;
+    if (reviewerInvocations <= 2) {
+      throw new Error("opencode exited with code 1");
+    }
+    return reviewerApproved();
+  };
+  const result = await runPerBranchEngine({ task: TASK, policy: POLICY, deps });
+  assert.equal(result.kind, "approved");
+  // The coder ran once; the reviewer crash retried within the round and then
+  // repeated the round host-only for a fresh attempt budget.
+  assert.equal(calls.invokeCoder.length, 1);
+  assert.equal(reviewerInvocations, 3);
 });
 
 test("coder livelock becomes stuck_livelock", async () => {

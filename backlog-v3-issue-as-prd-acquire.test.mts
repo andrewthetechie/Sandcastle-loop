@@ -60,6 +60,12 @@ test("returns none when no eligible parent exists", async () => {
       createStateComment() {
         throw new Error("should not claim");
       },
+      updateStateComment() {
+        throw new Error("should not requeue");
+      },
+      removeStuckLabelFromOpenChildren() {
+        throw new Error("should not requeue");
+      },
     },
   );
 
@@ -150,6 +156,12 @@ test("fresh selected parent with no durable state is claimed", async () => {
         calls.push(`createStateComment:${parentNumber}`);
         return 91;
       },
+      updateStateComment() {
+        throw new Error("should not requeue");
+      },
+      removeStuckLabelFromOpenChildren() {
+        throw new Error("should not requeue");
+      },
     },
   );
 
@@ -224,6 +236,12 @@ test("fresh claim stops as ownership_ambiguous when durable state is still not r
       createStateComment() {
         return 91;
       },
+      updateStateComment() {
+        throw new Error("should not requeue");
+      },
+      removeStuckLabelFromOpenChildren() {
+        throw new Error("should not requeue");
+      },
     },
   );
 
@@ -286,6 +304,12 @@ test("resume-selected parent returns resumed state without fresh-claim side effe
       },
       createStateComment() {
         throw new Error("should not claim fresh");
+      },
+      updateStateComment() {
+        throw new Error("should not requeue");
+      },
+      removeStuckLabelFromOpenChildren() {
+        throw new Error("should not requeue");
       },
     },
   );
@@ -350,6 +374,12 @@ test("fresh selection with unexpected resumable state stops as ownership_ambiguo
       },
       createStateComment() {
         throw new Error("should not claim fresh");
+      },
+      updateStateComment() {
+        throw new Error("should not requeue");
+      },
+      removeStuckLabelFromOpenChildren() {
+        throw new Error("should not requeue");
       },
     },
   );
@@ -447,6 +477,12 @@ test("resume-selected parent missing its durable state comment completes the int
         calls.push(`createStateComment:${parentNumber}`);
         return 91;
       },
+      updateStateComment() {
+        throw new Error("should not requeue");
+      },
+      removeStuckLabelFromOpenChildren() {
+        throw new Error("should not requeue");
+      },
     },
   );
 
@@ -526,6 +562,12 @@ test("resume-selected parent with terminal recorded phase returns terminal_label
       createStateComment() {
         throw new Error("should not claim fresh");
       },
+      updateStateComment() {
+        throw new Error("should not requeue");
+      },
+      removeStuckLabelFromOpenChildren() {
+        throw new Error("should not requeue");
+      },
     },
   );
 
@@ -533,4 +575,117 @@ test("resume-selected parent with terminal recorded phase returns terminal_label
   if (result.kind !== "terminal_label_repair") return;
   assert.equal(result.state.phase, "failed");
   assert.match(result.diagnostics.join("\n"), /Failed parent still has agent-in-progress/);
+});
+
+test("fresh-selected failed parent (agent-stuck removed by a human) is requeued to claimed", async () => {
+  const calls: string[] = [];
+  const failedState = state({
+    phase: "failed",
+    partialCauseChildNumber: 101,
+    rebaseConflictDiagnostics: ["old conflict"],
+  });
+  const parent = {
+    id: 1,
+    number: 42,
+    title: "Parent",
+    body: "Parent body",
+    state: "OPEN" as const,
+    labels: [{ name: "bug" }, { name: "parent-42" }],
+    comments: [
+      {
+        id: 9,
+        author: { login: "host" },
+        createdAt: "2026-07-02T12:00:00Z",
+        body: renderParentStateComment(failedState),
+      },
+    ],
+  };
+  let updatedBody = "";
+  let viewCount = 0;
+  let observeCount = 0;
+
+  const result = await acquireNextIssueAsPrdParent(
+    {
+      backlogLabels: ["bug"],
+      maxCommentBytes: 5000,
+    },
+    {
+      now: () => "2026-07-03T09:00:00Z",
+      listOpenParents: () => [
+        { number: 42, state: "OPEN", labels: [{ name: "bug" }, { name: "parent-42" }] },
+      ],
+      viewParent: () => {
+        viewCount += 1;
+        if (viewCount === 1) return parent;
+        return {
+          ...parent,
+          labels: [
+            { name: "bug" },
+            { name: "parent-42" },
+            { name: "agent-in-progress" },
+          ],
+          comments: [
+            {
+              id: 9,
+              author: { login: "host" },
+              createdAt: "2026-07-02T12:00:00Z",
+              body: updatedBody,
+            },
+          ],
+        };
+      },
+      observeRecovery: () => {
+        observeCount += 1;
+        return {
+          accumulationBranchExists: true,
+          localAccumulationHeadSha: sha("c"),
+          remoteAccumulationHeadSha: sha("c"),
+          parentLabels:
+            observeCount === 1
+              ? ["bug", "parent-42"]
+              : ["bug", "parent-42", "agent-in-progress"],
+          openChildNumbers: [101],
+          closedChildNumbers: [100],
+        };
+      },
+      addInProgressLabel(parentNumber) {
+        calls.push(`addInProgressLabel:${parentNumber}`);
+      },
+      ensureQueueLabel() {
+        throw new Error("should not claim fresh");
+      },
+      fetchMainline() {
+        throw new Error("should not claim fresh");
+      },
+      createAccumulationBranch() {
+        throw new Error("should not claim fresh");
+      },
+      pushInitialCheckpoint() {
+        throw new Error("should not claim fresh");
+      },
+      createStateComment() {
+        throw new Error("should not claim fresh");
+      },
+      updateStateComment({ commentId, body }) {
+        calls.push(`updateStateComment:${commentId}`);
+        updatedBody = body;
+      },
+      removeStuckLabelFromOpenChildren({ parentNumber, queueLabel }) {
+        calls.push(`unstickChildren:${parentNumber}:${queueLabel}`);
+      },
+    },
+  );
+
+  assert.equal(result.kind, "resumed");
+  if (result.kind !== "resumed") return;
+  assert.equal(result.commentId, 9);
+  assert.equal(result.state.phase, "claimed");
+  assert.equal(result.state.partialCauseChildNumber, null);
+  assert.deepEqual(result.state.rebaseConflictDiagnostics, []);
+  assert.match(updatedBody, /"phase": "claimed"/);
+  assert.deepEqual(calls, [
+    "addInProgressLabel:42",
+    "updateStateComment:9",
+    "unstickChildren:42:parent-42",
+  ]);
 });

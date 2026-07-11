@@ -28,6 +28,19 @@ export type BacklogTerminalAction =
       shouldStopLoop: false;
     }
   | {
+      // Host-verified: the parent's deliverable already exists on the
+      // accumulation base. Close the parent with the evidence instead of
+      // delivering an empty branch or marking it stuck.
+      kind: "close_complete";
+      labelPlan: {
+        remove: string[];
+        add: string[];
+        deleteQueueLabel: boolean;
+      };
+      shouldStopLoop: false;
+      evidence: string;
+    }
+  | {
       kind: "mark_parent_stuck";
       labelPlan: {
         remove: string[];
@@ -86,6 +99,17 @@ export function terminalActionForParentResult(
           ? rebaseNeededPartialDeliveryLabelPlan()
           : partialDeliveryLabelPlan(),
         shouldStopLoop: false,
+      };
+    case "parent_already_complete":
+      return {
+        kind: "close_complete",
+        labelPlan: {
+          remove: [ISSUE_AS_PRD_LABELS.inProgress.name],
+          add: [],
+          deleteQueueLabel: true,
+        },
+        shouldStopLoop: false,
+        evidence: result.evidence,
       };
     case "parent_stuck":
       return {

@@ -25,6 +25,8 @@ Operate read-only.
 # Issue draft rules
 
 - Make each child issue body self-contained enough for an implementation agent to work from the issue alone.
+- Before drafting, inspect how the repository implements the nearest sibling of the work (the adjacent form section, hook, component, service, or router). When a clear structural pattern exists, name the file to mirror in the body and list the expected new files, including extracted components or helpers, in `files`.
+- State in the body the interface rules the implementation must satisfy, such as which generated or shared module types come from, field optionality, and naming, so the reviewer can check the shipped diff against them.
 - Include these sections in each `body` string: `## User Story`, `## Context`, and `## Acceptance Criteria`.
 - Keep `title`, `body`, and `dedupe_key` non-empty.
 - Use only repository-relative file paths in `files` and keep them unique within a draft.

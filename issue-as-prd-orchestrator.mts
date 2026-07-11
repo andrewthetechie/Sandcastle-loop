@@ -37,6 +37,15 @@ export type ParentRunResult =
       stuckChildNumber: number;
     }
   | {
+      // The parent's deliverable already exists on the accumulation base with
+      // a host-verified empty diff: there is nothing to implement or review.
+      // The caller should close the parent with the evidence instead of
+      // marking it stuck.
+      kind: "parent_already_complete";
+      accumulationHeadSha: string;
+      evidence: string;
+    }
+  | {
       kind: "parent_stuck";
       accumulationHeadSha: string;
       reason: string;
@@ -172,6 +181,19 @@ export async function runIssueAsPrdParent(input: {
   state: IssueAsPrdParentState;
   normalizedContext: NormalizedParentContext;
 }, deps: IssueAsPrdOrchestratorDeps): Promise<ParentRunResult> {
+  if (input.state.phase === "failed" || input.state.phase === "delivered") {
+    // A terminal phase matches no phase block below; without this guard it
+    // would fall through to the delivery tail and mislabel a finished (or
+    // failed) parent as a fresh clean delivery.
+    return {
+      kind: "ownership_ambiguous",
+      reason: `Parent #${input.parent.number} arrived with terminal phase '${input.state.phase}'; the loop cannot resume a terminal parent.`,
+      diagnostics: [
+        "Requeue the parent (remove its agent-stuck label) or run recover-backlog-v3-issues.mts before retrying.",
+      ],
+    };
+  }
+
   const ownership = await deps.verifyOwnership({
     parent: input.parent,
     state: input.state,
@@ -206,69 +228,16 @@ export async function runIssueAsPrdParent(input: {
   }
 
   if (state.phase === "claimed") {
-    const acquisition = await deps.acquireInitialDecomposition({
+    const prepared = await prepareInitialWorkFromDecomposition({
       parent: input.parent,
       context: input.normalizedContext,
+      state,
+      accumulationHeadSha,
+      deps,
     });
-    if (!acquisition.ok) {
-      return parentStuck(
-        accumulationHeadSha,
-        "initial_decomposition_failed",
-        acquisition.diagnostics,
-      );
-    }
-
-    const result = acquisition.result;
-    if (result.status === "issues") {
-      const drafts = result.issues.map(initialDraftToPublishDraft);
-      const publication = await deps.publishChildren({
-        parent: input.parent,
-        drafts,
-        queueLabel: state.queueLabel,
-      });
-      if (!publication.ok) {
-        return parentStuck(
-          accumulationHeadSha,
-          "initial_child_publication_failed",
-          publication.diagnostics,
-        );
-      }
-      state = await transition(state, deps, {
-        phase: "decomposed",
-      });
-      const readiness = await deps.readiness({
-        parentContext: input.normalizedContext,
-        children: publication.children,
-        siblingSummaries: siblingSummaries(publication.children),
-        accumulationSha: accumulationHeadSha,
-      });
-      if (readiness.kind === "parent_failure") {
-        return parentStuck(
-          accumulationHeadSha,
-          "initial_child_readiness_failed",
-          readiness.diagnostics,
-        );
-      }
-      state = await transition(state, deps, { phase: "initial_ready" });
-    } else if (result.status === "no_work") {
-      const direct = await deps.runDirectParentEngine({
-        parent: input.parent,
-        context: input.normalizedContext,
-        accumulationBranch: state.accumulationBranch,
-        accumulationSha: accumulationHeadSha,
-      });
-      if (direct.kind !== "approved") {
-        return parentStuck(
-          accumulationHeadSha,
-          `direct_parent_${direct.kind}`,
-          direct.kind === "crashed" ? [direct.error] : direct.kind === "stuck" ? [direct.lastFeedback] : [direct.evidence],
-        );
-      }
-      accumulationHeadSha = direct.approvedHeadSha;
-      state = await transition(state, deps, {
-        phase: "initial_drained",
-      });
-    }
+    if (prepared.kind === "terminal") return prepared.result;
+    state = prepared.state;
+    accumulationHeadSha = prepared.accumulationHeadSha;
   }
 
   if (state.phase === "decomposed") {
@@ -292,7 +261,8 @@ export async function runIssueAsPrdParent(input: {
     state = await transition(state, deps, { phase: "initial_ready" });
   }
 
-  if (state.phase === "initial_ready") {
+  let redecompositionAttempted = false;
+  while (state.phase === "initial_ready") {
     const drained = await drainInitialChildren({
       parent: input.parent,
       context: input.normalizedContext,
@@ -302,6 +272,33 @@ export async function runIssueAsPrdParent(input: {
       deps,
     });
     if (drained.kind === "parent_stuck") return drained.result;
+    if (drained.kind === "queue_starved") {
+      // Every child was closed (duplicate, already satisfied, or left over
+      // from an earlier incarnation) without any work landing. That is a
+      // recoverable planning failure, not an implementation failure: retry
+      // decomposition once before giving up on the parent.
+      if (redecompositionAttempted) {
+        return parentStuck(
+          accumulationHeadSha,
+          "initial_child_stuck_empty",
+          [
+            "Initial child queue drained to empty with no integrated work even after a recovery decomposition.",
+          ],
+        );
+      }
+      redecompositionAttempted = true;
+      const prepared = await prepareInitialWorkFromDecomposition({
+        parent: input.parent,
+        context: input.normalizedContext,
+        state,
+        accumulationHeadSha,
+        deps,
+      });
+      if (prepared.kind === "terminal") return prepared.result;
+      state = prepared.state;
+      accumulationHeadSha = prepared.accumulationHeadSha;
+      continue;
+    }
     accumulationHeadSha = drained.accumulationHeadSha;
     partialCauseChildNumber = drained.partialCauseChildNumber;
     state = drained.state;
@@ -500,6 +497,141 @@ export async function runIssueAsPrdParent(input: {
   };
 }
 
+type InitialWorkPreparation =
+  | {
+      kind: "prepared";
+      state: IssueAsPrdParentState;
+      accumulationHeadSha: string;
+    }
+  | { kind: "terminal"; result: ParentRunResult };
+
+// Run one decomposition cycle for the parent: acquire the decomposition,
+// publish + readiness-check children (phase -> initial_ready), or — when the
+// decomposer reports no decomposable work — run the direct parent engine
+// (phase -> initial_drained). Used from the fresh 'claimed' phase and again
+// as recovery when the child queue starves without integrating any work.
+async function prepareInitialWorkFromDecomposition(input: {
+  parent: GitHubIssueRecord;
+  context: NormalizedParentContext;
+  state: IssueAsPrdParentState;
+  accumulationHeadSha: string;
+  deps: IssueAsPrdOrchestratorDeps;
+}): Promise<InitialWorkPreparation> {
+  const { deps } = input;
+  let state = input.state;
+  let accumulationHeadSha = input.accumulationHeadSha;
+
+  const acquisition = await deps.acquireInitialDecomposition({
+    parent: input.parent,
+    context: input.context,
+  });
+  if (!acquisition.ok) {
+    return terminal(
+      parentStuck(
+        accumulationHeadSha,
+        "initial_decomposition_failed",
+        acquisition.diagnostics,
+      ),
+    );
+  }
+
+  const result = acquisition.result;
+  if (result.status === "issues") {
+    const drafts = result.issues.map(initialDraftToPublishDraft);
+    const publication = await deps.publishChildren({
+      parent: input.parent,
+      drafts,
+      queueLabel: state.queueLabel,
+    });
+    if (!publication.ok) {
+      return terminal(
+        parentStuck(
+          accumulationHeadSha,
+          "initial_child_publication_failed",
+          publication.diagnostics,
+        ),
+      );
+    }
+    state = await transition(state, deps, {
+      phase: "decomposed",
+    });
+    const readiness = await deps.readiness({
+      parentContext: input.context,
+      children: publication.children,
+      siblingSummaries: siblingSummaries(publication.children),
+      accumulationSha: accumulationHeadSha,
+    });
+    if (readiness.kind === "parent_failure") {
+      return terminal(
+        parentStuck(
+          accumulationHeadSha,
+          "initial_child_readiness_failed",
+          readiness.diagnostics,
+        ),
+      );
+    }
+    state = await transition(state, deps, { phase: "initial_ready" });
+    return { kind: "prepared", state, accumulationHeadSha };
+  }
+
+  const direct = await deps.runDirectParentEngine({
+    parent: input.parent,
+    context: input.context,
+    accumulationBranch: state.accumulationBranch,
+    accumulationSha: accumulationHeadSha,
+  });
+  if (direct.kind === "approved") {
+    accumulationHeadSha = direct.approvedHeadSha;
+    state = await transition(state, deps, {
+      phase: "initial_drained",
+    });
+    return { kind: "prepared", state, accumulationHeadSha };
+  }
+  if (direct.kind === "already_satisfied") {
+    // Decomposer said there is no decomposable work AND the direct engine
+    // found nothing to implement. If the host verifies the branch tree is
+    // unchanged, the parent's deliverable already exists — complete, not
+    // stuck.
+    const verification = await deps.verifyInitialAlreadySatisfied({
+      child: input.parent,
+      reviewedBaseSha: direct.reviewedBaseSha || accumulationHeadSha,
+      headSha: direct.headSha,
+    });
+    if (verification.ok && verification.empty) {
+      return terminal({
+        kind: "parent_already_complete",
+        accumulationHeadSha,
+        evidence: [direct.evidence, verification.evidence]
+          .filter(Boolean)
+          .join("\n\n"),
+      });
+    }
+    return terminal(
+      parentStuck(
+        accumulationHeadSha,
+        "direct_parent_already_satisfied",
+        verification.ok
+          ? [
+              "Direct parent run claimed already_satisfied but the branch tree is not empty.",
+              direct.evidence,
+            ]
+          : verification.diagnostics,
+      ),
+    );
+  }
+  return terminal(
+    parentStuck(
+      accumulationHeadSha,
+      `direct_parent_${direct.kind}`,
+      direct.kind === "crashed" ? [direct.error] : [direct.lastFeedback],
+    ),
+  );
+}
+
+function terminal(result: ParentRunResult): InitialWorkPreparation {
+  return { kind: "terminal", result };
+}
+
 async function drainInitialChildren(input: {
   parent: GitHubIssueRecord;
   context: NormalizedParentContext;
@@ -509,6 +641,7 @@ async function drainInitialChildren(input: {
   deps: IssueAsPrdOrchestratorDeps;
 }): Promise<
   | { kind: "done"; accumulationHeadSha: string; partialCauseChildNumber: number | null; state: IssueAsPrdParentState }
+  | { kind: "queue_starved" }
   | { kind: "parent_stuck"; result: ParentRunResult }
 > {
   let state = input.state;
@@ -530,13 +663,20 @@ async function drainInitialChildren(input: {
         fullParentReviewBaseSha: state.fullParentReviewBaseSha,
         accumulationHeadSha,
       });
+      if (drain.kind === "queue_starved_empty") {
+        return { kind: "queue_starved" };
+      }
       if (drain.kind === "parent_stuck_empty") {
         return {
           kind: "parent_stuck",
           result: parentStuck(
             accumulationHeadSha,
             "initial_child_stuck_empty",
-            ["Initial drain produced no integrated reviewable work."],
+            [
+              `Initial drain produced no integrated reviewable work; stuck children: ${drain.openStuckNumbers
+                .map((number) => `#${number}`)
+                .join(", ")}.`,
+            ],
           ),
         };
       }
@@ -568,9 +708,12 @@ async function drainInitialChildren(input: {
     }
 
     if (outcome.kind === "already_satisfied") {
+      // already_satisfied engine outcomes carry an empty reviewedBaseSha
+      // (the coder never reached review); verify against the accumulation
+      // base the child was launched from instead.
       const verification = await input.deps.verifyInitialAlreadySatisfied({
         child,
-        reviewedBaseSha: outcome.reviewedBaseSha,
+        reviewedBaseSha: outcome.reviewedBaseSha || accumulationHeadSha,
         headSha: outcome.headSha,
       });
       if (verification.ok && verification.empty) {

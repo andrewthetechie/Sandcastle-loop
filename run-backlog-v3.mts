@@ -76,6 +76,11 @@ import {
   type StuckTerminalReason,
 } from "./mark-stuck-comment.mts";
 import {
+  installLoopCrashHandlers,
+  recordFailureDiagnostic,
+  type FailureDiagnosticInput,
+} from "./failure-diagnostics.mts";
+import {
   acquireReviewerResult,
   buildReviewerAttemptRunName,
   sanitizeReviewerExcerpt,
@@ -116,7 +121,6 @@ import { formatHostValidationFailureFeedback } from "./host-validation-feedback.
 import { readCliStringFlag } from "./cli-string-flag.mts";
 import {
   createLivelockWatchdogSandcastleRunOptions,
-  agentInvocationStageForRound,
   resolveRound1CoderLivelockControlFlow,
   resolveReworkLivelockControlFlow,
 } from "./agent-invocation-livelock.mts";
@@ -317,6 +321,13 @@ tuiEmitter.startLoop({
   phase: "normal_issue",
 });
 
+// Capture a diagnostics bundle before dying on any otherwise-unhandled crash.
+installLoopCrashHandlers({
+  prd: label,
+  repoRoot: REPO_ROOT,
+  baseRef: originBaseRef(),
+});
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -336,6 +347,18 @@ export function logCoderReworkModelStartupWarning(
 ): void {
   const message = sameCoderReworkModelWarning(coderModel, reworkModel);
   if (message) warn(message);
+}
+
+// Post-mortem capture for stuck/crash terminals. Best-effort by contract:
+// recordFailureDiagnostic never throws, so wiring it into terminal paths can
+// never change loop control flow.
+function recordLoopFailureDiagnostic(
+  input: Omit<FailureDiagnosticInput, "prd" | "baseRef">,
+): void {
+  recordFailureDiagnostic(
+    { ...input, prd: label, baseRef: originBaseRef() },
+    { repoRoot: REPO_ROOT },
+  );
 }
 
 const gh = (args: string[]): string =>
@@ -856,6 +879,32 @@ async function acquireNextIssueAsPrdParentForLoop() {
           `body=${body}`,
         ]);
         return response.id;
+      },
+      updateStateComment({ commentId, body }) {
+        issueClient().updateComment(commentId, body);
+      },
+      removeStuckLabelFromOpenChildren({ parentNumber, queueLabel }) {
+        const stuckChildren = listIssueAsPrdParentChildren({
+          parentNumber,
+          queueLabel,
+          client: issueClient(),
+        }).filter(
+          (child) =>
+            child.state === "OPEN" &&
+            child.labels.some((label) => label.name === AGENT_STUCK_LABEL),
+        );
+        for (const child of stuckChildren) {
+          console.log(
+            `  requeue: removing ${AGENT_STUCK_LABEL} from open child #${child.number}`,
+          );
+          gh([
+            "issue",
+            "edit",
+            String(child.number),
+            "--remove-label",
+            AGENT_STUCK_LABEL,
+          ]);
+        }
       },
     },
   );
@@ -1582,9 +1631,12 @@ function formatRebaseGuardFeedback(
 ): string {
   if (input.kind === "dirty_worktree") {
     return [
-      "## Cannot rebase: worktree not clean",
+      "## Worktree not clean: resolve before implementing",
       "",
-      `The issue branch worktree has uncommitted changes, so it cannot be rebased onto \`${input.baseRef}\` (\`${input.baseSha.slice(0, 8)}\`). A human needs to clean the worktree and rebase manually.`,
+      `The issue branch worktree has uncommitted changes left over from an earlier run, so the host could not rebase it onto \`${input.baseRef}\` (\`${input.baseSha.slice(0, 8)}\`).`,
+      "",
+      "Before implementing the issue: inspect the uncommitted changes with `git status` and `git diff`. Commit them if they belong to this issue, or discard them (`git checkout -- <file>` / `git clean -fd` for untracked leftovers) if they do not.",
+      `Then rebase the branch onto \`${input.baseRef}\` yourself (\`git rebase ${input.baseRef}\`), resolve any conflicts, and continue with the issue.`,
       "",
       "Uncommitted changes:",
       "```",
@@ -1593,9 +1645,14 @@ function formatRebaseGuardFeedback(
     ].join("\n");
   }
   return [
-    "## Rebase conflict with base branch",
+    "## Rebase conflict with base branch: resolve before implementing",
     "",
-    `The issue branch could not be rebased onto \`${input.baseRef}\` (\`${input.baseSha.slice(0, 8)}\`) due to conflicts. A human needs to rebase or resolve conflicts before this can proceed.`,
+    `The issue branch carries commits from an earlier run that conflict with the current base \`${input.baseRef}\` (\`${input.baseSha.slice(0, 8)}\`). The host aborted its automatic rebase; you must complete it:`,
+    "",
+    `1. Run \`git rebase ${input.baseRef}\`.`,
+    "2. Resolve each conflicted file. For generated lockfiles (package-lock.json, uv.lock, etc.), do not hand-merge: take the base branch's version (`git checkout --ours <lockfile>` during the rebase) and regenerate it from the manifest afterwards (e.g. `npm install --package-lock-only`) so it reflects both sides' dependency changes.",
+    "3. `git add` the resolved files and run `git rebase --continue` until the rebase finishes.",
+    "4. Re-verify the branch still satisfies the issue, commit anything missing, and finish as usual.",
     "",
     input.conflicts
       ? `Conflicted files:\n\`\`\`\n${input.conflicts.slice(0, 3000)}\n\`\`\``
@@ -1609,8 +1666,9 @@ function formatRebaseGuardFeedback(
 }
 
 // Pre-coder guard: bring a resumed, stale issue branch onto the current base
-// BEFORE the coder runs. Unlike prepareBranchForReview, a conflict here is
-// terminal — we abort and signal stuck rather than auto-recovering.
+// BEFORE the coder runs. A conflict or dirty worktree here is not terminal:
+// the guard's feedback is handed to the coder (in rework mode) so the agent
+// can resolve the rebase itself before implementing the issue.
 function rebaseStaleIssueBranchBeforeCoder(
   worktreePath: string,
   issueBranch: string,
@@ -2081,6 +2139,16 @@ function markStuck(
     headline?: string;
   },
 ): void {
+  recordLoopFailureDiagnostic({
+    scope: "issue",
+    outcome: options.terminalReason ?? "stuck",
+    issue: issue.number,
+    branch: issueBranch,
+    worktreePath,
+    roundsUsed: options.roundsUsed,
+    lastFeedback: options.lastFeedback,
+    detail: options.headline ? { headline: options.headline } : undefined,
+  });
   try {
     pushIssueBranch(worktreePath, issueBranch, "stuck");
   } catch (err) {
@@ -2201,7 +2269,10 @@ async function runBacklogIssueViaSharedEngine(input: {
         },
         async invokeCoder(input) {
           noteRound(input.round);
-          const isRework = agentInvocationStageForRound(input.round) === "rework";
+          // The engine forces rework mode whenever feedback exists — including
+          // round 1 after a pre-coder rebase-guard failure, where the guard's
+          // instructions must reach the agent through the rework prompt.
+          const isRework = input.isRework;
           let runResult: Awaited<ReturnType<typeof sandbox.run>>;
 
           if (isRework) {
@@ -3195,11 +3266,15 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
         });
       },
       listChildren: async ({ parent, queueLabel }) =>
+        // The orchestrator only ever acts on open children: closed children
+        // are inert and must not block re-decomposition (a claimed parent
+        // whose previous children were all closed as duplicates would
+        // otherwise never get a fresh decomposition) or feed readiness.
         listIssueAsPrdParentChildren({
           parentNumber: parent.number,
           queueLabel,
           client,
-        }),
+        }).filter((child) => child.state === "OPEN"),
       readiness: async ({
         parentContext,
         children,
@@ -3282,15 +3357,43 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
           accumulationSha,
           renderedContext: context.rendered,
         }),
-      verifyInitialAlreadySatisfied: async ({ reviewedBaseSha, headSha }) => ({
-        ok: true as const,
-        empty: treeShaOf(reviewedBaseSha) === treeShaOf(headSha),
-        evidence: `Tree comparison: ${reviewedBaseSha} vs ${headSha}.`,
-      }),
+      verifyInitialAlreadySatisfied: async ({ reviewedBaseSha, headSha }) => {
+        if (!reviewedBaseSha || !headSha) {
+          return {
+            ok: false as const,
+            diagnostics: [
+              `already_satisfied verification needs both SHAs (base='${reviewedBaseSha}', head='${headSha}').`,
+            ],
+          };
+        }
+        try {
+          return {
+            ok: true as const,
+            empty: treeShaOf(reviewedBaseSha) === treeShaOf(headSha),
+            evidence: `Tree comparison: ${reviewedBaseSha} vs ${headSha}.`,
+          };
+        } catch (error) {
+          return {
+            ok: false as const,
+            diagnostics: [
+              `Tree comparison between ${reviewedBaseSha} and ${headSha} failed: ${error instanceof Error ? error.message : String(error)}`,
+            ],
+          };
+        }
+      },
       closeAlreadySatisfiedChild: ({ child, evidence }) =>
         closeIssueAsPrdAlreadySatisfiedChild({ child, evidence, client }),
-      markChildStuck: ({ child, reason }) =>
-        markIssueAsPrdChildStuck({ child, reason, client }),
+      markChildStuck: ({ child, reason }) => {
+        recordLoopFailureDiagnostic({
+          scope: "child",
+          outcome: "child_stuck",
+          issue: child.number,
+          parentIssue: parent.number,
+          branch: childBranchName(parent.number, child.number),
+          lastFeedback: reason,
+        });
+        return markIssueAsPrdChildStuck({ child, reason, client });
+      },
       integrateChild: async (integration) =>
         {
           const childRecord = client.viewIssue(integration.childNumber);
@@ -3652,6 +3755,13 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
     console.error(
       `Ownership ambiguous after processing parent #${parent.number}:\n${terminal.diagnostics.join("\n")}`,
     );
+    recordLoopFailureDiagnostic({
+      scope: "parent",
+      outcome: "ownership_ambiguous",
+      issue: parent.number,
+      branch: accumulationBranchName(parent.number),
+      detail: { diagnostics: terminal.diagnostics },
+    });
     return { stopLoop: false, skippedParentNumber: parent.number };
   }
 
@@ -3720,6 +3830,74 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
     return { stopLoop: false };
   }
 
+  if (terminal.kind === "close_complete") {
+    tuiEmitter.beginHostStep("deliver_review_ready", currentState.accumulationBranch);
+    const childVerification = verifyTerminalChildren({
+      parentNumber: parent.number,
+      result: { kind: "clean_delivery" },
+      queueLabel: currentState.queueLabel,
+      client,
+    });
+    if (!childVerification.ok) {
+      console.error(
+        `Already-complete child verification failed for parent #${parent.number}:\n${childVerification.diagnostics.join("\n")}`,
+      );
+      return { stopLoop: true };
+    }
+    await persistTerminalPhase("delivered");
+    const add = terminal.labelPlan.add.filter((label) => !finalParent.labels.some((value) => value.name === label));
+    const remove = terminal.labelPlan.remove.filter((label) => finalParent.labels.some((value) => value.name === label));
+    const labelVerification = await applyVerifiedParentTerminalLabels({
+      parentNumber: parent.number,
+      add,
+      remove,
+      client,
+    });
+    if (!labelVerification.ok) {
+      console.error(
+        `Already-complete label verification failed for parent #${parent.number}:\n${labelVerification.diagnostics.join("\n")}`,
+      );
+      return { stopLoop: true };
+    }
+    if (terminal.labelPlan.deleteQueueLabel) {
+      try {
+        gh(["label", "delete", currentState.queueLabel, "--yes"]);
+      } catch (err) {
+        console.warn(
+          `Warning: failed to delete queue label ${currentState.queueLabel}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    const closeVerification = await runVerifiedHostMutation({
+      mutate: () =>
+        client.closeIssue(
+          parent.number,
+          [
+            "Closing as already complete: the deliverable already exists on the current base with a host-verified empty diff.",
+            "",
+            "Evidence:",
+            terminal.evidence,
+          ].join("\n"),
+        ),
+      readBack: () => client.viewIssue(parent.number),
+      verify: (value) => value.state === "CLOSED",
+      describe: (value) => `issue #${value.number} state=${value.state}`,
+    });
+    if (!closeVerification.ok) {
+      console.error(
+        `Already-complete close verification failed for parent #${parent.number}:\n${closeVerification.diagnostics.join("\n")}`,
+      );
+      return { stopLoop: true };
+    }
+    recordIssueOutcome({
+      prd: label,
+      issue: parent.number,
+      outcome: "already_satisfied",
+      roundsUsed: 1,
+    });
+    return { stopLoop: false };
+  }
+
   tuiEmitter.setTicket({
     number: parent.number,
     title: parent.title,
@@ -3749,6 +3927,14 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
     "",
     ...terminal.diagnostics,
   ].join("\n");
+  recordLoopFailureDiagnostic({
+    scope: "parent",
+    outcome: "parent_stuck",
+    issue: parent.number,
+    branch: currentState.accumulationBranch,
+    lastFeedback: commentBody,
+    detail: { reason: terminal.reason },
+  });
   const commentVerification = await appendVerifiedParentComment({
     parentNumber: parent.number,
     body: commentBody,
@@ -3875,6 +4061,15 @@ async function processIssue(issue: IssueDetail): Promise<void> {
       console.error(
         `Issue #${issue.number} crashed unexpectedly. Continuing to next issue.\n${outcome.error}`,
       );
+      recordLoopFailureDiagnostic({
+        scope: "issue",
+        outcome: "crashed",
+        issue: issue.number,
+        branch: issueBranch,
+        worktreePath,
+        roundsUsed: outcome.roundsUsed,
+        error: outcome.error,
+      });
       recordIssueOutcome({
         prd: label,
         issue: issue.number,
@@ -3895,6 +4090,8 @@ ensureBaseBranchAvailable();
 ensureLabels();
 
 let completedIterations = 0;
+let consecutiveAcquisitionFailures = 0;
+const MAX_ACQUISITION_FAILURES = 3;
 let stopReason:
   | "no_eligible_issue"
   | "max_iterations" = "no_eligible_issue";
@@ -3908,7 +4105,30 @@ while (true) {
   console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
   tuiEmitter.setIteration({ current: iteration, max: MAX_ITERATIONS });
 
-  const parent = await acquireNextIssueAsPrdParentForLoop();
+  let parent: Awaited<ReturnType<typeof acquireNextIssueAsPrdParentForLoop>>;
+  try {
+    parent = await acquireNextIssueAsPrdParentForLoop();
+    consecutiveAcquisitionFailures = 0;
+  } catch (error) {
+    // Acquisition failures (gh/API hiccups) name no parent to skip, so retry
+    // a few times before giving up on the whole run.
+    consecutiveAcquisitionFailures++;
+    console.error(
+      `Parent acquisition failed (${consecutiveAcquisitionFailures}/${MAX_ACQUISITION_FAILURES}):\n${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+    );
+    recordLoopFailureDiagnostic({
+      scope: "loop",
+      outcome: "acquisition_failed",
+      error:
+        error instanceof Error ? (error.stack ?? error.message) : String(error),
+      detail: {
+        consecutive_failures: consecutiveAcquisitionFailures,
+        max_failures: MAX_ACQUISITION_FAILURES,
+      },
+    });
+    if (consecutiveAcquisitionFailures >= MAX_ACQUISITION_FAILURES) break;
+    continue;
+  }
   if (parent.kind === "none") {
     console.log(`No eligible issues with label(s) '${labels.join(", ")}'.`);
     tuiEmitter.clearTicket();
@@ -3916,7 +4136,34 @@ while (true) {
     break;
   }
 
-  const processed = await processIssueAsPrdParent(parent);
+  let processed: Awaited<ReturnType<typeof processIssueAsPrdParent>>;
+  try {
+    processed = await processIssueAsPrdParent(parent);
+  } catch (error) {
+    // One parent's host-side crash must not kill the whole loop: skip the
+    // parent for this run (the recover script can requeue it) and move on.
+    const parentNumber = parent.parent.number;
+    console.error(
+      `Processing parent #${parentNumber} crashed; skipping it for this run.\n${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+    );
+    skippedAmbiguousParentNumbers.add(parentNumber);
+    recordLoopFailureDiagnostic({
+      scope: "parent",
+      outcome: "crashed",
+      issue: parentNumber,
+      branch: accumulationBranchName(parentNumber),
+      error:
+        error instanceof Error ? (error.stack ?? error.message) : String(error),
+    });
+    recordIssueOutcome({
+      prd: label,
+      issue: parentNumber,
+      outcome: "crashed",
+      roundsUsed: 1,
+    });
+    tuiEmitter.clearTicket();
+    continue;
+  }
   if (processed.skippedParentNumber !== undefined) {
     skippedAmbiguousParentNumbers.add(processed.skippedParentNumber);
     tuiEmitter.clearTicket();

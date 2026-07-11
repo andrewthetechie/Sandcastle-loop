@@ -24,7 +24,7 @@ const EXPECTED_SYSTEM_PROMPT = [
   "",
   "# Do not",
   "",
-  "- Refactor, rename, restructure, or reorganize code.",
+  "- Refactor, rename, restructure, or reorganize code beyond what a finding's `remediation` explicitly requires.",
   "- Fix related issues you notice while addressing a finding.",
   "- Rewrite the feature instead of applying the reviewer-requested fix.",
   "- Add tests unless a finding explicitly asks for tests.",

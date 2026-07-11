@@ -12,7 +12,8 @@ export type FailedRoundSource =
   | "reviewer_parse_failure"
   | "reviewer_incomplete"
   | "branch_prep"
-  | "livelock";
+  | "livelock"
+  | "agent_invocation_crash";
 
 export interface FailedRoundFingerprint {
   diffHash: string;

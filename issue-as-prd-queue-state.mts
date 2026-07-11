@@ -44,7 +44,12 @@ export type DrainState =
   | { kind: "continue"; issue: QueueIssue }
   | { kind: "ready_for_full_review" }
   | { kind: "partial_review" }
-  | { kind: "parent_stuck_empty" };
+  // Open children remain stuck and nothing was integrated: terminal.
+  | { kind: "parent_stuck_empty"; openStuckNumbers: number[] }
+  // No open children remain at all (everything was closed as duplicate /
+  // already satisfied) and nothing was integrated: the queue starved without
+  // any child actually failing, so the parent can retry decomposition.
+  | { kind: "queue_starved_empty" };
 
 export interface LabelMutationPlan {
   remove: string[];
@@ -125,12 +130,15 @@ export function decideDrainState(input: {
   if (openStuck.length > 0) {
     return integrated
       ? { kind: "partial_review" }
-      : { kind: "parent_stuck_empty" };
+      : {
+          kind: "parent_stuck_empty",
+          openStuckNumbers: openStuck.map((issue) => issue.number),
+        };
   }
 
   return integrated
     ? { kind: "ready_for_full_review" }
-    : { kind: "parent_stuck_empty" };
+    : { kind: "queue_starved_empty" };
 }
 
 export function cleanDeliveryLabelPlan(): LabelMutationPlan {
