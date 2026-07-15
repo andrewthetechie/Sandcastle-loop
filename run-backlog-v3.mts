@@ -117,7 +117,11 @@ import { loadSandcastleLoopConfig } from "./sandcastle-loop-config.mts";
 import { aggregateDependencySetupCommands } from "./aggregate-validation-worktree.mts";
 import { createHostCommandEnv } from "./host-command-env.mts";
 import { resolveHostValidationCommand } from "./host-validation-command.mts";
-import { formatHostValidationFailureFeedback } from "./host-validation-feedback.mts";
+import {
+  buildRoleDependencySummaryQuery,
+  extractDroppedRoleNameFromDependentObjectsError,
+  formatHostValidationFailureFeedback,
+} from "./host-validation-feedback.mts";
 import { readCliStringFlag } from "./cli-string-flag.mts";
 import {
   createLivelockWatchdogSandcastleRunOptions,
@@ -1390,6 +1394,8 @@ function summarizeFailureOutput(output: string): string {
     /\bcompilation failed\b/i,
     /\bbuild failed\b/i,
     /^Error:\s/,
+    /DependentObjectsStillExistError\b/,
+    /cannot be dropped because some objects depend on it/i,
     /^\s*panic:\s/i,
     /^\s*thread .* panicked\b/,
   ];
@@ -1409,6 +1415,56 @@ function summarizeFailureOutput(output: string): string {
     .slice(-3)
     .join(" | ");
   return tail.slice(0, 280) || "(no informative output)";
+}
+
+function databaseUrlForPsql(value: string): string {
+  return value.replace(/^postgresql\+asyncpg:\/\//, "postgresql://");
+}
+
+function extractDatabaseUrlFromValidationCommand(command: string): string | null {
+  return /(?:^|\s)DATABASE_URL=([^\s]+)/.exec(command)?.[1] ?? null;
+}
+
+function buildRoleDependencySummary(input: {
+  output: string;
+  command: string;
+}): string | null {
+  const roleName = extractDroppedRoleNameFromDependentObjectsError(input.output);
+  if (!roleName) return null;
+
+  const rawDatabaseUrl =
+    extractDatabaseUrlFromValidationCommand(input.command) ??
+    HOST_COMMAND_ENV.DATABASE_URL;
+  if (!rawDatabaseUrl) {
+    return "Skipped read-only dependency summary: DATABASE_URL was not available to the host runner.";
+  }
+
+  const query = buildRoleDependencySummaryQuery({
+    roleName,
+    pipeSeparated: true,
+  });
+  const result = spawnSync(
+    "psql",
+    [
+      databaseUrlForPsql(rawDatabaseUrl),
+      "-v",
+      "ON_ERROR_STOP=1",
+      "-P",
+      "pager=off",
+      "-Atc",
+      query,
+    ],
+    {
+      encoding: "utf8",
+      env: HOST_COMMAND_ENV,
+    },
+  );
+  if (result.status !== 0) {
+    const error = `${result.stderr ?? ""}${result.stdout ?? ""}`.trim();
+    return `Skipped read-only dependency summary: psql failed${error ? `: ${error.slice(0, 1000)}` : "."}`;
+  }
+  const summary = result.stdout.trim();
+  return summary || `No pg_shdepend rows found for role ${roleName}.`;
 }
 
 function runValidationGate(
@@ -1451,13 +1507,20 @@ function runValidationGate(
     if (result.status !== 0) {
       const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
       const summary = summarizeFailureOutput(output);
+      const roleDependencySummary = buildRoleDependencySummary({
+        output,
+        command: cmd,
+      });
       console.log(
         `    ✗ failed (exit ${result.status}) in ${elapsedS}s: ${summary}`,
       );
       return {
         ok: false,
         signature: `${cmd} :: ${summary}`,
-        feedback: formatHostValidationFailureFeedback({ output }),
+        feedback: formatHostValidationFailureFeedback({
+          output,
+          roleDependencySummary,
+        }),
       };
     }
     console.log(`    ✓ ${elapsedS}s`);
@@ -2629,6 +2692,7 @@ async function runBacklogIssueViaSharedEngine(input: {
             command: gate.signature.split(" :: ")[0] ?? gate.signature,
             exitCode: 1,
             feedback: gate.feedback,
+            failureSignature: gate.signature,
           };
         },
         async acquireReviewer(input) {

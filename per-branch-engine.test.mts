@@ -242,6 +242,59 @@ test("repeated validation failure yields stuck_no_progress", async () => {
   assert.equal(result.reason, "stuck_no_progress");
 });
 
+test("repeated validation failure signature stops even when candidate diff changes", async () => {
+  const { deps } = buildDeps({
+    coder: new Array(4).fill({ kind: "committed", committedCount: 1 }),
+    prep: new Array(4).fill({ ok: true, reviewedBaseSha: "base-1" }),
+    validation: new Array(4).fill({
+      ok: false,
+      command: "pytest",
+      exitCode: 1,
+      feedback: "## Host validation failed",
+      failureSignature:
+        "pytest :: DependentObjectsStillExistError role lawncare_admin cannot be dropped",
+    }),
+  });
+  let diffVersion = 0;
+  deps.computeReviewContext = async () => ({
+    ...REVIEW_CONTEXT,
+    diff: `diff-${++diffVersion}`,
+  });
+
+  const result = await runPerBranchEngine({ task: TASK, policy: POLICY, deps });
+
+  assert.equal(result.kind, "stuck");
+  assert.equal(result.reason, "stuck_no_progress");
+});
+
+test("different validation failure signatures are not collapsed", async () => {
+  const { deps } = buildDeps({
+    coder: [
+      { kind: "committed", committedCount: 1 },
+      { kind: "committed", committedCount: 1 },
+    ],
+    prep: [
+      { ok: true, reviewedBaseSha: "base-1" },
+      { ok: true, reviewedBaseSha: "base-1" },
+    ],
+    validation: [
+      {
+        ok: false,
+        command: "pytest",
+        exitCode: 1,
+        feedback: "## Host validation failed",
+        failureSignature: "pytest :: first failure",
+      },
+      { ok: true },
+    ],
+    reviewer: [reviewerApproved()],
+  });
+
+  const result = await runPerBranchEngine({ task: TASK, policy: POLICY, deps });
+
+  assert.equal(result.kind, "approved");
+});
+
 test("reviewer parse failure exhausts attempts and returns stuck", async () => {
   const { deps } = buildDeps({
     reviewer: [

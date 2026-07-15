@@ -19,6 +19,46 @@ const PYTEST_FAILURE_ANCHOR =
   /^(=+\s*(FAILURES|ERRORS|short test summary info)\s*=+)$/m;
 
 const HOST_DIAGNOSTICS_MAX_CHARS = 6000;
+const ROLE_DROP_DEPENDENCY_ERROR =
+  /role "([^"]+)" cannot be dropped because some objects depend on it/i;
+
+export function extractDroppedRoleNameFromDependentObjectsError(
+  output: string,
+): string | null {
+  if (!/DependentObjectsStillExistError/i.test(output)) return null;
+  return ROLE_DROP_DEPENDENCY_ERROR.exec(output)?.[1] ?? null;
+}
+
+function sqlLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+export function buildRoleDependencySummaryQuery(input: {
+  roleName: string;
+  pipeSeparated?: boolean;
+}): string {
+  const select = input.pipeSeparated
+    ? [
+        "SELECT COALESCE(db.datname, '<shared>') || ' | ' ||",
+        "       d.classid::regclass::text || ' | ' ||",
+        "       count(*)::text",
+      ]
+    : [
+        "SELECT COALESCE(db.datname, '<shared>') AS database,",
+        "       d.classid::regclass AS dependency_catalog,",
+        "       count(*) AS dependency_count",
+      ];
+  return [
+    ...select,
+    "FROM pg_shdepend d",
+    "LEFT JOIN pg_database db ON d.dbid = db.oid",
+    `WHERE d.refobjid = (SELECT oid FROM pg_roles WHERE rolname = ${sqlLiteral(input.roleName)})`,
+    "GROUP BY db.datname, d.classid",
+    input.pipeSeparated
+      ? "ORDER BY db.datname NULLS FIRST, d.classid::regclass::text;"
+      : "ORDER BY database NULLS FIRST, dependency_catalog;",
+  ].join("\n");
+}
 
 function redactHostOnlyDatabaseCommands(output: string): string {
   return output
@@ -55,7 +95,34 @@ function extractSalientTail(output: string, maxChars: number): string {
  */
 export function formatHostValidationFailureFeedback(input: {
   output: string;
+  roleDependencySummary?: string | null;
 }): string {
+  const droppedRole =
+    extractDroppedRoleNameFromDependentObjectsError(input.output);
+  const roleDependencyGuidance = droppedRole
+    ? [
+        "",
+        "## Postgres role dependency hint",
+        "",
+        `The failed SQL tried to drop role \`${droppedRole}\`. PostgreSQL roles are cluster-global, so a migration running in one database cannot drop a role while grants or ownership for that role still exist in another database in the same cluster.`,
+        "",
+        input.roleDependencySummary
+          ? [
+              "Read-only dependency summary from `pg_shdepend`:",
+              "```",
+              input.roleDependencySummary,
+              "```",
+            ].join("\n")
+          : [
+              "If this needs deeper inspection, run this read-only host query against the same Postgres cluster:",
+              "```sql",
+              buildRoleDependencySummaryQuery({ roleName: droppedRole }),
+              "```",
+            ].join("\n"),
+        "",
+        "Prefer making the downgrade revoke this database's privileges and skip `DROP ROLE` when cross-database dependencies remain.",
+      ]
+    : [];
   return [
     "## Host validation failed",
     "",
@@ -70,6 +137,7 @@ export function formatHostValidationFailureFeedback(input: {
       HOST_DIAGNOSTICS_MAX_CHARS,
     ),
     "```",
+    ...roleDependencyGuidance,
     "",
     "Fix the failures and commit again.",
   ].join("\n");

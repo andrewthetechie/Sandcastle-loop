@@ -118,6 +118,34 @@ export async function runAggregateValidation(input: {
       diagnostics: readiness.diagnostics,
     };
   }
+  // Repair child was assessed as not-needed by the readiness agent (closed as
+  // not_actionable). This is semantically identical to the engine returning
+  // already_satisfied: the validation failure was transient (e.g. a flaky test
+  // that passed by the time the fix was committed). Re-run the gate; if it is
+  // now green, treat the run as repaired with no code change. If it is still
+  // red the parent is genuinely stuck.
+  if (readiness.ready.length === 0 && readiness.dropped.length > 0) {
+    const rerunFailure = await runValidationCommands(
+      input.gate,
+      input.commands,
+      input.accumulationSha,
+      deps,
+    );
+    if (!rerunFailure) {
+      return {
+        kind: "repaired",
+        childNumber: readiness.dropped[0]!,
+        accumulationSha: input.accumulationSha,
+      };
+    }
+    return {
+      kind: "parent_failure",
+      failure: rerunFailure,
+      diagnostics: [
+        `Repair child readiness dropped all children (${readiness.dropped.join(",")}) as not-needed but validation gate '${input.gate}' is still red.`,
+      ],
+    };
+  }
   if (readiness.ready.length !== 1 || readiness.dropped.length > 0) {
     return {
       kind: "parent_failure",

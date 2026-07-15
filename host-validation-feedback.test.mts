@@ -49,3 +49,24 @@ test("surfaces the pytest failure even when alembic migration logs would fill th
   // The migration success noise must not be what the coder sees.
   assert.doesNotMatch(feedback, /Running upgrade 03[0-4] -> 03[1-5]/);
 });
+
+test("adds Postgres role dependency guidance for failed DROP ROLE", () => {
+  const feedback = formatHostValidationFailureFeedback({
+    output: [
+      "sqlalchemy.exc.DBAPIError: (sqlalchemy.dialects.postgresql.asyncpg.Error)",
+      '<class "asyncpg.exceptions.DependentObjectsStillExistError">: role "lawncare_admin" cannot be dropped because some objects depend on it',
+      "DETAIL:  privileges for database test",
+      "[SQL: DROP ROLE lawncare_admin]",
+    ].join("\n"),
+    roleDependencySummary: [
+      "<shared> | pg_database | 2",
+      "lawncare_migration_test | pg_class | 18",
+      "test | pg_class | 18",
+    ].join("\n"),
+  });
+
+  assert.match(feedback, /Postgres role dependency hint/);
+  assert.match(feedback, /roles are cluster-global/);
+  assert.match(feedback, /lawncare_migration_test \| pg_class \| 18/);
+  assert.match(feedback, /skip `DROP ROLE` when cross-database dependencies remain/);
+});

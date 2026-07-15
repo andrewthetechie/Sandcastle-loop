@@ -22,6 +22,9 @@ import type {
   AggregateValidationFailure,
 } from "./issue-as-prd-validation.mts";
 
+const INITIAL_CHILD_FAILED_NO_INTEGRATED_WORK =
+  "initial_child_failed_no_integrated_work";
+
 export type ParentRunResult =
   | {
       kind: "clean_delivery";
@@ -671,7 +674,7 @@ async function drainInitialChildren(input: {
           kind: "parent_stuck",
           result: parentStuck(
             accumulationHeadSha,
-            "initial_child_stuck_empty",
+            INITIAL_CHILD_FAILED_NO_INTEGRATED_WORK,
             [
               `Initial drain produced no integrated reviewable work; stuck children: ${drain.openStuckNumbers
                 .map((number) => `#${number}`)
@@ -734,7 +737,11 @@ async function drainInitialChildren(input: {
       if (accumulationHeadSha === state.fullParentReviewBaseSha) {
         return {
           kind: "parent_stuck",
-          result: parentStuck(accumulationHeadSha, "initial_child_stuck_empty", diagnostics),
+          result: parentStuck(
+            accumulationHeadSha,
+            INITIAL_CHILD_FAILED_NO_INTEGRATED_WORK,
+            diagnostics,
+          ),
         };
       }
       partialCauseChildNumber = child.number;
@@ -754,7 +761,11 @@ async function drainInitialChildren(input: {
     if (accumulationHeadSha === state.fullParentReviewBaseSha) {
       return {
         kind: "parent_stuck",
-        result: parentStuck(accumulationHeadSha, "initial_child_stuck_empty", diagnostics),
+        result: parentStuck(
+          accumulationHeadSha,
+          INITIAL_CHILD_FAILED_NO_INTEGRATED_WORK,
+          diagnostics,
+        ),
       };
     }
     partialCauseChildNumber = child.number;

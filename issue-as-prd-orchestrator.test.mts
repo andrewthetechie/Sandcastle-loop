@@ -118,8 +118,26 @@ test("first initial child stuck with no integrated work returns parent_stuck", a
   assert.deepEqual(result, {
     kind: "parent_stuck",
     accumulationHeadSha: sha("1"),
-    reason: "initial_child_stuck_empty",
+    reason: "initial_child_failed_no_integrated_work",
     diagnostics: ["blocked"],
+  });
+});
+
+test("already-stuck initial child with no integrated work uses failed-child parent reason", async () => {
+  const stuckChild = child(101, "Child A");
+  stuckChild.labels.push({ name: "agent-stuck" });
+  const deps = createDeps({
+    state: state({ phase: "initial_ready" }),
+    children: [stuckChild],
+  });
+
+  const result = await runIssueAsPrdParent(input({ state: deps.state }), deps);
+
+  assert.deepEqual(result, {
+    kind: "parent_stuck",
+    accumulationHeadSha: sha("1"),
+    reason: "initial_child_failed_no_integrated_work",
+    diagnostics: ["Initial drain produced no integrated reviewable work; stuck children: #101."],
   });
 });
 

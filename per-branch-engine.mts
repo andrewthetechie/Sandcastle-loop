@@ -83,7 +83,13 @@ export type EnginePrepResult =
 
 export type EngineValidationResult =
   | { ok: true }
-  | { ok: false; command: string; exitCode: number; feedback: string };
+  | {
+      ok: false;
+      command: string;
+      exitCode: number;
+      feedback: string;
+      failureSignature?: string;
+    };
 
 export interface EngineReviewContext {
   baseSha: string;
@@ -350,8 +356,8 @@ export async function runPerBranchEngine(
       const validation = await deps.runValidation({ task, sandbox, round });
       if (!validation.ok) {
         const fingerprint = buildValidationFailureFingerprint(
-          reviewContext.diff,
-          `${validation.command} :: exit ${validation.exitCode}`,
+          validation.failureSignature ??
+            `${validation.command} :: exit ${validation.exitCode}`,
         );
         const progress = observeFailedRoundFingerprint(
           progressState,
@@ -713,14 +719,16 @@ function normalizeSignatureSummary(value: string): string {
   return value.replace(/\r\n/g, "\n").trim().slice(0, 300);
 }
 
-function buildValidationFailureFingerprint(
-  reviewDiff: string,
-  signature: string,
-): FailedRoundFingerprint {
+function buildValidationFailureFingerprint(signature: string): FailedRoundFingerprint {
+  const normalizedSignature = normalizeForHash(signature);
   return {
-    diffHash: sha1(normalizeForHash(reviewDiff)),
+    // Validation failures are caused by the host gate, not by the textual
+    // review diff. If a reworker keeps changing files but the same gate fails
+    // with the same salient signature, that is no progress and should stop
+    // before exhausting every review round.
+    diffHash: sha1(normalizedSignature),
     source: "validation",
-    signatureHash: sha1(normalizeForHash(signature)),
+    signatureHash: sha1(normalizedSignature),
     signatureSummary: normalizeSignatureSummary(signature),
   };
 }
