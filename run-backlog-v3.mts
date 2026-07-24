@@ -3080,6 +3080,12 @@ async function runRefreshForAccumulation(input: {
         encoding: "utf8",
       });
     }
+    const existing = findManagedWorktreeForBranch(input.accumulationBranch);
+    if (existing && existing !== worktreePath) {
+      spawnSync("git", ["worktree", "remove", "--force", existing], {
+        encoding: "utf8",
+      });
+    }
     execFileSync(
       "git",
       ["worktree", "add", worktreePath, input.accumulationBranch],
