@@ -667,11 +667,31 @@ function observeIssueAsPrdParentRecoveryState(
       { encoding: "utf8" },
     ).status === 0;
 
-  const localAccumulationHeadSha = accumulationBranchExists
+  let localAccumulationHeadSha = accumulationBranchExists
     ? git(["rev-parse", accumulationBranch]).trim()
     : null;
 
-  const remoteAccumulationHeadSha = readRemoteHead(accumulationBranch);
+  let remoteAccumulationHeadSha = readRemoteHead(accumulationBranch);
+
+  // Auto-reconcile accumulation branch local/remote mismatch. This handles
+  // the common case where a prior run pushed work but the local branch wasn't
+  // updated, or where the remote was updated but the local wasn't pulled.
+  if (
+    accumulationBranchExists &&
+    localAccumulationHeadSha !== null &&
+    remoteAccumulationHeadSha !== null &&
+    localAccumulationHeadSha !== remoteAccumulationHeadSha
+  ) {
+    const reconciled = reconcileAccumulationBranchMismatch(
+      accumulationBranch,
+      localAccumulationHeadSha,
+      remoteAccumulationHeadSha,
+    );
+    if (reconciled) {
+      localAccumulationHeadSha = reconciled.local;
+      remoteAccumulationHeadSha = reconciled.remote;
+    }
+  }
 
   const queueChildren = ghJson<Array<{ number: number; state: "OPEN" | "CLOSED" }>>([
     "issue",
@@ -714,6 +734,78 @@ function readRemoteHead(branch: string): string | null {
   if (!line) return null;
   const sha = line.split(/\s+/u)[0]?.trim();
   return sha ? sha : null;
+}
+
+// Attempt to reconcile a local/remote accumulation branch mismatch. Returns
+// the reconciled SHAs on success, or null if the branches have diverged and
+// cannot be trivially reconciled.
+//
+// Reconciliation strategy:
+//   1. Local ahead of remote (remote is ancestor of local): push local to remote.
+//   2. Remote ahead of local (local is ancestor of remote): reset local to remote.
+//   3. Diverged: cannot reconcile without human intervention — return null.
+function reconcileAccumulationBranchMismatch(
+  branch: string,
+  localSha: string,
+  remoteSha: string,
+): { local: string; remote: string } | null {
+  // Fast-forward check: is remote an ancestor of local?
+  const remoteIsAncestorOfLocal = spawnSync(
+    "git",
+    ["merge-base", "--is-ancestor", remoteSha, localSha],
+    { encoding: "utf8" },
+  ).status === 0;
+
+  if (remoteIsAncestorOfLocal) {
+    // Local is ahead — push to remote.
+    console.log(
+      `Reconciling accumulation branch ${branch}: local is ahead, pushing to remote.`,
+    );
+    const pushResult = spawnSync(
+      "git",
+      ["push", "origin", `${localSha}:refs/heads/${branch}`],
+      { encoding: "utf8" },
+    );
+    if (pushResult.status !== 0) {
+      console.warn(
+        `Failed to push accumulation branch ${branch} during reconciliation: ${pushResult.stderr || pushResult.stdout || "unknown error"}`,
+      );
+      return null;
+    }
+    return { local: localSha, remote: localSha };
+  }
+
+  // Fast-forward check: is local an ancestor of remote?
+  const localIsAncestorOfRemote = spawnSync(
+    "git",
+    ["merge-base", "--is-ancestor", localSha, remoteSha],
+    { encoding: "utf8" },
+  ).status === 0;
+
+  if (localIsAncestorOfRemote) {
+    // Remote is ahead — reset local to match.
+    console.log(
+      `Reconciling accumulation branch ${branch}: remote is ahead, resetting local to remote.`,
+    );
+    const resetResult = spawnSync(
+      "git",
+      ["branch", "-f", branch, remoteSha],
+      { encoding: "utf8" },
+    );
+    if (resetResult.status !== 0) {
+      console.warn(
+        `Failed to reset accumulation branch ${branch} during reconciliation: ${resetResult.stderr || resetResult.stdout || "unknown error"}`,
+      );
+      return null;
+    }
+    return { local: remoteSha, remote: remoteSha };
+  }
+
+  // Branches have diverged — cannot reconcile automatically.
+  console.warn(
+    `Accumulation branch ${branch} has diverged (local ${localSha.slice(0, 12)} != remote ${remoteSha.slice(0, 12)}); cannot auto-reconcile.`,
+  );
+  return null;
 }
 
 // Detect git push's non-fast-forward rejection from its combined output. Git
