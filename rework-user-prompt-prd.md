@@ -1,14 +1,13 @@
-# Rework - issue #{{ISSUE_NUMBER}}: {{ISSUE_TITLE}}
+# Task: fix findings for issue #{{ISSUE_NUMBER}} — {{ISSUE_TITLE}}
 
-# Findings to address
+## Findings to address
 
 {{REVIEW_FEEDBACK}}
 
-# Reference: issue body
+## Reference: issue body
 
 <issue-body>
 
 {{ISSUE_BODY}}
 
 </issue-body>
-

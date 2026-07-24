@@ -1,4 +1,4 @@
-# Coder — issue #{{ISSUE_NUMBER}}: {{ISSUE_TITLE}}
+# Task: issue #{{ISSUE_NUMBER}} — {{ISSUE_TITLE}}
 
 ## Issue body
 
