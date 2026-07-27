@@ -168,6 +168,29 @@ export interface PerBranchEngineDeps {
   currentHeadSha(sandbox: EngineSandbox): string;
   currentTreeSha(sandbox: EngineSandbox): string;
   onHostStep?(name: string, detail?: string): void;
+  /**
+   * Optional escalation-ladder hook. Returns the model identity that
+   * `invokeCoder` will run for this round. When the identity changes between
+   * rounds the engine clears its no-progress fingerprint history.
+   *
+   * This reset is load-bearing, not cosmetic. `failedRoundRepeatLimit` stops a
+   * task once the same fingerprint repeats, which encodes the inference "same
+   * model, same input, same failure, therefore further attempts are pointless".
+   * A model change invalidates that inference. Without the reset, a task whose
+   * cheap model produces an identical failure on rounds 1..N is killed by the
+   * repeat limit at exactly the round the ladder would have escalated it —
+   * i.e. the ladder would never fire on the tasks that most need it.
+   *
+   * Callers with a single fixed model omit this and keep the previous
+   * behaviour: no resets, one continuous fingerprint history.
+   */
+  agentModelForRound?(input: { round: number; isRework: boolean }): string;
+  /** Notified after the engine resets fingerprint history for a model change. */
+  onModelEscalation?(input: {
+    round: number;
+    fromModel: string;
+    toModel: string;
+  }): void;
 }
 
 export interface PerBranchEngineInput {
@@ -189,6 +212,7 @@ export async function runPerBranchEngine(
   let progressState = initialNoProgressState();
   let hostOnlyReview = false;
   let hostOnlyReviewAttempts = 0;
+  let lastAgentModel: string | null = null;
 
   try {
     for (let round = 1; round <= policy.maxReviewRounds; round++) {
@@ -207,6 +231,24 @@ export async function runPerBranchEngine(
       }
 
       if (!hostOnlyReview) {
+        const isRework = round > 1 || feedback !== "";
+
+        // Escalation ladder: a change of model invalidates the accumulated
+        // no-progress history, so clear it before the new model gets its first
+        // attempt. See `agentModelForRound` on PerBranchEngineDeps.
+        if (deps.agentModelForRound) {
+          const agentModel = deps.agentModelForRound({ round, isRework });
+          if (lastAgentModel !== null && agentModel !== lastAgentModel) {
+            progressState = initialNoProgressState();
+            deps.onModelEscalation?.({
+              round,
+              fromModel: lastAgentModel,
+              toModel: agentModel,
+            });
+          }
+          lastAgentModel = agentModel;
+        }
+
         let coderResult: EngineCoderResult;
         try {
           coderResult = await deps.invokeCoder({
@@ -214,7 +256,7 @@ export async function runPerBranchEngine(
             sandbox,
             round,
             feedback,
-            isRework: round > 1 || feedback !== "",
+            isRework,
             maxIterations: policy.coderMaxIterations,
           });
         } catch (error) {

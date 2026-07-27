@@ -6,7 +6,12 @@ import { pathToFileURL } from "node:url";
 
 export interface SandcastleLoopRoleModels {
   coder: string;
+  /** Rework tier 1 — the cheap model, rounds below `coderEscalation.tier2FromRound`. */
   rework: string;
+  /** Rework tier 2 — used from `coderEscalation.tier2FromRound` (backlog v4). */
+  reworkTier2: string;
+  /** Rework tier 3 — used from `coderEscalation.tier3FromRound` (backlog v4). */
+  reworkTier3: string;
   reviewer: string;
   initialIssueDecomposer: string;
   subtaskReadiness: string;
@@ -28,6 +33,16 @@ export interface SandcastleLoopCacheConfig {
   env?: Record<string, string>;
 }
 
+/**
+ * Round thresholds for the backlog-v4 coder escalation ladder. Rounds below
+ * `tier2FromRound` run `models.rework`; rounds from `tier2FromRound` run
+ * `models.reworkTier2`; rounds from `tier3FromRound` run `models.reworkTier3`.
+ */
+export interface SandcastleLoopCoderEscalationConfig {
+  tier2FromRound?: number;
+  tier3FromRound?: number;
+}
+
 export interface SandcastleLoopConfig {
   models?: Partial<SandcastleLoopRoleModels>;
   validationCommands?: string[];
@@ -40,6 +55,7 @@ export interface SandcastleLoopConfig {
     parentCommentMaxBytes?: number;
   };
   reviewDiffMaxBytes?: number;
+  coderEscalation?: SandcastleLoopCoderEscalationConfig;
 }
 
 export interface ResolvedSandcastleLoopCacheMount {
@@ -61,6 +77,10 @@ export interface ResolvedSandcastleLoopConfig {
     parentCommentMaxBytes: number;
   };
   reviewDiffMaxBytes: number;
+  coderEscalation: {
+    tier2FromRound: number;
+    tier3FromRound: number;
+  };
   cache: {
     root: string;
     mounts: ResolvedSandcastleLoopCacheMount[];
@@ -74,6 +94,10 @@ const SANDBOX_HOME = "/home/agent";
 const DEFAULT_MODELS: SandcastleLoopRoleModels = {
   coder: "strix/qwen3.6-35b-a3b-8bit",
   rework: "strix/qwen3.6-35b-a3b-8bit",
+  // Escalation tiers default to models already present elsewhere in the stack
+  // so a fresh v4 run has a working ladder without extra configuration.
+  reworkTier2: "zai-coding-plan/glm-5.1",
+  reworkTier3: "anthropic/claude-sonnet-4-5",
   reviewer: "zai-coding-plan/glm-5.1",
   initialIssueDecomposer: "zai-coding-plan/glm-5.1",
   subtaskReadiness: "zai-coding-plan/glm-5.1",
@@ -93,6 +117,8 @@ const DEFAULT_SETUP_COMMANDS = ["npm install"];
 const DEFAULT_REVIEWER_MAX_ATTEMPTS = 2;
 const DEFAULT_PARENT_COMMENT_MAX_BYTES = 32_000;
 const DEFAULT_REVIEW_DIFF_MAX_BYTES = 60_000;
+const DEFAULT_CODER_ESCALATION_TIER2_FROM_ROUND = 3;
+const DEFAULT_CODER_ESCALATION_TIER3_FROM_ROUND = 5;
 
 export async function loadSandcastleLoopConfig(
   repoRoot: string,
@@ -144,6 +170,14 @@ export async function loadSandcastleLoopConfig(
     },
     reviewDiffMaxBytes:
       userConfig.reviewDiffMaxBytes ?? DEFAULT_REVIEW_DIFF_MAX_BYTES,
+    coderEscalation: {
+      tier2FromRound:
+        userConfig.coderEscalation?.tier2FromRound ??
+        DEFAULT_CODER_ESCALATION_TIER2_FROM_ROUND,
+      tier3FromRound:
+        userConfig.coderEscalation?.tier3FromRound ??
+        DEFAULT_CODER_ESCALATION_TIER3_FROM_ROUND,
+    },
     cache: {
       root: cacheRoot,
       mounts,
@@ -310,6 +344,31 @@ function validateConfig(
     ) {
       throw new Error(
         `${configPath}: reviewDiffMaxBytes must be a positive integer`,
+      );
+    }
+  }
+  if (config.coderEscalation !== undefined) {
+    if (!isRecord(config.coderEscalation)) {
+      throw new Error(`${configPath}: coderEscalation must be an object`);
+    }
+    for (const field of ["tier2FromRound", "tier3FromRound"] as const) {
+      const value = config.coderEscalation[field];
+      if (value === undefined) continue;
+      if (typeof value !== "number" || !Number.isInteger(value) || value < 2) {
+        throw new Error(
+          `${configPath}: coderEscalation.${field} must be an integer >= 2`,
+        );
+      }
+    }
+    const tier2 = config.coderEscalation.tier2FromRound;
+    const tier3 = config.coderEscalation.tier3FromRound;
+    if (
+      typeof tier2 === "number" &&
+      typeof tier3 === "number" &&
+      tier3 <= tier2
+    ) {
+      throw new Error(
+        `${configPath}: coderEscalation.tier3FromRound (${tier3}) must be greater than tier2FromRound (${tier2})`,
       );
     }
   }
