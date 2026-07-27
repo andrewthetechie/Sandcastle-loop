@@ -119,3 +119,39 @@ test("reviewer.maxAttempts rejects zero, values above 5, non-integers, and non-n
     );
   }
 });
+
+test("reviewDiffMaxBytes defaults to 60000", async () => {
+  const root = repoRoot("loop-config-diff-default");
+  const config = await loadSandcastleLoopConfig(root);
+  assert.equal(config.reviewDiffMaxBytes, 60_000);
+});
+
+test("reviewDiffMaxBytes accepts custom values", async () => {
+  const root = repoRoot("loop-config-diff-custom");
+  writeFileSync(
+    join(root, ".sandcastle", "config.mts"),
+    "export default { reviewDiffMaxBytes: 120_000 };",
+  );
+  const config = await loadSandcastleLoopConfig(root);
+  assert.equal(config.reviewDiffMaxBytes, 120_000);
+});
+
+test("reviewDiffMaxBytes rejects zero, negative, non-integer, and non-number", async () => {
+  const cases = [
+    "export default { reviewDiffMaxBytes: 0 };",
+    "export default { reviewDiffMaxBytes: -1 };",
+    "export default { reviewDiffMaxBytes: 1.5 };",
+    "export default { reviewDiffMaxBytes: 'large' };",
+  ];
+  for (const [index, source] of cases.entries()) {
+    const root = repoRoot(`loop-config-diff-invalid-${index}`);
+    const path = join(root, ".sandcastle", "config.mts");
+    writeFileSync(path, source);
+    await assert.rejects(
+      () => loadSandcastleLoopConfig(root),
+      new RegExp(
+        `${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: reviewDiffMaxBytes`,
+      ),
+    );
+  }
+});

@@ -39,6 +39,7 @@ export interface SandcastleLoopConfig {
   issueAsPrd?: {
     parentCommentMaxBytes?: number;
   };
+  reviewDiffMaxBytes?: number;
 }
 
 export interface ResolvedSandcastleLoopCacheMount {
@@ -59,6 +60,7 @@ export interface ResolvedSandcastleLoopConfig {
   issueAsPrd: {
     parentCommentMaxBytes: number;
   };
+  reviewDiffMaxBytes: number;
   cache: {
     root: string;
     mounts: ResolvedSandcastleLoopCacheMount[];
@@ -90,6 +92,7 @@ const DEFAULT_VALIDATION_COMMANDS = [
 const DEFAULT_SETUP_COMMANDS = ["npm install"];
 const DEFAULT_REVIEWER_MAX_ATTEMPTS = 2;
 const DEFAULT_PARENT_COMMENT_MAX_BYTES = 32_000;
+const DEFAULT_REVIEW_DIFF_MAX_BYTES = 60_000;
 
 export async function loadSandcastleLoopConfig(
   repoRoot: string,
@@ -139,6 +142,8 @@ export async function loadSandcastleLoopConfig(
         userConfig.issueAsPrd?.parentCommentMaxBytes ??
         DEFAULT_PARENT_COMMENT_MAX_BYTES,
     },
+    reviewDiffMaxBytes:
+      userConfig.reviewDiffMaxBytes ?? DEFAULT_REVIEW_DIFF_MAX_BYTES,
     cache: {
       root: cacheRoot,
       mounts,
@@ -294,6 +299,18 @@ function validateConfig(
           `${configPath}: issueAsPrd.parentCommentMaxBytes must be a positive integer`,
         );
       }
+    }
+  }
+  if (config.reviewDiffMaxBytes !== undefined) {
+    const reviewDiffMaxBytes = config.reviewDiffMaxBytes;
+    if (
+      typeof reviewDiffMaxBytes !== "number" ||
+      !Number.isInteger(reviewDiffMaxBytes) ||
+      reviewDiffMaxBytes < 1
+    ) {
+      throw new Error(
+        `${configPath}: reviewDiffMaxBytes must be a positive integer`,
+      );
     }
   }
   if (config.cache !== undefined) {

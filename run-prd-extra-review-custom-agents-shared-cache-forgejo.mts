@@ -125,7 +125,7 @@ const REVIEW_DIFF_EXCLUDES: string[] = [...EXTRA_REVIEW_INPUT_DIFF_EXCLUDES];
 // Hard cap on the reviewer diff (bytes). Linux execve argv limit is ~128KB
 // system-wide and opencode passes the whole prompt as a single CLI arg, so
 // keep this well under that with headroom for the rest of the prompt.
-const REVIEW_DIFF_MAX_BYTES = 60_000;
+const REVIEW_DIFF_MAX_BYTES = LOOP_CONFIG.reviewDiffMaxBytes;
 
 // Pull merge strategy. The Forgejo adapter maps this to `tea pulls merge`.
 const PR_MERGE_STRATEGY: ForgejoPullMergeStrategy = "squash";

@@ -165,10 +165,11 @@ const REVIEW_DIFF_EXCLUDES: string[] = [...EXTRA_REVIEW_INPUT_DIFF_EXCLUDES];
 // Hard cap on the reviewer diff (bytes). Linux execve argv limit is ~128KB
 // system-wide and opencode passes the whole prompt as a single CLI arg, so
 // keep this well under that with headroom for the rest of the prompt.
-const REVIEW_DIFF_MAX_BYTES = PRD_V4_ENGINE_POLICY.reviewDiffMaxBytes;
+const REVIEW_DIFF_MAX_BYTES = LOOP_CONFIG.reviewDiffMaxBytes;
 const PRD_V4_RUN_ENGINE_POLICY: PerBranchEnginePolicy = {
   ...PRD_V4_ENGINE_POLICY,
   reviewerMaxAttempts: LOOP_CONFIG.reviewer.maxAttempts,
+  reviewDiffMaxBytes: LOOP_CONFIG.reviewDiffMaxBytes,
 };
 
 // `gh pr merge` strategy flag. Repos may disable certain strategies in

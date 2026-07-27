@@ -206,6 +206,7 @@ const MAX_PUSH_RECOVERY_ATTEMPTS = 2; // remote issue-branch push recovery
 const BACKLOG_V3_SHARED_ENGINE_POLICY = {
   ...BACKLOG_V3_ENGINE_POLICY,
   reviewerMaxAttempts: LOOP_CONFIG.reviewer.maxAttempts,
+  reviewDiffMaxBytes: LOOP_CONFIG.reviewDiffMaxBytes,
 };
 
 // Idle timeout for the agent (sandcastle fails the run if stdout is silent
@@ -226,7 +227,7 @@ const REVIEW_DIFF_EXCLUDES: string[] = [...EXTRA_REVIEW_INPUT_DIFF_EXCLUDES];
 // Hard cap on the reviewer diff (bytes). opencode passes the whole prompt as a
 // single CLI arg and the Linux execve argv limit is ~128KB system-wide, so keep
 // this well under that with headroom for the rest of the prompt.
-const REVIEW_DIFF_MAX_BYTES = BACKLOG_V3_ENGINE_POLICY.reviewDiffMaxBytes;
+const REVIEW_DIFF_MAX_BYTES = LOOP_CONFIG.reviewDiffMaxBytes;
 
 // Tracked task files must not be copied from the host into a worktree: doing
 // so would leave the issue branch dirty. Validation resolves its PostgreSQL
