@@ -73,10 +73,10 @@ In `DEFAULT_MODELS`, add a default Claude model id (operator overrides via `.san
 const DEFAULT_MODELS: SandcastleLoopRoleModels = {
   coder: "strix/qwen3.6-35b-a3b-8bit",
   rework: "strix/qwen3.6-35b-a3b-8bit",
-  reviewer: "zai-coding-plan/glm-5.1",
-  codeQuality: "zai-coding-plan/glm-5.1",
-  twoAxis: "zai-coding-plan/glm-5.1",
-  issueDecomposer: "zai-coding-plan/glm-5.1",
+  reviewer: "zai-coding-plan/glm-5.2",
+  codeQuality: "zai-coding-plan/glm-5.2",
+  twoAxis: "zai-coding-plan/glm-5.2",
+  issueDecomposer: "zai-coding-plan/glm-5.2",
   escalationReview: "anthropic/claude-sonnet-4-5",
 };
 ```

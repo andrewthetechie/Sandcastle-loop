@@ -12,7 +12,7 @@ import { loadSandcastleLoopConfig } from "./sandcastle-loop-config.mts";
 
 // Models. Replace with the exact opencode model strings once known.
 const CODER_MODEL = "strix/qwen3.6-35b-a3b-8bit";
-const REVIEWER_MODEL = "zai-coding-plan/glm-5.1";
+const REVIEWER_MODEL = "zai-coding-plan/glm-5.2";
 
 // PRD layout
 const PRD_DIR = "docs/prd";

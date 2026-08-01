@@ -165,7 +165,7 @@ match your repo layout.
 ## 5. Configuring which models to use
 
 Agents run through opencode, so every model value is an **opencode
-`provider/model` identifier** (e.g. `zai-coding-plan/glm-5.1`,
+`provider/model` identifier** (e.g. `zai-coding-plan/glm-5.2`,
 `strix/qwen3.6-35b-a3b-8bit`). Configure those providers in your host opencode
 config first; the loop bind-mounts it into every sandbox:
 
@@ -180,7 +180,7 @@ In `run-prd-extra-reviews.mts`, near the top:
 
 ```ts
 const CODER_MODEL = "strix/qwen3.6-35b-a3b-8bit";
-const REVIEWER_MODEL = "zai-coding-plan/glm-5.1";
+const REVIEWER_MODEL = "zai-coding-plan/glm-5.2";
 ```
 
 - `CODER_MODEL` — implements each issue (often a cheaper/local model).
@@ -191,9 +191,9 @@ const REVIEWER_MODEL = "zai-coding-plan/glm-5.1";
 In `extra-review-config.mts`:
 
 ```ts
-export const EXTRA_CODE_REVIEW_MODEL = "zai-coding-plan/glm-5.1";
-export const EXTRA_TWO_AXIS_REVIEW_MODEL = "zai-coding-plan/glm-5.1";
-export const EXTRA_ISSUE_DECOMPOSER_MODEL = "zai-coding-plan/glm-5.1";
+export const EXTRA_CODE_REVIEW_MODEL = "zai-coding-plan/glm-5.2";
+export const EXTRA_TWO_AXIS_REVIEW_MODEL = "zai-coding-plan/glm-5.2";
+export const EXTRA_ISSUE_DECOMPOSER_MODEL = "zai-coding-plan/glm-5.2";
 ```
 
 - `EXTRA_CODE_REVIEW_MODEL` — maintainability / code-quality gate.

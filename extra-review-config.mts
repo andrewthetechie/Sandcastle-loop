@@ -2,9 +2,9 @@ export const MAX_EXTRA_REVIEW_ROUNDS = 2;
 export const ISSUE_AS_PRD_MAX_EXTRA_REVIEW_ROUNDS = 1;
 export const REVIEW_FOLLOW_UP_LABEL = "ai-review-followup";
 
-export const EXTRA_CODE_REVIEW_MODEL = "zai-coding-plan/glm-5.1";
-export const EXTRA_TWO_AXIS_REVIEW_MODEL = "zai-coding-plan/glm-5.1";
-export const EXTRA_ISSUE_DECOMPOSER_MODEL = "zai-coding-plan/glm-5.1";
+export const EXTRA_CODE_REVIEW_MODEL = "zai-coding-plan/glm-5.2";
+export const EXTRA_TWO_AXIS_REVIEW_MODEL = "zai-coding-plan/glm-5.2";
+export const EXTRA_ISSUE_DECOMPOSER_MODEL = "zai-coding-plan/glm-5.2";
 
 export const EXTRA_REVIEWER_MAX_ITERATIONS = 20;
 export const EXTRA_DECOMPOSER_MAX_ITERATIONS = 15;

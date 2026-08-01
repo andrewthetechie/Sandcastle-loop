@@ -60,7 +60,7 @@ import { loadSandcastleLoopConfig } from "./sandcastle-loop-config.mts";
 
 // Models. Replace with the exact opencode model strings once known.
 const CODER_MODEL = "strix/qwen3.6-35b-a3b-8bit";
-const REVIEWER_MODEL = "zai-coding-plan/glm-5.1";
+const REVIEWER_MODEL = "zai-coding-plan/glm-5.2";
 const CODER_AGENT_SYSTEM_PROMPT_FILE =
   "./.sandcastle/coder-agent-system-prompt-prd.md";
 const CODER_USER_PROMPT_FILE = "./.sandcastle/coder-user-prompt-prd.md";

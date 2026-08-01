@@ -96,14 +96,14 @@ const DEFAULT_MODELS: SandcastleLoopRoleModels = {
   rework: "strix/qwen3.6-35b-a3b-8bit",
   // Escalation tiers default to models already present elsewhere in the stack
   // so a fresh v4 run has a working ladder without extra configuration.
-  reworkTier2: "zai-coding-plan/glm-5.1",
+  reworkTier2: "zai-coding-plan/glm-5.2",
   reworkTier3: "anthropic/claude-sonnet-4-5",
-  reviewer: "zai-coding-plan/glm-5.1",
-  initialIssueDecomposer: "zai-coding-plan/glm-5.1",
-  subtaskReadiness: "zai-coding-plan/glm-5.1",
-  codeQuality: "zai-coding-plan/glm-5.1",
-  twoAxis: "zai-coding-plan/glm-5.1",
-  issueDecomposer: "zai-coding-plan/glm-5.1",
+  reviewer: "zai-coding-plan/glm-5.2",
+  initialIssueDecomposer: "zai-coding-plan/glm-5.2",
+  subtaskReadiness: "zai-coding-plan/glm-5.2",
+  codeQuality: "zai-coding-plan/glm-5.2",
+  twoAxis: "zai-coding-plan/glm-5.2",
+  issueDecomposer: "zai-coding-plan/glm-5.2",
   escalationReview: "anthropic/claude-sonnet-4-5",
 };
 

@@ -43,7 +43,7 @@ BODY`,
 test("buildAgentDefinition denies bash for code-quality", () => {
   const definition = buildAgentDefinition(
     CODE_QUALITY_AGENT_CONFIG,
-    "zai-coding-plan/glm-5.1",
+    "zai-coding-plan/glm-5.2",
     "BODY",
   );
 
@@ -52,7 +52,7 @@ test("buildAgentDefinition denies bash for code-quality", () => {
     `---
 description: Maintainability gate over the completed PRD branch
 mode: primary
-model: zai-coding-plan/glm-5.1
+model: zai-coding-plan/glm-5.2
 temperature: 0.1
 permission:
   edit: deny
