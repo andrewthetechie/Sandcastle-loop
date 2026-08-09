@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import type {
   TuiCounter,
   TuiLoopType,
@@ -179,6 +180,67 @@ function formatElapsed(ms: number): string {
   const mm = String(minutes).padStart(2, "0");
   const ss = String(seconds).padStart(2, "0");
   return hours > 0 ? `${hours}:${mm}:${ss}` : `${minutes}:${ss}`;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-snapshot discovery / selection (TUI can observe several loops at once)
+// ---------------------------------------------------------------------------
+
+/** Stable order for cycling through loop snapshots: by filename. */
+export function orderSnapshotPaths(paths: string[]): string[] {
+  return [...paths].sort((a, b) => basename(a).localeCompare(basename(b)));
+}
+
+/** Pick the snapshot with the most recent `updatedAt`. Ties fall back to filename order. */
+export function pickFreshestSnapshot(
+  paths: string[],
+  statuses: ReadonlyMap<string, TuiStatus>,
+): string | null {
+  let best: string | null = null;
+  let bestUpdated = -Infinity;
+  for (const path of paths) {
+    const status = statuses.get(path);
+    if (!status) continue;
+    const updated = safeParse(status.updatedAt);
+    if (updated === 0) continue;
+    if (updated > bestUpdated) {
+      bestUpdated = updated;
+      best = path;
+    } else if (updated === bestUpdated && best !== null && path < best) {
+      best = path;
+    }
+  }
+  return best;
+}
+
+/** Cycle to the next/previous snapshot in stable filename order. */
+export function selectAdjacentSnapshot(
+  current: string | null,
+  paths: string[],
+  direction: 1 | -1,
+): string | null {
+  if (paths.length === 0) return null;
+  const ordered = orderSnapshotPaths(paths);
+  if (current === null) return ordered[0];
+  const idx = ordered.indexOf(current);
+  if (idx === -1) return ordered[0];
+  const nextIdx = (idx + direction + ordered.length) % ordered.length;
+  return ordered[nextIdx];
+}
+
+/** Human-readable loop switcher label, e.g. "loop 2/3 · backlog · tab switch". */
+export function formatLoopSwitcherLabel(
+  selectedPath: string | null,
+  paths: string[],
+  statuses: ReadonlyMap<string, TuiStatus>,
+): string | null {
+  if (paths.length <= 1) return null;
+  const ordered = orderSnapshotPaths(paths);
+  const selected = selectedPath ?? ordered[0];
+  const index = ordered.indexOf(selected);
+  const status = statuses.get(selected);
+  const loopType = status?.loopType ?? "loop";
+  return `loop ${index + 1}/${ordered.length} · ${loopType} · tab switch`;
 }
 
 function safeParse(iso: string): number {

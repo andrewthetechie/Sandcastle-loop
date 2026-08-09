@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
   buildTuiStatus,
+  listTuiStatusSnapshotPaths,
+  parseTuiStatusFileName,
+  tuiLegacyStatusPath,
+  tuiStatusFileName,
   tuiStatusPath,
   tuiWorkingLogPath,
   writeStatusSnapshotAtomic,
@@ -96,7 +100,7 @@ test("buildTuiStatus carries stopReason and extraReviewRound when present", () =
   assert.deepEqual(status.extraReviewRound, { current: 1, max: 3 });
 });
 
-test("writeStatusSnapshotAtomic yields a complete, parseable status.json", () => {
+test("writeStatusSnapshotAtomic yields a complete, parseable status-<loopType>.json", () => {
   const dir = mkdtempSync(join(tmpdir(), "tui-status-"));
   try {
     const status = buildTuiStatus(
@@ -106,7 +110,7 @@ test("writeStatusSnapshotAtomic yields a complete, parseable status.json", () =>
     );
     writeStatusSnapshotAtomic(dir, status);
 
-    const raw = readFileSync(join(dir, "status.json"), "utf8");
+    const raw = readFileSync(join(dir, "status-prd.json"), "utf8");
     assert.equal(raw.endsWith("\n"), true);
     const parsed = JSON.parse(raw) as TuiStatus;
     assert.deepEqual(parsed, status);
@@ -132,7 +136,7 @@ test("writeStatusSnapshotAtomic overwrites the previous snapshot in place", () =
     writeStatusSnapshotAtomic(dir, second);
 
     const parsed = JSON.parse(
-      readFileSync(join(dir, "status.json"), "utf8"),
+      readFileSync(join(dir, "status-prd.json"), "utf8"),
     ) as TuiStatus;
     assert.deepEqual(parsed, second);
   } finally {
@@ -142,7 +146,15 @@ test("writeStatusSnapshotAtomic overwrites the previous snapshot in place", () =
 
 test("path helpers resolve under .sandcastle/tui and sanitize run names", () => {
   assert.equal(
-    tuiStatusPath("/repo"),
+    tuiStatusFileName("backlog"),
+    "status-backlog.json",
+  );
+  assert.equal(
+    tuiStatusPath("pr-review", "/repo"),
+    "/repo/.sandcastle/tui/status-pr-review.json",
+  );
+  assert.equal(
+    tuiLegacyStatusPath("/repo"),
     "/repo/.sandcastle/tui/status.json",
   );
   assert.equal(
@@ -153,4 +165,85 @@ test("path helpers resolve under .sandcastle/tui and sanitize run names", () => 
     tuiWorkingLogPath("", "/repo"),
     "/repo/.sandcastle/tui/logs/agent.log",
   );
+});
+
+test("parseTuiStatusFileName accepts namespaced and legacy snapshots", () => {
+  assert.deepEqual(parseTuiStatusFileName("status.json"), {
+    fileName: "status.json",
+    legacy: true,
+  });
+  assert.deepEqual(parseTuiStatusFileName("status-prd.json"), {
+    fileName: "status-prd.json",
+    loopType: "prd",
+    legacy: false,
+  });
+  assert.deepEqual(parseTuiStatusFileName("status-backlog.json"), {
+    fileName: "status-backlog.json",
+    loopType: "backlog",
+    legacy: false,
+  });
+  assert.deepEqual(parseTuiStatusFileName("status-pr-review.json"), {
+    fileName: "status-pr-review.json",
+    loopType: "pr-review",
+    legacy: false,
+  });
+  assert.equal(parseTuiStatusFileName("status-unknown.json"), null);
+  assert.equal(parseTuiStatusFileName(".status-prd.json.tmp-123"), null);
+  assert.equal(parseTuiStatusFileName("coder.log"), null);
+});
+
+test("listTuiStatusSnapshotPaths returns only status snapshot files, sorted", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tui-status-"));
+  try {
+    writeFileSync(join(dir, "status-prd.json"), "{}", "utf8");
+    writeFileSync(join(dir, "status-backlog.json"), "{}", "utf8");
+    writeFileSync(join(dir, "status.json"), "{}", "utf8");
+    writeFileSync(join(dir, ".status-prd.json.tmp-abc"), "", "utf8");
+    mkdirSync(join(dir, "logs"), { recursive: true });
+    writeFileSync(join(dir, "logs", "agent.log"), "", "utf8");
+
+    const paths = listTuiStatusSnapshotPaths(dir);
+    assert.deepEqual(paths, [
+      join(dir, "status-backlog.json"),
+      join(dir, "status-prd.json"),
+      join(dir, "status.json"),
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("two loop types can write snapshots to the same directory without clobbering", () => {
+  const dir = mkdtempSync(join(tmpdir(), "tui-status-"));
+  try {
+    const backlog = buildTuiStatus(
+      { ...baseContext, loopType: "backlog", loopId: "bugs" },
+      { kind: "host", name: "startup", startedAt: "2026-07-02T10:00:00.000Z" },
+      new Date("2026-07-02T10:00:01.000Z"),
+    );
+    const prReview = buildTuiStatus(
+      { ...baseContext, loopType: "pr-review", loopId: "all" },
+      { kind: "host", name: "startup", startedAt: "2026-07-02T10:00:00.000Z" },
+      new Date("2026-07-02T10:00:02.000Z"),
+    );
+    writeStatusSnapshotAtomic(dir, backlog);
+    writeStatusSnapshotAtomic(dir, prReview);
+
+    assert.ok(existsSync(join(dir, "status-backlog.json")));
+    assert.ok(existsSync(join(dir, "status-pr-review.json")));
+
+    const parsedBacklog = JSON.parse(
+      readFileSync(join(dir, "status-backlog.json"), "utf8"),
+    ) as TuiStatus;
+    const parsedPrReview = JSON.parse(
+      readFileSync(join(dir, "status-pr-review.json"), "utf8"),
+    ) as TuiStatus;
+
+    assert.equal(parsedBacklog.loopType, "backlog");
+    assert.equal(parsedBacklog.loopId, "bugs");
+    assert.equal(parsedPrReview.loopType, "pr-review");
+    assert.equal(parsedPrReview.loopId, "all");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

@@ -1,2 +1,4 @@
 context/
 node_modules/
+.sandcastle/
+.pi-subagents/

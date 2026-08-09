@@ -3,28 +3,32 @@ import { basename } from "node:path";
 import React from "react";
 import { Box, Text, render, useApp, useInput, useStdout } from "ink";
 import {
+  listTuiStatusSnapshotPaths,
   tuiDir,
-  tuiStatusPath,
   type TuiStatus,
 } from "./tui-status.mts";
 import {
   deriveStatusView,
   deriveWorkingLogTarget,
+  formatLoopSwitcherLabel,
+  orderSnapshotPaths,
+  pickFreshestSnapshot,
+  selectAdjacentSnapshot,
   type StatusView,
   type TuiLiveness,
 } from "./tui-view.mts";
 
 // ---------------------------------------------------------------------------
-// Read-only I/O helpers (never write to or signal the loop; ADR 0002/0003).
+// Read-only I/O helpers (never write to or signal the loop; ADR 0002/0004).
 // ---------------------------------------------------------------------------
 
 const POLL_INTERVAL_MS = 1_000;
 const TICK_INTERVAL_MS = 1_000;
 
-/** Parse the atomic status snapshot. Returns null when absent or unreadable. */
-function readStatusSnapshot(cwd: string): TuiStatus | null {
+/** Parse an atomic status snapshot at the given path. Returns null when absent or unreadable. */
+function readStatusSnapshot(path: string): TuiStatus | null {
   try {
-    const raw = readFileSync(tuiStatusPath(cwd), "utf8");
+    const raw = readFileSync(path, "utf8");
     const parsed = JSON.parse(raw) as TuiStatus;
     if (parsed && typeof parsed === "object" && parsed.step) return parsed;
     return null;
@@ -210,7 +214,7 @@ function WorkingLogPane(props: {
 }
 
 // ---------------------------------------------------------------------------
-// App
+// Multi-loop state
 // ---------------------------------------------------------------------------
 
 interface LogState {
@@ -218,55 +222,128 @@ interface LogState {
   lines: string[];
 }
 
+interface LoopPaneState {
+  status: TuiStatus | null;
+  prevStatus: TuiStatus | null;
+  log: LogState;
+  scrollOffset: number;
+}
+
+/** Build the initial map from whatever snapshots already exist on disk. */
+function buildInitialLoops(cwd: string): Map<string, LoopPaneState> {
+  const loops = new Map<string, LoopPaneState>();
+  for (const path of listTuiStatusSnapshotPaths(tuiDir(cwd))) {
+    const status = readStatusSnapshot(path);
+    if (status === null) continue;
+    loops.set(path, {
+      status,
+      prevStatus: null,
+      log: { path: null, lines: [] },
+      scrollOffset: 0,
+    });
+  }
+  return loops;
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+
 function TuiApp(props: { cwd: string }): React.ReactElement {
   const { cwd } = props;
   const { exit } = useApp();
   const { stdout } = useStdout();
 
-  const [status, setStatus] = React.useState<TuiStatus | null>(() =>
-    readStatusSnapshot(cwd),
-  );
+  const loopsRef = React.useRef<Map<string, LoopPaneState>>(buildInitialLoops(cwd));
+  const [selected, setSelected] = React.useState<string | null>(() => {
+    const statusMap = new Map(
+      [...loopsRef.current.entries()]
+        .filter((entry): entry is [string, LoopPaneState & { status: TuiStatus }] => entry[1].status !== null)
+        .map(([path, loop]) => [path, loop.status]),
+    );
+    return pickFreshestSnapshot([...statusMap.keys()], statusMap);
+  });
   const [now, setNow] = React.useState<Date>(() => new Date());
-  const [log, setLog] = React.useState<LogState>({ path: null, lines: [] });
-  const [scrollOffset, setScrollOffset] = React.useState(0);
+  const [tick, setTick] = React.useState(0);
 
-  const prevStatusRef = React.useRef<TuiStatus | null>(null);
-  const logRef = React.useRef<LogState>(log);
-  logRef.current = log;
+  const selectedRef = React.useRef(selected);
+  selectedRef.current = selected;
+
+  const updateSelectedScroll = React.useCallback((fn: (offset: number) => number) => {
+    const path = selectedRef.current;
+    if (path === null) return;
+    const loop = loopsRef.current.get(path);
+    if (!loop) return;
+    const next = new Map(loopsRef.current);
+    next.set(path, { ...loop, scrollOffset: fn(loop.scrollOffset) });
+    loopsRef.current = next;
+    setTick((t) => t + 1);
+  }, []);
 
   const refresh = React.useCallback(() => {
-    const next = readStatusSnapshot(cwd);
     setNow(new Date());
-    if (next === null) {
-      setStatus(null);
-      prevStatusRef.current = null;
-      return;
+
+    const paths = listTuiStatusSnapshotPaths(tuiDir(cwd));
+    const next = new Map(loopsRef.current);
+
+    for (const path of paths) {
+      const status = readStatusSnapshot(path);
+      if (status === null) {
+        // Torn read: keep the last known state so the pane doesn't flicker.
+        continue;
+      }
+
+      const existing = next.get(path) ?? {
+        status: null,
+        prevStatus: null,
+        log: { path: null, lines: [] },
+        scrollOffset: 0,
+      };
+
+      const prev = existing.status;
+      const target = deriveWorkingLogTarget(prev, status);
+      let log = existing.log;
+      let scrollOffset = existing.scrollOffset;
+
+      if (target.action === "clear") {
+        log = { path: target.activeLogPath, lines: readLogLines(target.activeLogPath) };
+        scrollOffset = 0;
+      } else if (target.action === "continue") {
+        log = { path: target.activeLogPath, lines: readLogLines(target.activeLogPath) };
+      }
+      // "freeze" (host step) keeps whatever the log pane was already showing.
+
+      next.set(path, { status, prevStatus: prev, log, scrollOffset });
     }
 
-    const target = deriveWorkingLogTarget(prevStatusRef.current, next);
-    if (target.action === "clear") {
-      setLog({ path: target.activeLogPath, lines: readLogLines(target.activeLogPath) });
-      setScrollOffset(0);
-    } else if (target.action === "continue") {
-      setLog({
-        path: target.activeLogPath,
-        lines: readLogLines(target.activeLogPath),
-      });
+    // Drop loops whose snapshot files have disappeared.
+    for (const path of next.keys()) {
+      if (!paths.includes(path)) next.delete(path);
     }
-    // "freeze" (host step) keeps whatever the log pane was already showing.
 
-    prevStatusRef.current = next;
-    setStatus(next);
+    loopsRef.current = next;
+
+    setSelected((current) => {
+      if (current !== null && next.has(current)) return current;
+      const statusMap = new Map(
+        [...next.entries()]
+          .filter((entry): entry is [string, LoopPaneState & { status: TuiStatus }] => entry[1].status !== null)
+          .map(([path, loop]) => [path, loop.status]),
+      );
+      return pickFreshestSnapshot([...statusMap.keys()], statusMap);
+    });
+
+    setTick((t) => t + 1);
   }, [cwd]);
 
   React.useEffect(() => {
     refresh();
     const poll = setInterval(refresh, POLL_INTERVAL_MS);
-    const tick = setInterval(() => setNow(new Date()), TICK_INTERVAL_MS);
+    const tickTimer = setInterval(() => setNow(new Date()), TICK_INTERVAL_MS);
 
     let watcher: FSWatcher | null = null;
     try {
-      // Recursive watch covers both status.json (rename) and logs/*.log appends.
+      // Recursive watch covers all status-<loopType>.json renames and logs/*.log appends.
       watcher = watch(tuiDir(cwd), { recursive: true }, () => refresh());
     } catch {
       // Some platforms lack recursive watch; the 1s poll is the safety net.
@@ -275,7 +352,7 @@ function TuiApp(props: { cwd: string }): React.ReactElement {
 
     return () => {
       clearInterval(poll);
-      clearInterval(tick);
+      clearInterval(tickTimer);
       if (watcher) watcher.close();
     };
   }, [cwd, refresh]);
@@ -285,14 +362,37 @@ function TuiApp(props: { cwd: string }): React.ReactElement {
       exit();
       return;
     }
+
+    const paths = orderSnapshotPaths([...loopsRef.current.keys()]);
+    if (paths.length === 0) return;
+
+    if (key.tab && key.shift) {
+      const next = selectAdjacentSnapshot(selected, paths, -1);
+      if (next !== null) setSelected(next);
+      return;
+    }
+    if (key.tab || input === "n") {
+      const next = selectAdjacentSnapshot(selected, paths, 1);
+      if (next !== null) setSelected(next);
+      return;
+    }
+    if (input === "p") {
+      const next = selectAdjacentSnapshot(selected, paths, -1);
+      if (next !== null) setSelected(next);
+      return;
+    }
+
     if (key.upArrow) {
-      setScrollOffset((offset) => offset + 1);
+      updateSelectedScroll((offset) => offset + 1);
     } else if (key.downArrow) {
-      setScrollOffset((offset) => Math.max(0, offset - 1));
+      updateSelectedScroll((offset) => Math.max(0, offset - 1));
     } else if (input === "g") {
-      setScrollOffset(logRef.current.lines.length);
+      updateSelectedScroll(() => {
+        const loop = selected ? loopsRef.current.get(selected) : undefined;
+        return loop?.log.lines.length ?? 0;
+      });
     } else if (input === "G") {
-      setScrollOffset(0);
+      updateSelectedScroll(() => 0);
     }
   });
 
@@ -302,7 +402,8 @@ function TuiApp(props: { cwd: string }): React.ReactElement {
   const logWidth = Math.max(24, columns - statusWidth - 1);
   const paneHeight = Math.max(6, rows - 2);
 
-  if (status === null) {
+  const loops = loopsRef.current;
+  if (loops.size === 0) {
     return h(
       Box,
       { flexDirection: "column", padding: 1 },
@@ -310,17 +411,42 @@ function TuiApp(props: { cwd: string }): React.ReactElement {
       h(
         Text,
         { dimColor: true },
-        "Waiting for a loop… (no .sandcastle/tui/status.json yet)",
+        "Waiting for a loop… (no .sandcastle/tui/status*.json yet)",
       ),
       h(Text, { dimColor: true }, "Press q to quit."),
     );
   }
 
-  const view = deriveStatusView(status, now, {
-    pidAlive: probePidAlive(status.pid),
+  const selectedPath = selected ?? [...loops.keys()][0];
+  const loop = loops.get(selectedPath);
+  if (!loop || loop.status === null) {
+    return h(
+      Box,
+      { flexDirection: "column", padding: 1 },
+      h(Text, { bold: true }, "Sandcastle Companion TUI"),
+      h(Text, { dimColor: true }, "Reading loop snapshot…"),
+      h(Text, { dimColor: true }, "Press q to quit."),
+    );
+  }
+
+  const view = deriveStatusView(loop.status, now, {
+    pidAlive: probePidAlive(loop.status.pid),
   });
-  const target = deriveWorkingLogTarget(prevStatusRef.current, status);
+  const target = deriveWorkingLogTarget(loop.prevStatus, loop.status);
   const frozenLabel = target.action === "freeze" ? view.stepLabel : null;
+
+  const switcherLabel = formatLoopSwitcherLabel(
+    selectedPath,
+    [...loops.keys()],
+    new Map(
+      [...loops.entries()]
+        .filter((entry): entry is [string, LoopPaneState & { status: TuiStatus }] => entry[1].status !== null)
+        .map(([path, l]) => [path, l.status]),
+    ),
+  );
+  const footer = switcherLabel
+    ? `q quit · ↑/↓ scroll · g top · G bottom · tab/p/n prev/next · ${switcherLabel}`
+    : "q quit · ↑/↓ scroll · g top · G bottom";
 
   return h(
     Box,
@@ -330,23 +456,15 @@ function TuiApp(props: { cwd: string }): React.ReactElement {
       { flexDirection: "row" },
       h(StatusPane, { view, width: statusWidth }),
       h(WorkingLogPane, {
-        lines: log.lines,
-        logPath: log.path,
+        lines: loop.log.lines,
+        logPath: loop.log.path,
         frozenLabel,
         width: logWidth,
         height: paneHeight,
-        scrollOffset,
+        scrollOffset: loop.scrollOffset,
       }),
     ),
-    h(
-      Box,
-      { paddingX: 1 },
-      h(
-        Text,
-        { dimColor: true },
-        "q quit · ↑/↓ scroll · g top · G bottom",
-      ),
-    ),
+    h(Box, { paddingX: 1 }, h(Text, { dimColor: true }, footer)),
   );
 }
 

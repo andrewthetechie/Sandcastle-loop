@@ -29,7 +29,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { hostname } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { listTuiStatusSnapshotPaths } from "./tui-status.mts";
 
 const MAX_LOG_TAIL_BYTES = 64 * 1024;
 const MAX_LOG_FILES = 12;
@@ -141,14 +142,14 @@ export function recordFailureDiagnostic(
     );
 
     capture("tui_snapshot", () => {
-      const snapshotPath = join(
-        deps.repoRoot,
-        ".sandcastle",
-        "tui",
-        "status.json",
+      const paths = listTuiStatusSnapshotPaths(
+        join(deps.repoRoot, ".sandcastle", "tui"),
       );
-      if (existsSync(snapshotPath)) {
-        copyFileSync(snapshotPath, join(bundleDir, "tui-status.json"));
+      for (const snapshotPath of paths) {
+        copyFileSync(
+          snapshotPath,
+          join(bundleDir, `tui-${basename(snapshotPath)}`),
+        );
       }
     });
 

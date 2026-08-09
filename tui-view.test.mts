@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { TuiStatus, TuiStep } from "./tui-status.mts";
-import { deriveStatusView, deriveWorkingLogTarget } from "./tui-view.mts";
+import {
+  deriveStatusView,
+  deriveWorkingLogTarget,
+  formatLoopSwitcherLabel,
+  orderSnapshotPaths,
+  pickFreshestSnapshot,
+  selectAdjacentSnapshot,
+} from "./tui-view.mts";
 
 function status(overrides: Partial<TuiStatus> = {}): TuiStatus {
   return {
@@ -185,4 +192,72 @@ test("an agent step following a host step clears (host is not the same step)", (
   const next = status({ step: agentStep("/logs/coder.log") });
   const target = deriveWorkingLogTarget(prev, next);
   assert.deepEqual(target, { action: "clear", activeLogPath: "/logs/coder.log" });
+});
+
+test("orderSnapshotPaths sorts by filename", () => {
+  assert.deepEqual(
+    orderSnapshotPaths([
+      "/repo/.sandcastle/tui/status-prd.json",
+      "/repo/.sandcastle/tui/status-backlog.json",
+      "/repo/.sandcastle/tui/status.json",
+    ]),
+    [
+      "/repo/.sandcastle/tui/status-backlog.json",
+      "/repo/.sandcastle/tui/status-prd.json",
+      "/repo/.sandcastle/tui/status.json",
+    ],
+  );
+});
+
+test("pickFreshestSnapshot selects the most recently updated status", () => {
+  const statuses = new Map([
+    ["/a/status-backlog.json", status({ updatedAt: "2026-07-02T10:05:00.000Z" })],
+    ["/a/status-prd.json", status({ updatedAt: "2026-07-02T10:06:00.000Z" })],
+    ["/a/status-pr-review.json", status({ updatedAt: "2026-07-02T10:04:00.000Z" })],
+  ]);
+  assert.equal(
+    pickFreshestSnapshot([...statuses.keys()], statuses),
+    "/a/status-prd.json",
+  );
+});
+
+test("selectAdjacentSnapshot cycles in filename order with wraparound", () => {
+  const paths = orderSnapshotPaths([
+    "/a/status-prd.json",
+    "/a/status-backlog.json",
+    "/a/status-pr-review.json",
+  ]);
+  assert.equal(selectAdjacentSnapshot(null, paths, 1), paths[0]);
+  assert.equal(
+    selectAdjacentSnapshot(paths[0], paths, 1),
+    paths[1],
+  );
+  assert.equal(
+    selectAdjacentSnapshot(paths[2], paths, 1),
+    paths[0],
+  );
+  assert.equal(
+    selectAdjacentSnapshot(paths[0], paths, -1),
+    paths[2],
+  );
+  assert.equal(
+    selectAdjacentSnapshot("/missing", paths, 1),
+    paths[0],
+  );
+});
+
+test("formatLoopSwitcherLabel returns null for a single loop and a label for many", () => {
+  const statuses = new Map([
+    ["/a/status-backlog.json", status({ loopType: "backlog" })],
+    ["/a/status-prd.json", status({ loopType: "prd" })],
+  ]);
+  assert.equal(formatLoopSwitcherLabel("/a/status-backlog.json", ["/a/status-backlog.json"], statuses), null);
+  assert.equal(
+    formatLoopSwitcherLabel("/a/status-prd.json", [...statuses.keys()], statuses),
+    "loop 2/2 · prd · tab switch",
+  );
+  assert.equal(
+    formatLoopSwitcherLabel("/a/status-backlog.json", [...statuses.keys()], statuses),
+    "loop 1/2 · backlog · tab switch",
+  );
 });

@@ -1,15 +1,18 @@
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
- * The status snapshot is the single contract between the loop-side emitter and
- * the read-only Companion TUI (ADR 0002). It is written atomically at every step
- * transition to `.sandcastle/tui/status.json`. Keep this shape in exact sync
- * with the PRD; both writer and reader import it so they cannot drift.
+ * The status snapshot is the contract between the loop-side emitter and the
+ * read-only Companion TUI (ADR 0002/0004). It is written atomically at every
+ * step transition to `.sandcastle/tui/status-<loopType>.json` (one file per
+ * loop type; legacy `status.json` is still discovered). Keep this shape in
+ * exact sync with the PRD; both writer and reader import it so they cannot drift.
  */
 export const TUI_STATUS_SCHEMA_VERSION = 1 as const;
 
 export type TuiLoopType = "prd" | "backlog" | "pr-review";
+
+export const TUI_LOOP_TYPES: readonly TuiLoopType[] = ["prd", "backlog", "pr-review"];
 
 /** `escalation` is reserved for future runners; neither v4 nor backlog emit it.
     `pr_review` is for run-pr-review-v1. */
@@ -138,9 +141,63 @@ export function tuiDir(cwd: string = process.cwd()): string {
   return join(cwd, ...TUI_DIR_SEGMENTS);
 }
 
-/** Absolute path to the single status snapshot. */
-export function tuiStatusPath(cwd: string = process.cwd()): string {
-  return join(tuiDir(cwd), "status.json");
+/** Legacy single-loop status snapshot filename. Kept for backward-compatible discovery. */
+export const TUI_LEGACY_STATUS_FILE_NAME = "status.json";
+
+/** Namespaced status snapshot filename for a given loop type. */
+export function tuiStatusFileName(loopType: TuiLoopType): string {
+  return `status-${loopType}.json`;
+}
+
+/** Absolute path to the namespaced status snapshot for a loop type. */
+export function tuiStatusPath(loopType: TuiLoopType, cwd: string = process.cwd()): string {
+  return join(tuiDir(cwd), tuiStatusFileName(loopType));
+}
+
+/** Absolute path to the legacy single status snapshot. */
+export function tuiLegacyStatusPath(cwd: string = process.cwd()): string {
+  return join(tuiDir(cwd), TUI_LEGACY_STATUS_FILE_NAME);
+}
+
+/**
+ * Matches `status.json` (legacy) or `status-<loopType>.json` (namespaced).
+ * Loop types are constrained to the known union at runtime so new loop types
+ * must add themselves to TUI_LOOP_TYPES.
+ */
+export const TUI_STATUS_SNAPSHOT_FILE_RE = /^status(?:-[a-z0-9-]+)?\.json$/;
+
+export interface TuiStatusFileInfo {
+  fileName: string;
+  loopType?: TuiLoopType;
+  legacy: boolean;
+}
+
+/**
+ * Parse a filename discovered in the TUI directory. Returns null for temp files,
+ * working logs, or unknown suffixes. The legacy `status.json` is accepted so an
+ * older emitter still shows up in the TUI.
+ */
+export function parseTuiStatusFileName(fileName: string): TuiStatusFileInfo | null {
+  if (!TUI_STATUS_SNAPSHOT_FILE_RE.test(fileName)) return null;
+  if (fileName === TUI_LEGACY_STATUS_FILE_NAME) {
+    return { fileName, legacy: true };
+  }
+  const suffix = fileName.slice("status-".length, -".json".length);
+  const loopType = suffix as TuiLoopType;
+  if (!TUI_LOOP_TYPES.includes(loopType)) return null;
+  return { fileName, loopType, legacy: false };
+}
+
+/** List candidate status snapshot paths in the TUI directory, sorted. */
+export function listTuiStatusSnapshotPaths(dir: string): string[] {
+  try {
+    return readdirSync(dir)
+      .filter((name) => parseTuiStatusFileName(name) !== null)
+      .map((name) => join(dir, name))
+      .sort();
+  } catch {
+    return [];
+  }
 }
 
 /** Absolute path to the per-agent-step working log for a given run name. */
@@ -161,16 +218,18 @@ function sanitizeRunName(runName: string): string {
 }
 
 /**
- * Write `status.json` atomically: serialize to a unique temp file in the same
- * directory, then `renameSync` over the target. A concurrent reader therefore
- * observes either the old file or the complete new file, never a partial write.
+ * Write the namespaced status snapshot atomically: serialize to a unique temp
+ * file in the same directory, then `renameSync` over the target. A concurrent
+ * reader therefore observes either the old file or the complete new file, never
+ * a partial write.
  */
 export function writeStatusSnapshotAtomic(dir: string, status: TuiStatus): void {
   mkdirSync(dir, { recursive: true });
-  const target = join(dir, "status.json");
+  const fileName = tuiStatusFileName(status.loopType);
+  const target = join(dir, fileName);
   const tmp = join(
     dir,
-    `.status.json.tmp-${process.pid}-${Date.now()}-${Math.random()
+    `.${fileName}.tmp-${process.pid}-${Date.now()}-${Math.random()
       .toString(36)
       .slice(2, 8)}`,
   );

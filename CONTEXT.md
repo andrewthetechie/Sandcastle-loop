@@ -121,7 +121,7 @@ A step that is host-side loop work with no agent and no working log — sandbox 
 _Avoid_: Host phase, gate, host task
 
 **Status snapshot**:
-The single atomically-rewritten `.sandcastle/tui/status.json` the loop replaces at every step transition. It is the authoritative source for the status pane and holds loop metadata, the current iteration/round/phase, the ticket, and the current step (with its start time and, for agent steps, the working-log path).
+The atomically-rewritten `.sandcastle/tui/status-<loopType>.json` the loop replaces at every step transition (legacy `status.json` is still discovered). There is one file per loop type so multiple loops can run concurrently in the same repo without clobbering each other. It is the authoritative source for the status pane and holds loop metadata, the current iteration/round/phase, the ticket, and the current step (with its start time and, for agent steps, the working-log path).
 _Avoid_: Status file, state dump, metrics record
 
 **Working log**:
