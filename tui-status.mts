@@ -9,10 +9,11 @@ import { join } from "node:path";
  */
 export const TUI_STATUS_SCHEMA_VERSION = 1 as const;
 
-export type TuiLoopType = "prd" | "backlog";
+export type TuiLoopType = "prd" | "backlog" | "pr-review";
 
-/** `escalation` is reserved for future runners; neither v4 nor backlog emit it. */
-export type TuiPhase = "normal_issue" | "extra_review" | "escalation";
+/** `escalation` is reserved for future runners; neither v4 nor backlog emit it.
+    `pr_review` is for run-pr-review-v1. */
+export type TuiPhase = "normal_issue" | "extra_review" | "escalation" | "pr_review";
 
 export type TuiLoopState = "running" | "stopped";
 
