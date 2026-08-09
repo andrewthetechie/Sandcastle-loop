@@ -7,10 +7,10 @@ export type CustomAgentBashPermission =
 export interface CustomAgentPermission {
   edit: CustomAgentPermissionValue;
   bash: CustomAgentBashPermission;
-  task: "deny";
-  question: "deny";
-  webfetch: "deny";
-  websearch: "deny";
+  task: CustomAgentPermissionValue;
+  question: CustomAgentPermissionValue;
+  webfetch: CustomAgentPermissionValue;
+  websearch: CustomAgentPermissionValue;
 }
 
 export interface CustomAgentConfig {
@@ -107,6 +107,49 @@ export const INITIAL_ISSUE_DECOMPOSER_AGENT_CONFIG: CustomAgentConfig = {
 export const SUBTASK_READINESS_AGENT_CONFIG: CustomAgentConfig = {
   name: "subtask-readiness",
   description: "Readiness-gates one generated child issue before implementation",
+  temperature: 0.1,
+  permission: {
+    edit: "deny",
+    bash: "deny",
+    ...DENY_ONLY_PERMISSION,
+  },
+};
+
+// ---------------------------------------------------------------------------
+// PR Review agents (run-pr-review-v1.mts)
+// ---------------------------------------------------------------------------
+
+export const PR_REVIEW_AGENT_CONFIG: CustomAgentConfig = {
+  name: "pr-review",
+  description:
+    "Reviews a PR diff, invokes Standards and Spec sub-agents sequentially, fixes all actionable findings, and commits",
+  temperature: 0.2,
+  permission: {
+    edit: "allow",
+    bash: "allow",
+    task: "allow",
+    question: "deny",
+    webfetch: "deny",
+    websearch: "deny",
+  },
+};
+
+export const PR_STANDARDS_REVIEW_AGENT_CONFIG: CustomAgentConfig = {
+  name: "pr-standards-review",
+  description:
+    "Read-only sub-agent: reviews a PR diff against coding standards and the Fowler smell baseline",
+  temperature: 0.1,
+  permission: {
+    edit: "deny",
+    bash: "deny",
+    ...DENY_ONLY_PERMISSION,
+  },
+};
+
+export const PR_SPEC_REVIEW_AGENT_CONFIG: CustomAgentConfig = {
+  name: "pr-spec-review",
+  description:
+    "Read-only sub-agent: reviews a PR diff against the PR description and linked issues for spec compliance",
   temperature: 0.1,
   permission: {
     edit: "deny",
