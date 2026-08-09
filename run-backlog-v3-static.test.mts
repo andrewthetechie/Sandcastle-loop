@@ -186,6 +186,28 @@ test("backlog-v3 formats readiness siblings compactly and excludes the child und
   );
 });
 
+test("backlog-v3 accepts --no-pr flag", () => {
+  assert.match(source, /--no-pr/);
+  assert.match(source, /import \{ hasFlag, readCliStringFlag \} from "\.\/cli-string-flag\.mts";/);
+  assert.match(source, /const NO_PR = hasFlag\(process\.argv, "--no-pr"\);/);
+  assert.match(
+    source,
+    /Auto-PR on Review: \$\{NO_PR \? "disabled \(--no-pr\)" : "enabled"\}/,
+  );
+});
+
+test("backlog-v3 exports formatParentPrBody", () => {
+  assert.match(source, /import \{ formatParentPrBody \} from "\.\/format-parent-pr-body\.mts";/);
+  assert.match(source, /formatParentPrBody\(/);
+});
+
+test("backlog-v3 creates PR on clean/partial delivery unless --no-pr", () => {
+  assert.match(source, /if \(!NO_PR\) \{/);
+  assert.match(source, /"pr",\s*"list",\s*"--head"/);
+  assert.match(source, /"pr",\s*"create"/);
+  assert.match(source, /formatParentPrBody\(/);
+});
+
 test("older runners remain outside the Issue-as-PRD outer-loop wiring", () => {
   if (prdV4) {
     assert.doesNotMatch(prdV4, /runIssueAsPrdParent\(/);

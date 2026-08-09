@@ -14,7 +14,7 @@
 //     [--base-branch main] [--dry-run] [--no-pr]
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { readCliStringFlag } from "./cli-string-flag.mts";
+import { hasFlag, readCliStringFlag } from "./cli-string-flag.mts";
 import {
   accumulationBranchName,
   childBranchName,
@@ -36,10 +36,6 @@ function readFlag(flag: string): string | undefined {
   }
 }
 
-function hasFlag(flag: string): boolean {
-  return process.argv.includes(flag);
-}
-
 const issueRaw = readFlag("--issue");
 if (!issueRaw) throw new Error(`${USAGE}\n\nMissing required argument: --issue <N>`);
 const parentNumber = Number.parseInt(issueRaw, 10);
@@ -48,8 +44,8 @@ if (!Number.isInteger(parentNumber) || parentNumber < 1) {
 }
 
 const baseBranch = readFlag("--base-branch") ?? "main";
-const DRY_RUN = hasFlag("--dry-run");
-const NO_PR = hasFlag("--no-pr");
+const DRY_RUN = hasFlag(process.argv, "--dry-run");
+const NO_PR = hasFlag(process.argv, "--no-pr");
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -1,3 +1,8 @@
+/** Returns true when the exact flag string appears anywhere in argv. */
+export function hasFlag(argv: readonly string[], flag: string): boolean {
+  return argv.includes(flag);
+}
+
 /** Reads one optional CLI string flag in either `--flag value` or `--flag=value` form. */
 export function readCliStringFlag(
   argv: readonly string[],

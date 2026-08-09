@@ -122,7 +122,8 @@ import {
   extractDroppedRoleNameFromDependentObjectsError,
   formatHostValidationFailureFeedback,
 } from "./host-validation-feedback.mts";
-import { readCliStringFlag } from "./cli-string-flag.mts";
+import { hasFlag, readCliStringFlag } from "./cli-string-flag.mts";
+import { formatParentPrBody } from "./format-parent-pr-body.mts";
 import {
   createLivelockWatchdogSandcastleRunOptions,
   resolveRound1CoderLivelockControlFlow,
@@ -261,7 +262,7 @@ const HOST_COMMAND_ENV = createHostCommandEnv({
 // ---------------------------------------------------------------------------
 
 const USAGE =
-  "Usage: tsx run-backlog-v3.mts --label <name[,name2]> [--base-branch <name>] [--idle-timeout <seconds>] [--model-coder <model>] [--model-rework <model>]";
+  "Usage: tsx run-backlog-v3.mts --label <name[,name2]> [--base-branch <name>] [--idle-timeout <seconds>] [--model-coder <model>] [--model-rework <model>] [--no-pr]";
 
 function readStringFlag(flag: string): string | undefined {
   try {
@@ -300,8 +301,11 @@ if (idleRaw !== undefined) {
   idleTimeoutSeconds = parsed;
 }
 
+const NO_PR = hasFlag(process.argv, "--no-pr");
+
 console.log(`Backlog label(s): ${labels.join(", ")}`);
 console.log(`Base branch: ${baseBranch} (fork point: origin/${baseBranch})`);
+console.log(`Auto-PR on Review: ${NO_PR ? "disabled (--no-pr)" : "enabled"}`);
 console.log(`Idle timeout: ${idleTimeoutSeconds}s`);
 console.log(
   [
@@ -3982,6 +3986,68 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
       } catch (err) {
         console.warn(
           `Warning: failed to delete queue label ${currentState.queueLabel}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    if (!NO_PR) {
+      try {
+        const prChildren = client
+          .listIssues({
+            state: "all",
+            labels: [currentState.queueLabel],
+            limit: 1000,
+          })
+          .filter((issue) => issue.number !== parent.number)
+          .sort((a, b) => a.number - b.number);
+        const existingPrs = ghJson<
+          { number: number; url: string }[]
+        >([
+          "pr",
+          "list",
+          "--head",
+          currentState.accumulationBranch,
+          "--state",
+          "open",
+          "--json",
+          "number,url",
+        ]);
+        if (existingPrs.length === 0) {
+          const prBody = formatParentPrBody({
+            parentNumber: parent.number,
+            parentTitle: parent.title,
+            children: prChildren.map((c) => ({
+              number: c.number,
+              title: c.title,
+              state: c.state,
+            })),
+          });
+          execFileSync(
+            "gh",
+            [
+              "pr",
+              "create",
+              "--title",
+              parent.title,
+              "--base",
+              baseBranch,
+              "--head",
+              currentState.accumulationBranch,
+              "--body",
+              prBody,
+            ],
+            { stdio: "inherit" },
+          );
+          console.log(
+            `  PR created for ${currentState.accumulationBranch} → ${baseBranch}`,
+          );
+        } else {
+          console.log(
+            `  PR already exists for ${currentState.accumulationBranch}: #${existingPrs[0]!.number}`,
+          );
+        }
+      } catch (err) {
+        console.error(
+          `  PR creation failed for parent #${parent.number}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
     }
