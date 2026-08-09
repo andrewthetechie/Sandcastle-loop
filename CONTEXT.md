@@ -135,3 +135,29 @@ _Avoid_: Left pane, info pane, header
 **Working-log pane**:
 The right pane of the Companion TUI. Tails the current agent step's working log and freezes it during host steps.
 _Avoid_: Right pane, log pane, output pane
+
+### PR review loop
+
+**PR risk rating**:
+A 0–5 assessment assigned by the coordinating `pr-review` agent to the combined change (original PR plus any fixes it applied). It judges the change itself, not CI or external check status. Distinct from a specialist severity or confidence score.
+_Avoid_: Risk score, severity, confidence
+
+**Risk label**:
+A GitHub label `risk-N` (0 ≤ N ≤ 5) applied by the PR review loop after a successful review. It is durable state used by external automation and is replaced on re-review.
+_Avoid_: Severity label, priority label
+
+**PR review result artifact**:
+The JSON file the coordinating agent writes to `RESULT_PATH` before emitting the completion signal. It carries the risk rating, summary, findings, fixes applied, rejected findings with reasons, and optional notes. The host validates it and uses it to produce the PR comment and risk label.
+_Avoid_: Review report, findings file, output JSON
+
+**Reviewed HEAD SHA**:
+The commit SHA the PR review loop reviewed, recorded in the result artifact and the posted comment. External automation can compare it to the PR's current HEAD to detect staleness.
+_Avoid_: Review SHA, head commit
+
+**Re-review**:
+A fresh full review performed when a human removes the `ai-review-complete` label from a previously reviewed PR. The loop replaces the stale risk label and posts a new comment.
+_Avoid_: Re-run, follow-up review
+
+**Agent-authored label**:
+The `agent-authored` label applied to pull requests created by `run-backlog-v3.mts` at parent delivery. It identifies loop-created PRs for external automation.
+_Avoid_: Bot label, auto-PR label

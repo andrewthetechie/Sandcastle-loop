@@ -45,6 +45,14 @@ import { hasFlag, readCliStringFlag } from "./cli-string-flag.mts";
 import { recordMeasuredAgentRun } from "./metrics-recorder.mts";
 import { tuiEmitter } from "./tui-emitter.mts";
 import { tuiWorkingLogPath } from "./tui-status.mts";
+import { runVerifiedHostMutation } from "./verified-host-mutation.mts";
+import {
+  allRiskLabels,
+  isRiskLabel,
+  renderPrReviewComment,
+  validatePrReviewResult,
+  type PrReviewResult,
+} from "./pr-review-result.mts";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -71,6 +79,7 @@ const PR_REVIEW_USER_PROMPT_FILE = fileURLToPath(
 
 // Labels
 const AI_REVIEW_COMPLETE_LABEL = "ai-review-complete";
+const RISK_LABELS = allRiskLabels();
 
 // Idle timeout for the agent (sandcastle fails the run if stdout is silent
 // this long). Override on the command line with `--idle-timeout <seconds>`.
@@ -81,9 +90,6 @@ const SANDBOX_READY_COMMANDS: string[] = LOOP_CONFIG.setupCommands;
 
 // Git pathspec exclusions for the reviewer diff.
 const REVIEW_DIFF_EXCLUDES: string[] = [...EXTRA_REVIEW_INPUT_DIFF_EXCLUDES];
-
-// Hard cap on the reviewer diff (bytes).
-const REVIEW_DIFF_MAX_BYTES = LOOP_CONFIG.reviewDiffMaxBytes;
 
 // Files copied from the host into the worktree before the sandbox starts.
 const COPY_TO_WORKTREE: string[] = [];
@@ -280,17 +286,34 @@ function ensureLabels(): void {
     "--limit",
     "1000",
   ]);
-  if (existing.some((l) => l.name === AI_REVIEW_COMPLETE_LABEL)) return;
-  console.log(`Creating missing label '${AI_REVIEW_COMPLETE_LABEL}'`);
-  gh([
-    "label",
-    "create",
-    AI_REVIEW_COMPLETE_LABEL,
-    "--color",
-    "0e8a16",
-    "--description",
-    "AI code review completed; fixes applied and pushed.",
-  ]);
+  const have = new Set(existing.map((l) => l.name));
+
+  if (!have.has(AI_REVIEW_COMPLETE_LABEL)) {
+    console.log(`Creating missing label '${AI_REVIEW_COMPLETE_LABEL}'`);
+    gh([
+      "label",
+      "create",
+      AI_REVIEW_COMPLETE_LABEL,
+      "--color",
+      "0e8a16",
+      "--description",
+      "AI code review completed; fixes applied and pushed.",
+    ]);
+  }
+
+  for (const riskLabel of RISK_LABELS) {
+    if (have.has(riskLabel)) continue;
+    console.log(`Creating missing label '${riskLabel}'`);
+    gh([
+      "label",
+      "create",
+      riskLabel,
+      "--color",
+      "5319e7",
+      "--description",
+      `AI PR review risk rating ${riskLabel.slice("risk-".length)}/5.`,
+    ]);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +747,111 @@ function pushPrBranch(
   }
 }
 
+async function applyRiskLabel(prNumber: number, risk: number): Promise<void> {
+  const wantedLabel = `risk-${risk}`;
+  const currentLabels = ghJson<{ labels: { name: string }[] }>([
+    "pr",
+    "view",
+    String(prNumber),
+    "--json",
+    "labels",
+  ]).labels.map((l) => l.name);
+  const toRemove = currentLabels.filter(
+    (label) => isRiskLabel(label) && label !== wantedLabel,
+  );
+
+  for (const label of toRemove) {
+    const removal = await runVerifiedHostMutation<{ name: string }[]>({
+      mutate: () => {
+        gh([
+          "api",
+          `repos/{owner}/{repo}/issues/${prNumber}/labels/${label}`,
+          "-X",
+          "DELETE",
+        ]);
+      },
+      readBack: () =>
+        ghJson<{ labels: { name: string }[] }>([
+          "pr",
+          "view",
+          String(prNumber),
+          "--json",
+          "labels",
+        ]).labels,
+      verify: (labels) => !labels.some((l) => l.name === label),
+      describe: (labels) =>
+        `labels=${labels.map((l) => l.name).sort().join(",")}`,
+    });
+    if (!removal.ok) {
+      throw new Error(
+        `Could not remove stale label ${label}: ${removal.diagnostics.join("; ")}`,
+      );
+    }
+  }
+
+  if (currentLabels.includes(wantedLabel)) return;
+
+  const addition = await runVerifiedHostMutation<{ name: string }[]>({
+    mutate: () => {
+      gh([
+        "api",
+        `repos/{owner}/{repo}/issues/${prNumber}/labels`,
+        "-X",
+        "POST",
+        "-f",
+        `labels[]=${wantedLabel}`,
+      ]);
+    },
+    readBack: () =>
+      ghJson<{ labels: { name: string }[] }>([
+        "pr",
+        "view",
+        String(prNumber),
+        "--json",
+        "labels",
+      ]).labels,
+    verify: (labels) => labels.some((l) => l.name === wantedLabel),
+    describe: (labels) =>
+      `labels=${labels.map((l) => l.name).sort().join(",")}`,
+  });
+  if (!addition.ok) {
+    throw new Error(
+      `Could not apply label ${wantedLabel}: ${addition.diagnostics.join("; ")}`,
+    );
+  }
+}
+
+async function applyAiReviewCompleteLabel(prNumber: number): Promise<void> {
+  const addition = await runVerifiedHostMutation<{ name: string }[]>({
+    mutate: () => {
+      gh([
+        "api",
+        `repos/{owner}/{repo}/issues/${prNumber}/labels`,
+        "-X",
+        "POST",
+        "-f",
+        `labels[]=${AI_REVIEW_COMPLETE_LABEL}`,
+      ]);
+    },
+    readBack: () =>
+      ghJson<{ labels: { name: string }[] }>([
+        "pr",
+        "view",
+        String(prNumber),
+        "--json",
+        "labels",
+      ]).labels,
+    verify: (labels) => labels.some((l) => l.name === AI_REVIEW_COMPLETE_LABEL),
+    describe: (labels) =>
+      `labels=${labels.map((l) => l.name).sort().join(",")}`,
+  });
+  if (!addition.ok) {
+    throw new Error(
+      `Could not apply label ${AI_REVIEW_COMPLETE_LABEL}: ${addition.diagnostics.join("; ")}`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Docker sandbox
 // ---------------------------------------------------------------------------
@@ -838,14 +966,6 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       `  review diff: ${reviewContext.diffBytes} bytes, ${reviewContext.changedFiles.length} file(s), aspects: ${reviewContext.reviewAspects.join(", ")}`,
     );
 
-    // Check diff size limit.
-    if (reviewContext.diffBytes > REVIEW_DIFF_MAX_BYTES) {
-      console.log(
-        `  diff too large (${reviewContext.diffBytes} > ${REVIEW_DIFF_MAX_BYTES}); skipping`,
-      );
-      return { outcome: "diff_too_large" };
-    }
-
     // Persist review inputs as files in the worktree so the full diff/body
     // do not have to travel through argv to the agent.
     const reviewInputData: PrReviewInputData = {
@@ -882,6 +1002,7 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       DIFF_STAT_PATH: reviewInputs.paths.diffStat,
       DIFF_PATH: reviewInputs.paths.diff,
       METADATA_PATH: reviewInputs.paths.metadata,
+      RESULT_PATH: `${reviewInputs.relativeDir}/review-result.json`,
     };
     const userTemplate = readFileSync(PR_REVIEW_USER_PROMPT_FILE, "utf8");
     const rendered = renderSlimMessage(userTemplate, userArgs);
@@ -939,22 +1060,71 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       );
     }
 
+    // Read and validate the review result artifact the agent wrote.
+    const resultPath = `${reviewInputs.relativeDir}/review-result.json`;
+    console.log(`  reading review result artifact ${resultPath}`);
+    let resultArtifactRaw: string;
+    try {
+      resultArtifactRaw = readFileSync(
+        join(sandbox.worktreePath, resultPath),
+        "utf8",
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Could not read review result artifact: ${message}`);
+    }
+    const validation = validatePrReviewResult(resultArtifactRaw);
+    if (!validation.ok) {
+      throw new Error(
+        `Invalid review result artifact: ${validation.errors.join("; ")}`,
+      );
+    }
+    const reviewResult: PrReviewResult = validation.result;
+    const reviewedHeadSha = git(
+      ["rev-parse", "HEAD"],
+      sandbox.worktreePath,
+    ).trim();
+    console.log(
+      `  review result: risk ${reviewResult.risk}/5, ${reviewResult.findings.length} finding(s), ${reviewResult.fixes_applied.length} fix(es), ${reviewResult.not_fixed.length} not-fixed`,
+    );
+
     // Push the branch (even if no commits — ensures the branch is up to date).
     console.log(`  pushing ${prBranch} to origin`);
     pushPrBranch(sandbox.worktreePath, prBranch);
 
-    // Apply the ai-review-complete label via the REST API to avoid the
-    // Projects (classic) GraphQL deprecation error that affects `gh pr edit`
-    // on older gh versions (< 2.73.0). PRs share the issues label API.
+    // Apply the risk label and ai-review-complete via verified mutations.
+    // The risk label is durable state used by external automation, so it must
+    // be read back and verified. ai-review-complete is the loop's memory.
+    console.log(`  applying risk-${reviewResult.risk} label`);
+    await applyRiskLabel(pr.number, reviewResult.risk);
     console.log(`  applying ${AI_REVIEW_COMPLETE_LABEL} label`);
-    gh([
-      "api",
-      `repos/{owner}/{repo}/issues/${pr.number}/labels`,
-      "-X",
-      "POST",
-      "-f",
-      `labels[]=${AI_REVIEW_COMPLETE_LABEL}`,
-    ]);
+    await applyAiReviewCompleteLabel(pr.number);
+
+    // Post a summary comment. The comment is best-effort after durable labels;
+    // if it fails, the PR is still marked reviewed. Use the REST API directly
+    // (like labels) to avoid `gh pr comment` CLI quirks around body-file paths
+    // and repo-context detection.
+    const commentBody = renderPrReviewComment({
+      result: reviewResult,
+      reviewedHeadSha,
+      commitCount,
+    });
+    try {
+      console.log(`  posting review comment on PR #${pr.number}`);
+      gh([
+        "api",
+        `repos/{owner}/{repo}/issues/${pr.number}/comments`,
+        "-X",
+        "POST",
+        "-f",
+        `body=${commentBody}`,
+      ]);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `  Could not post review comment on PR #${pr.number}: ${message}`,
+      );
+    }
 
     console.log(`  PR #${pr.number} review complete`);
     return { outcome: "review_complete" };

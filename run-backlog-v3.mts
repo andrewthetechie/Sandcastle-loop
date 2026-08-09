@@ -195,6 +195,7 @@ const SUBTASK_READINESS_AGENT_SYSTEM_PROMPT_FILE = fileURLToPath(
 // Labels
 const REVIEW_LABEL = "Review"; // added on clean approval; issue kept open
 const STUCK_LABEL = "agent-stuck"; // added when the loop cannot land the issue
+const AGENT_AUTHORED_LABEL = "agent-authored"; // identifies PRs the loop opened
 
 // Loop bounds
 const MAX_REVIEW_ROUNDS = BACKLOG_V3_ENGINE_POLICY.maxReviewRounds;
@@ -494,6 +495,11 @@ function ensureLabels(): void {
       name: ISSUE_AS_PRD_LABELS.rebaseNeeded.name,
       color: ISSUE_AS_PRD_LABELS.rebaseNeeded.color,
       description: ISSUE_AS_PRD_LABELS.rebaseNeeded.description,
+    },
+    {
+      name: AGENT_AUTHORED_LABEL,
+      color: "5319e7",
+      description: "Pull request created by the agent loop.",
     },
   ];
   for (const wantedLabel of wanted) {
@@ -4032,6 +4038,8 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
               baseBranch,
               "--head",
               currentState.accumulationBranch,
+              "--label",
+              AGENT_AUTHORED_LABEL,
               "--body",
               prBody,
             ],

@@ -78,6 +78,7 @@ test("user prompt contains exactly the runtime placeholders supplied by the runn
     "PR_BODY_PATH",
     "PR_NUMBER",
     "PR_TITLE",
+    "RESULT_PATH",
     "REVIEW_ASPECTS",
   ]);
   assert.match(prompt, /untrusted review data/i);
@@ -96,6 +97,6 @@ test("runner passes file paths and labels via REST", () => {
   assert.doesNotMatch(runner, /\{\{PR_BODY\}\}/);
   assert.doesNotMatch(runner, /\{\{LINKED_ISSUES\}\}/);
 
-  assert.match(runner, /repos\/\{owner\}\/\{repo\}\/issues\/\$\{pr\.number\}\/labels/);
+  assert.match(runner, /repos\/\{owner\}\/\{repo\}\/issues\/\$\{prNumber\}\/labels/);
   assert.doesNotMatch(runner, /\[\s*"pr",\s*"edit",/);
 });

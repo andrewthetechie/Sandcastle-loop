@@ -37,8 +37,10 @@ tsx run-backlog-v3.mts --label <name[,name2]> \
 `MAX_ACQUISITION_FAILURES = 3` consecutive `gh` failures before the run gives up.
 
 **Labels it manages.** Permanent: `Review`, `agent-stuck`, `agent-in-progress`,
-`agent-partial`, `agent-rebase-needed` — created by `ensureLabels()` at startup. Dynamic:
-one `parent-<N>` queue label per active parent, deleted last and warning-only.
+`agent-partial`, `agent-rebase-needed`, `agent-authored` — created by `ensureLabels()` at
+startup. Dynamic: one `parent-<N>` queue label per active parent, deleted last and
+warning-only. `agent-authored` is applied to PRs the loop opens so external automation can
+identify them.
 
 **Stop reasons:** `no_eligible_issue` (the normal end — re-run to continue) or
 `max_iterations`. A crashed parent is quarantined for the run and the loop continues.
@@ -69,8 +71,9 @@ both the `typecheck` and `build` allowlists.
 ### `run-pr-review-v1.mts`
 
 The PR review loop. Polls open PRs, runs one agent that fans out to Standards and Spec
-sub-agents via the Task tool, applies the findings itself, pushes, and labels
-`ai-review-complete`.
+sub-agents via the Task tool, applies the findings itself, pushes, labels
+`ai-review-complete`, applies a 0–5 risk label, and posts a comment summarizing what it
+found, fixed, and chose not to fix.
 
 ```bash
 tsx run-pr-review-v1.mts [--label <name[,name2]>] [--model-reviewer <model>] \
@@ -90,9 +93,8 @@ tsx run-pr-review-v1.mts [--label <name[,name2]>] [--model-reviewer <model>] \
 
 **Per-PR skip conditions,** in order: not `OPEN`; already labeled `ai-review-complete`;
 `mergeable` is `CONFLICTING` or still computing (`null`); not settled. Then, inside
-`processPr`: diff over `reviewDiffMaxBytes` → `diff_too_large`; rendered prompt over the
-argv limit → `prompt_too_large`. Skips leave the PR unlabeled, so it is retried next
-iteration.
+`processPr`: rendered prompt over the argv limit → `prompt_too_large`. Skips leave the
+PR unlabeled, so it is retried next iteration.
 
 **The three agents** (`custom-agent-defs.mts`):
 
@@ -113,21 +115,27 @@ worktree; the prompt carries only metadata and the paths (`DIFF_PATH`, `PR_BODY_
 `LINKED_ISSUES_PATH`, …). Keep it that way — inlining a diff back into `promptArgs`
 reintroduces `prompt_too_large` skips on exactly the large PRs that most need review.
 
+**Review result is file-backed too.** The coordinating agent writes a JSON artifact to
+`RESULT_PATH` before emitting `</pr_review_complete>`. The host validates the artifact,
+records the reviewed HEAD SHA, applies the matching `risk-N` label, applies
+`ai-review-complete`, and then posts the summary comment. An invalid or missing artifact
+is treated as an error outcome: no labels or comment are applied, and the PR is retried.
+
 **Invariants to preserve:**
 
-- `ai-review-complete` is the loop's entire memory. Applying it to a PR that was not
-  actually reviewed drops that PR forever.
+- `ai-review-complete` is the loop's primary memory. Applying it to a PR that was not
+  actually reviewed drops that PR forever. Removing the label makes the PR eligible for a
+  fresh full re-review; stale `risk-N` labels are replaced and a new comment is posted.
+- `risk-N` labels are durable state used by external automation. They are applied and
+  removed through verified mutations.
+- An invalid or missing review result artifact is an error outcome: no labels or comment
+  are applied.
 - Conflicted PRs are skipped, never rebased or resolved.
 - The branch is pushed even when the agent produced zero commits, to normalize the ref.
 
-**Covered by:** only `pr-review-prompt.test.mts`, which asserts the four prompt files exist
-at the paths the runner loads and are non-empty. **It is not in the `typecheck` allowlist** —
-typecheck it by hand after editing:
-
-```bash
-npx tsc --noEmit --allowImportingTsExtensions --module nodenext --moduleResolution nodenext \
-  --target es2022 --types node types/ai-hero-sandcastle.d.ts run-pr-review-v1.mts
-```
+**Covered by:** `pr-review-prompt.test.mts` (path + non-empty assertions on the four prompt
+files), plus unit tests on every module it imports. **It is in the `typecheck` allowlist**
+— run `npm run typecheck` after editing.
 
 If you add logic here, extract it into a module you can unit-test rather than growing
 `processPr`.

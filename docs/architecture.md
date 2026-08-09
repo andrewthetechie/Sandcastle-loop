@@ -219,7 +219,7 @@ The agent reviews, applies the fixes itself, and commits. Then the host pushes t
 (even with zero commits, to normalize the ref) and applies `ai-review-complete`.
 
 Bail-outs return an outcome string without labeling, so the PR is retried next iteration:
-`diff_too_large` (over `reviewDiffMaxBytes`), `prompt_too_large` (argv limit), `error`.
+`prompt_too_large` (argv limit), `error`.
 
 Things to preserve when editing:
 
@@ -300,7 +300,7 @@ one. A default-exported object with:
 | `cache` | Host↔sandbox cache mounts (`root`, `mounts`, `env`), so package managers do not re-download per sandbox. Host paths are derived per-repo and created eagerly. |
 | `reviewer.maxAttempts` | Reviewer acquisition retries. Default 2. |
 | `issueAsPrd.parentCommentMaxBytes` | Cap on the parent state comment. Default 32 000. |
-| `reviewDiffMaxBytes` | Hard cap on any review diff. Default 60 000. |
+| `reviewDiffMaxBytes` | Hard cap on review diffs passed via argv (backlog and PRD loops). Default 60 000. |
 | `coderEscalation` | `tier2FromRound` (3) / `tier3FromRound` (5) for the v4 ladder. |
 
 CLI flags override config for models: `--model-coder`, `--model-rework` (backlog),

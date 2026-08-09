@@ -21,5 +21,6 @@ Use these path arguments exactly as provided; paths are relative to the worktree
 - Diff stat: `{{DIFF_STAT_PATH}}`
 - Full diff: `{{DIFF_PATH}}`
 - Review metadata JSON: `{{METADATA_PATH}}`
+- Review result JSON (write here before completing): `{{RESULT_PATH}}`
 
 Read the PR body, linked issues, changed files, diff stat, full diff, and metadata from those files. Do not expect the diff, PR body, or linked issues to be provided inline in this message.
