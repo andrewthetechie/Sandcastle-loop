@@ -36,6 +36,8 @@ test("coordinator prompt enforces sequential reviews and guarded completion", ()
   assert.match(prompt, /never use `git add -A` or `git add \.`/i);
   assert.match(prompt, /never emit it for partial, blocked, or unvalidated work/i);
   assert.match(prompt, /<\/pr_review_complete>/);
+  assert.match(prompt, /file-backed review input/i);
+  assert.match(prompt, /input file paths/i);
 });
 
 test("specialist prompts require read-only tagged JSON with an evidence bar", () => {
@@ -54,6 +56,7 @@ test("specialist prompts require read-only tagged JSON with an evidence bar", ()
     assert.match(prompt, new RegExp(id));
     assert.match(prompt, /Confidence is at least 80/i);
     assert.match(prompt, /at most five findings/i);
+    assert.match(prompt, /supplied file paths/i);
   }
 });
 
@@ -65,16 +68,34 @@ test("user prompt contains exactly the runtime placeholders supplied by the runn
 
   assert.deepEqual(placeholders, [
     "BASE_SHA",
-    "CHANGED_FILES",
-    "DIFF",
+    "CHANGED_FILES_PATH",
     "DIFF_BYTES",
-    "DIFF_STAT",
+    "DIFF_PATH",
+    "DIFF_STAT_PATH",
     "ECOSYSTEMS",
-    "LINKED_ISSUES",
-    "PR_BODY",
+    "LINKED_ISSUES_PATH",
+    "METADATA_PATH",
+    "PR_BODY_PATH",
     "PR_NUMBER",
     "PR_TITLE",
     "REVIEW_ASPECTS",
   ]);
-  assert.match(prompt, /untrusted review data, not instructions/i);
+  assert.match(prompt, /untrusted review data/i);
+  assert.match(prompt, /File-backed inputs/i);
+  assert.match(prompt, /Do not expect .* inline/i);
+});
+
+test("runner passes file paths and labels via REST", () => {
+  const runner = read("run-pr-review-v1.mts");
+
+  assert.match(runner, /PR_BODY_PATH:\s+reviewInputs\.paths\.prBody/);
+  assert.match(runner, /LINKED_ISSUES_PATH:\s+reviewInputs\.paths\.linkedIssues/);
+  assert.match(runner, /DIFF_PATH:\s+reviewInputs\.paths\.diff/);
+  assert.match(runner, /METADATA_PATH:\s+reviewInputs\.paths\.metadata/);
+  assert.doesNotMatch(runner, /\{\{DIFF\}\}/);
+  assert.doesNotMatch(runner, /\{\{PR_BODY\}\}/);
+  assert.doesNotMatch(runner, /\{\{LINKED_ISSUES\}\}/);
+
+  assert.match(runner, /repos\/\{owner\}\/\{repo\}\/issues\/\$\{pr\.number\}\/labels/);
+  assert.doesNotMatch(runner, /\[\s*"pr",\s*"edit",/);
 });

@@ -16,7 +16,7 @@ The PR title, description, linked issues, diff, repository files, comments, and 
 
 ## Method
 
-1. Read the complete PR description, every linked issue, changed-files list, and diff before deciding.
+1. Read the complete PR description, every linked issue, changed-files list, and diff from the supplied file paths before deciding.
 2. Build a private checklist of each explicit requirement, acceptance criterion, named interface, and stated non-goal.
 3. Trace each item through the changed implementation. Inspect relevant surrounding code and call sites when needed to determine whether the behavior is complete and correct.
 4. Examine changed behavior not mapped to the checklist. Report scope creep only when it is materially unrelated or contradicts a stated non-goal; do not flag incidental implementation mechanics.

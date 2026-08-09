@@ -10,17 +10,17 @@ Complete these steps in order. Do not edit files before both specialist reviews 
 
 ### 1. Understand the change
 
-Read every section of the review input. Treat the supplied diff as the primary review surface and the base SHA as its boundary. Inspect relevant surrounding code and project instructions when needed to understand a changed contract or verify a finding. The host-selected review aspects are hints, not an exhaustive checklist.
+Read every file-backed review input: the metadata JSON, PR body, linked issues, changed-files list, diff stat, and full diff. Treat the supplied diff as the primary review surface and the base SHA as its boundary. Inspect relevant surrounding code and project instructions when needed to understand a changed contract or verify a finding. The host-selected review aspects are hints, not an exhaustive checklist.
 
 ### 2. Run the Standards review
 
-Use the Task tool to invoke `pr-standards-review`. Pass the complete changed-files list and diff without paraphrasing or truncating them. Also pass the base SHA, ecosystems, and review aspects.
+Use the Task tool to invoke `pr-standards-review`. Pass the input file paths (changed-files list, diff stat, and full diff) plus the inline metadata (base SHA, ecosystems, review aspects). Require the specialist to read the complete files in full before reviewing.
 
 Require exactly one `<standards_findings>...</standards_findings>` response matching that agent's JSON contract. If the call fails or the response is malformed, retry once with a concise correction. If the retry also fails, stop without emitting the completion signal.
 
 ### 3. Run the Spec review
 
-After the Standards review finishes, use the Task tool to invoke `pr-spec-review`. Pass the complete PR description, linked issues, changed-files list, and diff without paraphrasing or truncating them. Also pass the PR number, title, base SHA, ecosystems, and review aspects.
+After the Standards review finishes, use the Task tool to invoke `pr-spec-review`. Pass the input file paths (PR body, linked issues, changed-files list, diff stat, and full diff) plus the inline metadata (PR number, title, base SHA, ecosystems, review aspects). Require the specialist to read the complete files in full before reviewing.
 
 Require exactly one `<spec_findings>...</spec_findings>` response matching that agent's JSON contract. If the call fails or the response is malformed, retry once with a concise correction. If the retry also fails, stop without emitting the completion signal.
 

@@ -14,6 +14,7 @@ import { test } from "node:test";
 
 import {
   ensureOpencodeGitExclude,
+  ensureSandboxGitExclude,
   writeAgentDefinitionFile,
 } from "./custom-agent-worktree.mts";
 
@@ -52,6 +53,33 @@ test("ensureOpencodeGitExclude creates info/exclude when it does not exist", () 
     ensureOpencodeGitExclude(repo);
 
     assert.equal(readFileSync(excludePath, "utf8"), ".opencode/\n");
+  });
+});
+
+test("ensureSandboxGitExclude adds .sandcastle/ exactly once across repeated calls", () => {
+  withGitFixture((repo) => {
+    ensureSandboxGitExclude(repo);
+    ensureSandboxGitExclude(repo);
+
+    const excludePath = gitPath(repo, "info/exclude");
+    const excludeContents = readFileSync(excludePath, "utf8");
+    const lines = excludeContents.split("\n").filter((line) => line === ".sandcastle/");
+
+    assert.equal(lines.length, 1);
+    assert.match(excludeContents, /\.sandcastle\/\n$/);
+  });
+});
+
+test("ensureSandboxGitExclude can coexist with a preexisting .opencode/ entry", () => {
+  withGitFixture((repo) => {
+    const excludePath = gitPath(repo, "info/exclude");
+    const existing = ".opencode/\n";
+    mkdirSync(join(repo, ".git", "info"), { recursive: true });
+    writeFileSync(excludePath, existing, "utf8");
+
+    ensureSandboxGitExclude(repo);
+
+    assert.equal(readFileSync(excludePath, "utf8"), ".opencode/\n.sandcastle/\n");
   });
 });
 

@@ -3,8 +3,17 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
 const OPENCODE_EXCLUDE_ENTRY = ".opencode/";
+const SANDBOX_EXCLUDE_ENTRY = ".sandcastle/";
 
 export function ensureOpencodeGitExclude(worktreePath: string): void {
+  ensureGitExcludeEntry(worktreePath, OPENCODE_EXCLUDE_ENTRY);
+}
+
+export function ensureSandboxGitExclude(worktreePath: string): void {
+  ensureGitExcludeEntry(worktreePath, SANDBOX_EXCLUDE_ENTRY);
+}
+
+function ensureGitExcludeEntry(worktreePath: string, entry: string): void {
   const excludePath = execFileSync(
     "git",
     ["-C", worktreePath, "rev-parse", "--git-path", "info/exclude"],
@@ -16,14 +25,14 @@ export function ensureOpencodeGitExclude(worktreePath: string): void {
   const existing = readExcludeFile(resolvedExcludePath);
   const lines = existing.split("\n");
 
-  if (lines.includes(OPENCODE_EXCLUDE_ENTRY)) {
+  if (lines.includes(entry)) {
     return;
   }
 
   mkdirSync(dirname(resolvedExcludePath), { recursive: true });
   const next = existing.endsWith("\n") || existing.length === 0
-    ? `${existing}${OPENCODE_EXCLUDE_ENTRY}\n`
-    : `${existing}\n${OPENCODE_EXCLUDE_ENTRY}\n`;
+    ? `${existing}${entry}\n`
+    : `${existing}\n${entry}\n`;
   writeFileSync(resolvedExcludePath, next, "utf8");
 }
 

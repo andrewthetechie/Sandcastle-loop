@@ -32,9 +32,14 @@ import { enforceArgvSizeLimit } from "./custom-agent-argv-guard.mts";
 import { renderSlimMessage } from "./custom-agent-render.mts";
 import {
   ensureOpencodeGitExclude,
+  ensureSandboxGitExclude,
   writeAgentDefinitionFile,
 } from "./custom-agent-worktree.mts";
 import { EXTRA_REVIEW_INPUT_DIFF_EXCLUDES } from "./extra-review-inputs.mts";
+import {
+  writePrReviewInputs,
+  type PrReviewInputData,
+} from "./pr-review-inputs.mts";
 import { loadSandcastleLoopConfig } from "./sandcastle-loop-config.mts";
 import { hasFlag, readCliStringFlag } from "./cli-string-flag.mts";
 import { recordMeasuredAgentRun } from "./metrics-recorder.mts";
@@ -264,8 +269,8 @@ function ensureBaseBranchAvailable(): void {
   }
 }
 
-// `gh pr edit --add-label` fails if the label does not already exist, so
-// create the label up front if the repo is missing it.
+// Adding a label fails if the label does not already exist, so create the
+// label up front if the repo is missing it.
 function ensureLabels(): void {
   const existing = ghJson<{ name: string }[]>([
     "label",
@@ -791,6 +796,7 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
     hooks: sandboxReadyHooks(),
   });
   ensureOpencodeGitExclude(sandbox.worktreePath);
+  ensureSandboxGitExclude(sandbox.worktreePath);
 
   try {
     // Write all three agent definitions to the worktree so the main agent
@@ -840,19 +846,42 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       return { outcome: "diff_too_large" };
     }
 
-    // Render the user prompt.
+    // Persist review inputs as files in the worktree so the full diff/body
+    // do not have to travel through argv to the agent.
+    const reviewInputData: PrReviewInputData = {
+      prNumber: pr.number,
+      title: pr.title,
+      body: pr.body || "(no PR description)",
+      linkedIssues,
+      baseSha: mergeBase,
+      diff: reviewContext.diff,
+      diffStat: reviewContext.diffStat,
+      changedFiles: reviewContext.changedFiles,
+      reviewAspects: reviewContext.reviewAspects,
+      ecosystems: reviewContext.ecosystems,
+    };
+    const reviewInputs = writePrReviewInputs(
+      sandbox.worktreePath,
+      reviewInputData,
+    );
+    console.log(
+      `  review inputs written to ${reviewInputs.relativeDir} (${reviewContext.diffBytes} bytes diff)`,
+    );
+
+    // Render the user prompt (now small — only metadata and file paths).
     const userArgs = {
       PR_NUMBER: String(pr.number),
       PR_TITLE: pr.title,
-      PR_BODY: pr.body || "(no PR description)",
-      LINKED_ISSUES: linkedIssues,
       BASE_SHA: mergeBase,
-      DIFF: reviewContext.diff,
       DIFF_BYTES: String(reviewContext.diffBytes),
-      DIFF_STAT: reviewContext.diffStat,
-      CHANGED_FILES: reviewContext.changedFiles.join("\n") || "(none)",
-      REVIEW_ASPECTS: reviewContext.reviewAspects.join(", "),
       ECOSYSTEMS: reviewContext.ecosystems.join(", ") || "(unknown)",
+      REVIEW_ASPECTS: reviewContext.reviewAspects.join(", "),
+      PR_BODY_PATH: reviewInputs.paths.prBody,
+      LINKED_ISSUES_PATH: reviewInputs.paths.linkedIssues,
+      CHANGED_FILES_PATH: reviewInputs.paths.changedFiles,
+      DIFF_STAT_PATH: reviewInputs.paths.diffStat,
+      DIFF_PATH: reviewInputs.paths.diff,
+      METADATA_PATH: reviewInputs.paths.metadata,
     };
     const userTemplate = readFileSync(PR_REVIEW_USER_PROMPT_FILE, "utf8");
     const rendered = renderSlimMessage(userTemplate, userArgs);
@@ -914,14 +943,17 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
     console.log(`  pushing ${prBranch} to origin`);
     pushPrBranch(sandbox.worktreePath, prBranch);
 
-    // Apply the ai-review-complete label.
+    // Apply the ai-review-complete label via the REST API to avoid the
+    // Projects (classic) GraphQL deprecation error that affects `gh pr edit`
+    // on older gh versions (< 2.73.0). PRs share the issues label API.
     console.log(`  applying ${AI_REVIEW_COMPLETE_LABEL} label`);
     gh([
-      "pr",
-      "edit",
-      String(pr.number),
-      "--add-label",
-      AI_REVIEW_COMPLETE_LABEL,
+      "api",
+      `repos/{owner}/{repo}/issues/${pr.number}/labels`,
+      "-X",
+      "POST",
+      "-f",
+      `labels[]=${AI_REVIEW_COMPLETE_LABEL}`,
     ]);
 
     console.log(`  PR #${pr.number} review complete`);
