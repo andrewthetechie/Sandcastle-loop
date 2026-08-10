@@ -7,10 +7,14 @@ import {
   type SubtaskReadinessAcquisition,
   type SubtaskReadinessParseFailure,
   type SubtaskReadinessResult,
+  type SubtaskImprovementAcquisition,
+  type SubtaskImprovementParseFailure,
+  type SubtaskImprovementResult,
 } from "./issue-as-prd-contracts.mts";
 import {
   parseInitialIssueDecomposition,
   parseSubtaskReadiness,
+  parseSubtaskImprovement,
 } from "./issue-as-prd-parsers.mts";
 import {
   recordMeasuredAgentRun,
@@ -21,16 +25,19 @@ import { fileURLToPath } from "node:url";
 
 export const INITIAL_ISSUE_DECOMPOSER_STAGE = "initial_issue_decomposer";
 export const SUBTASK_READINESS_STAGE = "subtask_readiness";
+export const SUBTASK_IMPROVEMENT_STAGE = "subtask_improvement";
 export const ISSUE_AS_PRD_MAX_ATTEMPTS = 2;
 
 export const INITIAL_ISSUE_DECOMPOSER_USER_PROMPT_FILE =
   fileURLToPath(new URL("./initial-issue-decomposer-user-prompt-prd.md", import.meta.url));
 export const SUBTASK_READINESS_USER_PROMPT_FILE =
   fileURLToPath(new URL("./subtask-readiness-user-prompt-prd.md", import.meta.url));
+export const SUBTASK_IMPROVEMENT_USER_PROMPT_FILE =
+  fileURLToPath(new URL("./subtask-improvement-user-prompt-prd.md", import.meta.url));
 
 export function extractSingleTaggedOutput(
   logText: string,
-  tag: "initial_issue_decomposition" | "subtask_readiness",
+  tag: "initial_issue_decomposition" | "subtask_readiness" | "subtask_improvement" | "rebase_result",
 ): string | undefined {
   const currentRunStart = logText.lastIndexOf("--- Run started:");
   const currentRunLog = currentRunStart === -1
@@ -70,6 +77,10 @@ export interface AcquireSubtaskReadinessInput {
   runAttempt(attempt: 1 | 2): Promise<IssueAsPrdAttemptResult>;
   measuredRunDeps?: RecordMeasuredAgentRunDeps;
   workingLogPathForAttempt?: (attempt: 1 | 2) => string | undefined;
+}
+
+export interface AcquireSubtaskImprovementInput extends AcquireSubtaskReadinessInput {
+  validateResult?(result: SubtaskImprovementResult): string[];
 }
 
 export async function acquireInitialDecomposition(
@@ -148,6 +159,41 @@ export async function acquireSubtaskReadiness(
   });
 }
 
+export async function acquireSubtaskImprovement(
+  input: AcquireSubtaskImprovementInput,
+): Promise<SubtaskImprovementAcquisition> {
+  return acquireWithRetries<
+    SubtaskImprovementResult,
+    SubtaskImprovementParseFailure
+  >({
+    prd: input.prd,
+    issue: input.childIssueNumber,
+    model: input.model,
+    round: input.round,
+    worktreePath: input.worktreePath,
+    promptFile: input.promptFile,
+    promptArgs: input.promptArgs,
+    stage: SUBTASK_IMPROVEMENT_STAGE,
+    runName: (attempt) => buildSubtaskImprovementRunName(input.childIssueNumber, attempt),
+    workingLogPathForAttempt:
+      input.workingLogPathForAttempt ??
+      ((attempt) => subtaskImprovementWorkingLogPath(input.childIssueNumber, attempt)),
+    measuredRunDeps: input.measuredRunDeps,
+    runAttempt: input.runAttempt,
+    parse: parseSubtaskImprovement,
+    accept(result, artifact, diagnostics) {
+      const resultDiagnostics = input.validateResult?.(result) ?? [];
+      if (resultDiagnostics.length > 0) {
+        const detail = `improvement contract failure: ${resultDiagnostics.join("; ")}`;
+        artifact.diagnostics.push(detail);
+        diagnostics.push(detail);
+        return { accept: false };
+      }
+      return { accept: true, result };
+    },
+  });
+}
+
 export function buildInitialIssueDecomposerRunName(
   parentIssueNumber: number,
   attempt: 1 | 2,
@@ -160,6 +206,13 @@ export function buildSubtaskReadinessRunName(
   attempt: 1 | 2,
 ): string {
   return `subtask readiness #${childIssueNumber} a${attempt}`;
+}
+
+export function buildSubtaskImprovementRunName(
+  childIssueNumber: number,
+  attempt: 1 | 2,
+): string {
+  return `subtask improvement #${childIssueNumber} a${attempt}`;
 }
 
 export function initialIssueDecomposerWorkingLogPath(
@@ -182,6 +235,14 @@ export function subtaskReadinessWorkingLogPath(
     buildSubtaskReadinessRunName(childIssueNumber, attempt),
     cwd,
   );
+}
+
+export function subtaskImprovementWorkingLogPath(
+  childIssueNumber: number,
+  attempt: 1 | 2,
+  cwd?: string,
+): string {
+  return tuiWorkingLogPath(buildSubtaskImprovementRunName(childIssueNumber, attempt), cwd);
 }
 
 async function acquireWithRetries<

@@ -2,6 +2,8 @@ import {
   INITIAL_ISSUE_DECOMPOSITION_STATUSES,
   INITIAL_SUBTASK_PRIORITIES,
   SUBTASK_READINESS_DISPOSITIONS,
+  SUBTASK_IMPROVEMENT_EVIDENCE_CLASSIFICATIONS,
+  SUBTASK_IMPROVEMENT_OUTCOMES,
   type InitialIssueDecomposition,
   type InitialIssueDecompositionParseFailure,
   type InitialIssueDecompositionParseResult,
@@ -14,6 +16,9 @@ import {
   type SubtaskReadinessParseFailure,
   type SubtaskReadinessParseResult,
   type SubtaskReadinessResult,
+  type SubtaskImprovementParseFailure,
+  type SubtaskImprovementParseResult,
+  type SubtaskImprovementResult,
 } from "./issue-as-prd-contracts.mts";
 import {
   enumField,
@@ -81,6 +86,32 @@ export function parseSubtaskReadiness(
     );
   }
 
+  return result;
+}
+
+export function parseSubtaskImprovement(
+  stdout: string,
+): SubtaskImprovementParseResult {
+  const parsed = parseStrictTaggedJsonObject(
+    stdout,
+    "subtask_improvement",
+    "subtask_improvement",
+  );
+  if ("failure" in parsed) return subtaskImprovementFailure(parsed.failure);
+
+  const details: IssueAsPrdParseFailureDetail[] = [];
+  const result = parseSubtaskImprovementObject(parsed.value, details);
+  if (details.length > 0 || !result) {
+    return subtaskImprovementFailure(
+      validationFailure(
+        "subtask_improvement",
+        "subtask_improvement",
+        stdout,
+        parsed.rawJson,
+        details,
+      ),
+    );
+  }
   return result;
 }
 
@@ -379,6 +410,147 @@ function parseSubtaskReadinessObject(
   };
 }
 
+function parseSubtaskImprovementObject(
+  value: JsonRecord,
+  details: IssueAsPrdParseFailureDetail[],
+): SubtaskImprovementResult | null {
+  exactKeys(
+    value,
+    [
+      "kind",
+      "outcome",
+      "summary",
+      "proposed_title",
+      "proposed_body",
+      "changes",
+      "evidence",
+      "close_reason",
+    ],
+    "$",
+    details,
+  );
+  const kind = exactStringField(value, "kind", "subtask_improvement", "$.kind", details);
+  const outcome = enumField(
+    value,
+    "outcome",
+    SUBTASK_IMPROVEMENT_OUTCOMES,
+    "$.outcome",
+    details,
+  );
+  const summary = nonEmptyStringField(value, "summary", "$.summary", details);
+  const proposedTitle = nonEmptyStringField(
+    value,
+    "proposed_title",
+    "$.proposed_title",
+    details,
+  );
+  const proposedBody = nonEmptyStringField(
+    value,
+    "proposed_body",
+    "$.proposed_body",
+    details,
+  );
+  const changes = stringArrayField(value, "changes", "$.changes", details);
+  const evidence = subtaskImprovementEvidenceArray(value, "evidence", "$.evidence", details);
+  const closeReason = stringField(value, "close_reason", "$.close_reason", details);
+
+  if (
+    !kind ||
+    !outcome ||
+    !summary ||
+    !proposedTitle ||
+    !proposedBody ||
+    !changes ||
+    !evidence ||
+    closeReason === undefined
+  ) return null;
+
+  if (evidence.length === 0) {
+    details.push({
+      code: "invalid_field_value",
+      path: "$.evidence",
+      message: "Evidence ledger must contain at least one entry.",
+      expected: "non-empty array",
+      actual: "[]",
+    });
+  }
+  if (outcome === "improved" && changes.length === 0) {
+    details.push({
+      code: "inconsistent_disposition",
+      path: "$.changes",
+      message: "`outcome: improved` requires at least one change.",
+      expected: "non-empty array",
+      actual: "[]",
+    });
+  }
+  if (outcome === "redundant" && closeReason.trim() === "") {
+    details.push({
+      code: "inconsistent_disposition",
+      path: "$.close_reason",
+      message: "`outcome: redundant` requires a non-empty close_reason.",
+      expected: "non-empty string",
+      actual: JSON.stringify(closeReason),
+    });
+  }
+  if (outcome !== "redundant" && closeReason !== "") {
+    details.push({
+      code: "inconsistent_disposition",
+      path: "$.close_reason",
+      message: `\`outcome: ${outcome}\` requires an empty close_reason.`,
+      expected: "\"\"",
+      actual: JSON.stringify(closeReason),
+    });
+  }
+
+  return {
+    kind,
+    outcome,
+    summary,
+    proposed_title: proposedTitle,
+    proposed_body: proposedBody,
+    changes,
+    evidence,
+    close_reason: closeReason,
+  };
+}
+
+function subtaskImprovementEvidenceArray(
+  record: JsonRecord,
+  key: string,
+  path: string,
+  details: IssueAsPrdParseFailureDetail[],
+): SubtaskImprovementResult["evidence"] | undefined {
+  if (!hasOwn(record, key)) {
+    missingField(path, details);
+    return undefined;
+  }
+  const value = record[key];
+  if (!Array.isArray(value)) {
+    invalidType(path, "array", value, details);
+    return undefined;
+  }
+  const entries: SubtaskImprovementResult["evidence"] = [];
+  value.forEach((entry, index) => {
+    const itemPath = `${path}[${index}]`;
+    if (!isRecord(entry)) {
+      invalidType(itemPath, "object", entry, details);
+      return;
+    }
+    exactKeys(entry, ["claim", "classification", "source"], itemPath, details);
+    const claim = nonEmptyStringField(entry, "claim", `${itemPath}.claim`, details);
+    const classification = enumField(
+      entry,
+      "classification",
+      SUBTASK_IMPROVEMENT_EVIDENCE_CLASSIFICATIONS,
+      `${itemPath}.classification`,
+      details,
+    );
+    const source = nonEmptyStringField(entry, "source", `${itemPath}.source`, details);
+    if (claim && classification && source) entries.push({ claim, classification, source });
+  });
+  return entries;
+}
+
 function initialSubtaskDraftArray(
   record: JsonRecord,
   key: string,
@@ -660,6 +832,12 @@ function subtaskReadinessFailure(
   return { kind: "parse_failure", parse_failure };
 }
 
+function subtaskImprovementFailure(
+  parse_failure: IssueAsPrdParseFailure,
+): SubtaskImprovementParseFailure {
+  return { kind: "parse_failure", parse_failure };
+}
+
 function tagRegex(tag: string): RegExp {
   return new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, "g");
 }
@@ -676,5 +854,7 @@ function parserLabel(parser: IssueAsPrdParserName): string {
       return "initial issue decomposition";
     case "subtask_readiness":
       return "subtask readiness";
+    case "subtask_improvement":
+      return "subtask improvement";
   }
 }

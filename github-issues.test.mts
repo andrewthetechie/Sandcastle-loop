@@ -198,6 +198,7 @@ test("label and issue mutation methods emit exact gh argv", () => {
     "issue edit 7 --repo acme/widgets --add-label parent-4": "",
     "issue edit 7 --repo acme/widgets --remove-label parent-4": "",
     "issue edit 7 --repo acme/widgets --body New body": "",
+    "issue edit 7 --repo acme/widgets --title Improved title --body Improved body": "",
     "issue close 7 --repo acme/widgets --comment Closed as not actionable": "",
   });
   const client = new GitHubIssuesClient({ owner: "acme", repo: "widgets" }, runner);
@@ -207,6 +208,7 @@ test("label and issue mutation methods emit exact gh argv", () => {
   client.addLabel(7, "parent-4");
   client.removeLabel(7, "parent-4");
   client.editIssueBody(7, "New body");
+  client.editIssueTitleAndBody({ issueNumber: 7, title: "Improved title", body: "Improved body" });
   client.closeIssue(7, "Closed as not actionable");
 
   assert.deepEqual(runner.commands, [
@@ -215,6 +217,7 @@ test("label and issue mutation methods emit exact gh argv", () => {
     ["issue", "edit", "7", "--repo", "acme/widgets", "--add-label", "parent-4"],
     ["issue", "edit", "7", "--repo", "acme/widgets", "--remove-label", "parent-4"],
     ["issue", "edit", "7", "--repo", "acme/widgets", "--body", "New body"],
+    ["issue", "edit", "7", "--repo", "acme/widgets", "--title", "Improved title", "--body", "Improved body"],
     ["issue", "close", "7", "--repo", "acme/widgets", "--comment", "Closed as not actionable"],
   ]);
 });

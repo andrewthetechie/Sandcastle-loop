@@ -45,6 +45,7 @@ test("recovers when the remote accumulation branch is strictly behind the review
     "close",
     "issue-read",
   ]);
+  assert.deepEqual(deps.pushExpectedRemoteShas, ["behind-sha"]);
 });
 
 test("still rejects when the remote has genuinely diverged from the reviewed base", async () => {
@@ -93,6 +94,7 @@ test("successful integration uses the exact required operation order", async () 
     "close",
     "issue-read",
   ]);
+  assert.deepEqual(deps.pushExpectedRemoteShas, ["reviewed-base"]);
 });
 
 test("recovery before local update behaves like a fresh success", async () => {
@@ -238,8 +240,9 @@ function createDeps(options: {
   pushError?: Error;
   closeError?: Error;
   issueState?: "OPEN" | "CLOSED";
-} = {}): ChildIntegrationDeps & { events: string[] } {
+} = {}): ChildIntegrationDeps & { events: string[]; pushExpectedRemoteShas: string[] } {
   const events: string[] = [];
+  const pushExpectedRemoteShas: string[] = [];
   let localHeadSha = options.localHeadSha ?? "reviewed-base";
   let remoteHeadSha = options.remoteHeadSha ?? "reviewed-base";
   let remoteReadCount = 0;
@@ -247,6 +250,7 @@ function createDeps(options: {
 
   return {
     events,
+    pushExpectedRemoteShas,
     readAccumulationHeads() {
       if (events.length > 0 && events.includes("push")) {
         events.push("remote-read");
@@ -267,8 +271,9 @@ function createDeps(options: {
       events.push("fast-forward");
       localHeadSha = targetSha;
     },
-    pushAccumulationBranch({ expectedHeadSha }) {
+    pushAccumulationBranch({ expectedHeadSha, expectedRemoteSha }) {
       events.push("push");
+      pushExpectedRemoteShas.push(expectedRemoteSha);
       if (options.pushError) throw options.pushError;
       remoteHeadSha = expectedHeadSha;
     },

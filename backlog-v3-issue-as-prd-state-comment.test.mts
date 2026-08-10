@@ -24,6 +24,8 @@ function state(overrides: Partial<IssueAsPrdParentState> = {}): IssueAsPrdParent
     completedExtraReviewRounds: 0,
     aggregateValidationRepairs: { pre_review: 0, pre_delivery: 0 },
     rebaseConflictDiagnostics: [],
+    accumulationDiverged: false,
+    mainlineRefresh: null,
     partialCauseChildNumber: null,
     lastTransitionAt: "2026-07-02T12:00:00Z",
     ...overrides,
@@ -74,4 +76,61 @@ test("updates the existing state comment when comment id is known", async () => 
 
   assert.deepEqual(calls, ["update:17:true"]);
   assert.equal(result.commentId, 17);
+});
+
+test("read-back verifies a newly created comment and retries without creating a duplicate", async () => {
+  const calls: string[] = [];
+  let persistedBody = "stale";
+  const result = await persistIssueAsPrdParentStateComment(
+    {
+      parentNumber: 42,
+      commentId: null,
+      state: state({ phase: "initial_drained" }),
+    },
+    {
+      createComment({ body }) {
+        calls.push("create");
+        persistedBody = "eventually-consistent";
+        assert.match(body, /"phase": "initial_drained"/);
+        return 91;
+      },
+      updateComment({ commentId, body }) {
+        calls.push(`update:${commentId}`);
+        persistedBody = body;
+      },
+      readComments() {
+        calls.push("read");
+        return [{ id: 91, body: persistedBody }];
+      },
+    },
+  );
+
+  assert.equal(result.commentId, 91);
+  assert.deepEqual(calls, ["create", "read", "update:91", "read"]);
+});
+
+test("read-back failure is terminal after the bounded retry budget", async () => {
+  let updates = 0;
+  await assert.rejects(
+    persistIssueAsPrdParentStateComment(
+      {
+        parentNumber: 42,
+        commentId: 17,
+        state: state({ phase: "decomposed" }),
+      },
+      {
+        createComment() {
+          throw new Error("should not create");
+        },
+        updateComment() {
+          updates += 1;
+        },
+        readComments() {
+          return [{ id: 17, body: "stale" }];
+        },
+      },
+    ),
+    /Parent state comment persistence failed:.*verification mismatch/s,
+  );
+  assert.equal(updates, 3);
 });

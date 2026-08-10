@@ -17,30 +17,28 @@ test("PR review runner prompt files exist at the paths it loads", () => {
     "pr-standards-review-agent-system-prompt.md",
     "pr-spec-review-agent-system-prompt.md",
     "pr-review-user-prompt.md",
+    "pr-standards-review-user-prompt.md",
+    "pr-spec-review-user-prompt.md",
   ]) {
     assert.match(runner, new RegExp(`new URL\\(\"\\./${name}\"`));
     assert.ok(read(name).length > 0, `${name} must not be empty`);
   }
 });
 
-test("coordinator prompt enforces sequential reviews and guarded completion", () => {
+test("fixer prompt preserves every host-owned finding disposition", () => {
   const prompt = read("pr-review-agent-system-prompt.md");
 
   assert.match(prompt, /untrusted review data/i);
-  assert.match(prompt, /Do not edit files before both specialist reviews finish/i);
-  assert.ok(
-    prompt.indexOf("pr-standards-review") < prompt.indexOf("pr-spec-review"),
-    "Standards must run before Spec",
-  );
-  assert.match(prompt, /retry once/i);
+  assert.match(prompt, /findings are immutable inputs/i);
+  assert.match(prompt, /every finding ID exactly one disposition/i);
+  assert.match(prompt, /serious unresolved finding does not prevent review completion/i);
+  assert.match(prompt, /`fixed` or `not_fixed`/i);
+  assert.match(prompt, /FIX_RESULT_PATH/);
   assert.match(prompt, /never use `git add -A` or `git add \.`/i);
-  assert.match(prompt, /never emit it for partial, blocked, or unvalidated work/i);
   assert.match(prompt, /<\/pr_review_complete>/);
-  assert.match(prompt, /file-backed review input/i);
-  assert.match(prompt, /input file paths/i);
 });
 
-test("specialist prompts require read-only tagged JSON with an evidence bar", () => {
+test("specialist prompts report non-local blockers without a finding cap", () => {
   const cases = [
     ["pr-standards-review-agent-system-prompt.md", "standards_findings", "STD-001"],
     ["pr-spec-review-agent-system-prompt.md", "spec_findings", "SPEC-001"],
@@ -54,13 +52,14 @@ test("specialist prompts require read-only tagged JSON with an evidence bar", ()
     assert.match(prompt, new RegExp(`<${tag}>`));
     assert.match(prompt, new RegExp(`<\\/${tag}>`));
     assert.match(prompt, new RegExp(id));
-    assert.match(prompt, /Confidence is at least 80/i);
-    assert.match(prompt, /at most five findings/i);
-    assert.match(prompt, /supplied file paths/i);
+    assert.match(prompt, /Confidence must be at least 70/i);
+    assert.match(prompt, /There is no arbitrary finding-count cap/i);
+    assert.match(prompt, /architecture/i);
+    assert.doesNotMatch(prompt, /fix is local/i);
   }
 });
 
-test("user prompt contains exactly the runtime placeholders supplied by the runner", () => {
+test("fixer user prompt contains immutable specialist artifact paths", () => {
   const prompt = read("pr-review-user-prompt.md");
   const placeholders = [
     ...prompt.matchAll(/{{([^{}]+)}}/g),
@@ -69,6 +68,48 @@ test("user prompt contains exactly the runtime placeholders supplied by the runn
   assert.deepEqual(placeholders, [
     "BASE_SHA",
     "CHANGED_FILES_PATH",
+    "COMMIT_LIST_PATH",
+    "DIFF_BYTES",
+    "DIFF_PATH",
+    "DIFF_STAT_PATH",
+    "ECOSYSTEMS",
+    "FINDINGS_PATH",
+    "FIX_RESULT_PATH",
+    "LINKED_ISSUES_PATH",
+    "METADATA_PATH",
+    "PR_BODY_PATH",
+    "PR_NUMBER",
+    "PR_TITLE",
+    "REVIEW_ASPECTS",
+    "SPEC_REVIEW_PATH",
+    "STANDARDS_FILES_PATH",
+    "STANDARDS_REVIEW_PATH",
+  ]);
+  assert.match(prompt, /untrusted review data/i);
+  assert.match(prompt, /Original review inputs/i);
+  assert.match(prompt, /Immutable specialist outputs/i);
+});
+
+test("specialist user prompts receive explicit context manifests", () => {
+  const standards = read("pr-standards-review-user-prompt.md");
+  const spec = read("pr-spec-review-user-prompt.md");
+
+  assert.deepEqual(placeholders(standards), [
+    "BASE_SHA",
+    "CHANGED_FILES_PATH",
+    "COMMIT_LIST_PATH",
+    "DIFF_BYTES",
+    "DIFF_PATH",
+    "DIFF_STAT_PATH",
+    "ECOSYSTEMS",
+    "METADATA_PATH",
+    "REVIEW_ASPECTS",
+    "STANDARDS_FILES_PATH",
+  ]);
+  assert.deepEqual(placeholders(spec), [
+    "BASE_SHA",
+    "CHANGED_FILES_PATH",
+    "COMMIT_LIST_PATH",
     "DIFF_BYTES",
     "DIFF_PATH",
     "DIFF_STAT_PATH",
@@ -78,12 +119,8 @@ test("user prompt contains exactly the runtime placeholders supplied by the runn
     "PR_BODY_PATH",
     "PR_NUMBER",
     "PR_TITLE",
-    "RESULT_PATH",
     "REVIEW_ASPECTS",
   ]);
-  assert.match(prompt, /untrusted review data/i);
-  assert.match(prompt, /File-backed inputs/i);
-  assert.match(prompt, /Do not expect .* inline/i);
 });
 
 test("runner passes file paths and labels via REST", () => {
@@ -93,6 +130,12 @@ test("runner passes file paths and labels via REST", () => {
   assert.match(runner, /LINKED_ISSUES_PATH:\s+reviewInputs\.paths\.linkedIssues/);
   assert.match(runner, /DIFF_PATH:\s+reviewInputs\.paths\.diff/);
   assert.match(runner, /METADATA_PATH:\s+reviewInputs\.paths\.metadata/);
+  assert.match(runner, /STANDARDS_FILES_PATH:\s+reviewInputs\.paths\.standardsFiles/);
+  assert.match(runner, /COMMIT_LIST_PATH:\s+reviewInputs\.paths\.commitList/);
+  assert.match(runner, /acquirePrReviewSpecialist<StandardsReview>/);
+  assert.match(runner, /acquirePrReviewSpecialist<SpecReview>/);
+  assert.match(runner, /writePrReviewSpecialistArtifacts/);
+  assert.match(runner, /buildPrReviewResult/);
   assert.doesNotMatch(runner, /\{\{DIFF\}\}/);
   assert.doesNotMatch(runner, /\{\{PR_BODY\}\}/);
   assert.doesNotMatch(runner, /\{\{LINKED_ISSUES\}\}/);
@@ -100,3 +143,41 @@ test("runner passes file paths and labels via REST", () => {
   assert.match(runner, /repos\/\{owner\}\/\{repo\}\/issues\/\$\{prNumber\}\/labels/);
   assert.doesNotMatch(runner, /\[\s*"pr",\s*"edit",/);
 });
+
+test("runner host-acquires both reviews before starting the fixer", () => {
+  const runner = read("run-pr-review-v1.mts");
+  const standardsCall = runner.indexOf(
+    "const standardsAcquisition = await acquirePrReviewSpecialist",
+  );
+  const specCall = runner.indexOf(
+    "const specAcquisition = await acquirePrReviewSpecialist",
+  );
+  const artifactWrite = runner.indexOf(
+    "const outputPaths = writePrReviewSpecialistArtifacts",
+  );
+  const fixerRun = runner.indexOf("const runName = `pr-review #${pr.number}`");
+
+  assert.ok(standardsCall >= 0);
+  assert.ok(specCall > standardsCall);
+  assert.ok(artifactWrite > specCall);
+  assert.ok(fixerRun > artifactWrite);
+  assert.match(runner, /const PR_SPECIALIST_MAX_ATTEMPTS = 2/);
+  assert.match(runner, /completionSignal: "<\/standards_findings>"/);
+  assert.match(runner, /completionSignal: "<\/spec_findings>"/);
+  assert.match(runner, /Invalid PR review finding accounting/);
+});
+
+test("fixer agent cannot delegate review work", () => {
+  const definitions = read("custom-agent-defs.mts");
+  const fixerBlock = definitions.slice(
+    definitions.indexOf("export const PR_REVIEW_AGENT_CONFIG"),
+    definitions.indexOf("export const PR_STANDARDS_REVIEW_AGENT_CONFIG"),
+  );
+  assert.match(fixerBlock, /task: "deny"/);
+});
+
+function placeholders(prompt: string): string[] {
+  return [...prompt.matchAll(/{{([^{}]+)}}/g)]
+    .map((match) => match[1]!)
+    .sort();
+}

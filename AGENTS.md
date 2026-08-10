@@ -29,7 +29,7 @@ live traffic. Unless you were pointed somewhere else, your change belongs in one
 | File | What it is | Lines | Deep dive |
 | --- | --- | --- | --- |
 | **`run-backlog-v3.mts`** | The production **Issue-as-PRD backlog loop**. Claims one triaged parent issue, decomposes it into GitHub child issues, drives each child through coder↔reviewer, accumulates approved work on a durable parent branch, runs one full-parent review, delivers review-ready. | 4.4k | [docs/runners.md#run-backlog-v3mts](docs/runners.md#run-backlog-v3mts) |
-| **`run-pr-review-v1.mts`** | The **PR review loop**. Polls open PRs, runs one agent that fans out to Standards and Spec sub-agents, applies the fixes itself, pushes, labels `ai-review-complete`. | 1.1k | [docs/runners.md#run-pr-review-v1mts](docs/runners.md#run-pr-review-v1mts) |
+| **`run-pr-review-v1.mts`** | The **PR review loop**. Polls open PRs, host-runs independent Standards and Spec sessions with parsed artifacts, gives immutable findings to a fresh fixer session, pushes, labels `ai-review-complete`. | 1.3k | [docs/runners.md#run-pr-review-v1mts](docs/runners.md#run-pr-review-v1mts) |
 | **`tui-companion.mts`** | The read-only **Companion TUI**. Renders live loop state from `.sandcastle/tui/` in a second terminal. Multi-loop aware. | 470 | [docs/runners.md#tui-companionmts](docs/runners.md#tui-companionmts) |
 
 Everything else is either a shared module those three import, or a frozen older runner.
@@ -43,9 +43,10 @@ Before editing any of the three, know these three things:
   `issue-as-prd-*` pure modules. If you are adding an `if` to the runner, check whether it
   belongs in `issue-as-prd-orchestrator.mts`, `issue-as-prd-state.mts`, or
   `per-branch-engine.mts` instead.
-- **`run-pr-review-v1.mts` is deliberately the simplest loop.** No engine, no state machine,
-  no durable state comment — one agent, one pass, one label. It is not a smaller
-  `run-backlog-v3`, and it should not grow into one.
+- **`run-pr-review-v1.mts` is deliberately a simple staged loop.** No engine, no state
+  machine, no durable state comment — two independent read-only specialist sessions, one
+  fresh fixer session, one label. It is not a smaller `run-backlog-v3`, and it should not
+  grow into one.
 - **`tui-companion.mts` may never write.** It reads `.sandcastle/tui/` and nothing else. All
   derivation logic lives in `tui-view.mts` so it can be tested without Ink; the component
   file holds rendering only.
@@ -179,14 +180,13 @@ import.meta.url))`). Match the surrounding style of whichever runner you are in.
 until you add it (or a matching glob) to the `typecheck` script in `package.json`. Same for
 `npm run build`.
 
-Currently outside typecheck: **`run-pr-review-v1.mts`**, `run-backlog-v4.mts`,
-`run-prd-v5.mts`, `run-backlog-v2.mts`, and the older `run-prd-*` runners. If you edit one —
-and `run-pr-review-v1.mts` is a hot file, so you will — typecheck it manually before
-claiming it compiles:
+`run-pr-review-v1.mts` and its `pr-review-*` pure modules are included explicitly. Older
+runner variants remain outside the allowlist unless named by the script. If you edit an
+outside runner, typecheck it manually before claiming it compiles:
 
 ```bash
 npx tsc --noEmit --allowImportingTsExtensions --module nodenext --moduleResolution nodenext \
-  --target es2022 --types node types/ai-hero-sandcastle.d.ts run-pr-review-v1.mts
+  --target es2022 --types node types/ai-hero-sandcastle.d.ts <runner>.mts
 ```
 
 New test files at the root are picked up automatically by `tsx --test *.test.mts`.

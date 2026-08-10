@@ -44,6 +44,8 @@ test("issue-as-prd models default to reviewer and follow reviewer override unles
     configA.models.reviewer,
   );
   assert.equal(configA.models.subtaskReadiness, configA.models.reviewer);
+  assert.equal(configA.models.subtaskImprovement, configA.models.reviewer);
+  assert.equal(configA.models.rebase, configA.models.reworkTier3);
 
   const rootB = repoRoot("loop-config-reviewer-override");
   writeFileSync(
@@ -54,16 +56,41 @@ test("issue-as-prd models default to reviewer and follow reviewer override unles
   assert.equal(configB.models.reviewer, "custom-reviewer");
   assert.equal(configB.models.initialIssueDecomposer, "custom-reviewer");
   assert.equal(configB.models.subtaskReadiness, "custom-reviewer");
+  assert.equal(configB.models.subtaskImprovement, "custom-reviewer");
 
   const rootC = repoRoot("loop-config-model-independent");
   writeFileSync(
     join(rootC, ".sandcastle", "config.mts"),
-    "export default { models: { reviewer: 'reviewer-x', initialIssueDecomposer: 'decomposer-y', subtaskReadiness: 'readiness-z' } };",
+    "export default { models: { reviewer: 'reviewer-x', initialIssueDecomposer: 'decomposer-y', subtaskReadiness: 'readiness-z', subtaskImprovement: 'improvement-q', rebase: 'rebase-r' } };",
   );
   const configC = await loadSandcastleLoopConfig(rootC);
   assert.equal(configC.models.reviewer, "reviewer-x");
   assert.equal(configC.models.initialIssueDecomposer, "decomposer-y");
   assert.equal(configC.models.subtaskReadiness, "readiness-z");
+  assert.equal(configC.models.subtaskImprovement, "improvement-q");
+  assert.equal(configC.models.rebase, "rebase-r");
+});
+
+test("PR review stage models follow reviewer unless independently overridden", async () => {
+  const rootA = repoRoot("loop-config-pr-review-model-defaults");
+  writeFileSync(
+    join(rootA, ".sandcastle", "config.mts"),
+    "export default { models: { reviewer: 'reviewer-x' } };",
+  );
+  const configA = await loadSandcastleLoopConfig(rootA);
+  assert.equal(configA.models.prReviewStandards, "reviewer-x");
+  assert.equal(configA.models.prReviewSpec, "reviewer-x");
+  assert.equal(configA.models.prReviewFixer, "reviewer-x");
+
+  const rootB = repoRoot("loop-config-pr-review-model-independent");
+  writeFileSync(
+    join(rootB, ".sandcastle", "config.mts"),
+    "export default { models: { reviewer: 'reviewer-x', prReviewStandards: 'standards-y', prReviewSpec: 'spec-z', prReviewFixer: 'fixer-q' } };",
+  );
+  const configB = await loadSandcastleLoopConfig(rootB);
+  assert.equal(configB.models.prReviewStandards, "standards-y");
+  assert.equal(configB.models.prReviewSpec, "spec-z");
+  assert.equal(configB.models.prReviewFixer, "fixer-q");
 });
 
 test("issueAsPrd.parentCommentMaxBytes defaults to 32000 and accepts positive integers", async () => {

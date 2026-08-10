@@ -21,6 +21,8 @@ function state(overrides: Partial<IssueAsPrdParentState> = {}): IssueAsPrdParent
     completedExtraReviewRounds: 0,
     aggregateValidationRepairs: { pre_review: 0, pre_delivery: 0 },
     rebaseConflictDiagnostics: [],
+    accumulationDiverged: false,
+    mainlineRefresh: null,
     partialCauseChildNumber: null,
     lastTransitionAt: "2026-07-02T12:00:00Z",
     ...overrides,

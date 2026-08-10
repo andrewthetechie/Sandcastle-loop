@@ -59,15 +59,15 @@ _Avoid_: Open issue, unprocessed issue, queue membership
 ### Issue-as-PRD loop
 
 **Issue-as-PRD loop**:
-A backlog loop variant in which each triaged backlog issue is treated as its own PRD: the loop decomposes the issue into readiness-gated child issues, fast-forwards approved child work onto a per-issue accumulation branch, runs exactly one full-parent extra review round, readiness-gates and drains any follow-ups once, and then delivers the branch review-ready. A reviewed partial branch may be delivered after a child gets stuck. Distinct from the Backlog-clearer loop (which does no decomposition, accumulation, or full-issue extra review) and from the PRD loop (whose PRD is a file).
+A backlog loop variant in which each triaged backlog issue is treated as its own PRD: the loop decomposes the issue into child issues, improves each child just before implementation, fast-forwards approved child work onto a per-issue accumulation branch, runs exactly one full-parent extra review round, improves and drains any follow-ups once, and then delivers the branch review-ready. A reviewed partial branch may be delivered after a child gets stuck. Distinct from the Backlog-clearer loop (which does no decomposition, accumulation, or full-issue extra review) and from the PRD loop (whose PRD is a file).
 _Avoid_: Backlog-clearer loop, PRD loop, mini-PRD, decomposing backlog loop
 
 **Parent issue**:
-The incoming triaged backlog issue that plays the PRD role for one pass of the Issue-as-PRD loop. It retains its configured backlog labels, gains `agent-in-progress` while owned, and is resumed before fresh work after a restart. Clean completion earns `Review`; reviewed incomplete delivery adds `agent-partial`; a reviewed branch needing manual mainline integration adds `agent-rebase-needed`; a parent-level failure with no reviewable delivery earns `agent-stuck` without `Review`.
+The incoming triaged backlog issue that plays the PRD role for one pass of the Issue-as-PRD loop. It retains its configured backlog labels, gains `agent-in-progress` while owned, and is resumed before fresh work after a restart. A parent whose accumulation cannot be integrated with current mainline gains `agent-diverged` while work continues; clean completion earns `Review`, reviewed incomplete delivery adds `agent-partial`, reviewed delivery needing manual mainline integration adds `agent-rebase-needed`, and a parent-level failure with no reviewable delivery earns `agent-stuck` without `Review`.
 _Avoid_: PRD issue, main issue, epic, backlog issue
 
 **Parent state comment**:
-The single host-managed GitHub comment on a parent issue containing schema-versioned tagged orchestration state: accumulation branch, original fork SHA, full-parent review base, phase, queue label, bounded review/repair budgets, and transition time. It is a restart checkpoint, is verified against branches/labels/children, and is excluded from agent-facing parent context.
+The single host-managed GitHub comment on a parent issue containing schema-versioned tagged orchestration state: accumulation branch, original fork SHA, full-parent review base, phase, queue label, any in-flight mainline refresh, divergence state, bounded review/repair budgets, and transition time. It is a restart checkpoint, is verified against branches/labels/children, and is excluded from agent-facing parent context.
 _Avoid_: Parent specification, issue body, human comment, local state file
 
 **Sub-task child issue**:
@@ -79,27 +79,35 @@ The first decomposition pass that turns normalized parent context (the issue bod
 _Avoid_: Extra-review decomposition, PRD decomposition, follow-up decomposition
 
 **Issue accumulation branch**:
-The stable per-parent integration branch (`issue-<N>-accumulation`) initially forked from origin/main and pushed as a recovery checkpoint. Child branches fork from its current tip sequentially; approved child HEADs fast-forward it and are checkpointed remotely without temporary pull requests. Before full-parent review it gets one best-effort refresh onto current mainline, and it is ultimately delivered for human review rather than auto-merged.
+The stable per-parent integration branch (`issue-<N>-accumulation`) initially forked from origin/main and pushed as a recovery checkpoint. Child branches fork from its current tip sequentially; after every accumulation advance, and again before full-parent review, the loop refreshes it onto the latest observed mainline unless it has become a Diverged accumulation. It is ultimately delivered for human review rather than auto-merged.
 _Avoid_: Completed PRD branch, issue branch, work branch, PRD branch
+
+**Diverged accumulation**:
+An Issue accumulation branch whose deterministic and agent-assisted integration with current mainline could not be completed safely. The parent records `agent-diverged`, preserves the pre-rebase checkpoint and diagnostics, continues child implementation from that checkpoint, and suppresses further automatic rebase attempts for that parent, including after restart; `agent-diverged` remains on the parent through delivery.
+_Avoid_: Rebase-needed delivery, local/remote branch divergence, stuck parent
+
+**Rebase agent**:
+A dedicated agent that attempts semantic conflict resolution between an Issue accumulation branch and current mainline only after a deterministic rebase conflicts. It preserves the intent of both histories and reports an unresolved result instead of guessing when the safe resolution is ambiguous.
+_Avoid_: Coder, rework agent, deterministic rebase, merge agent
 
 **Partial delivery**:
 The fail-soft terminal when at least one child integrated before an initial or review-follow-up child got stuck. The accumulated partial diff still receives aggregate validation, one full-parent extra review, and one follow-up drain before the branch is delivered with `Review` plus `agent-partial`; the failed child retains `agent-stuck`. An empty or unvalidated partial branch is not delivered and instead leaves the parent `agent-stuck` without `Review`.
 _Avoid_: Abandoned parent, stuck issue, review-ready issue, clean delivery
 
 **Rebase-needed delivery**:
-A completed or partial reviewed accumulation branch delivered with `Review` plus `agent-rebase-needed` because the pre-review mainline rebase conflicted or mainline advanced after full-parent review began. The loop preserves the reviewed branch and diagnostics and leaves the final rebase to the human; this is neither partial implementation nor agent failure by itself.
+A completed or partial reviewed accumulation branch delivered with `Review` plus `agent-rebase-needed` because its accumulation diverged or mainline advanced after full-parent review began. A diverged delivery also retains `agent-diverged`; the loop preserves the reviewed branch and diagnostics, leaves the final rebase to the human, and continues processing other parents.
 _Avoid_: Partial delivery, parent-level stuck, automatic second rebase
 
-**Sub-task readiness gate**:
-A per-child step that runs once before the child's first coder attempt, for both initial and full-parent-review follow-up batches. It reuses the configured reviewer model with dedicated prompts and receives a clean context containing the child, normalized parent context, the active sibling batch, and repository access. It returns a machine-readable disposition plus a complete proposed body; the host validates, persists, and verifies the body. The agent never edits GitHub itself. Distinct from the reviewer, which gates code diffs rather than issue drafts.
-_Avoid_: Reviewer, extra review round, initial issue decomposition, coder gate
+**Just-in-time sub-task improvement**:
+An evidence-backed refinement of a sub-task child issue immediately before implementation. It preserves the child's intent while improving its title and body against the latest accumulated parent work, and may remove the child from the queue only when that evidence proves the work is duplicate or already implemented.
+_Avoid_: Sub-task readiness gate, reviewer, coder gate, issue rewrite
 
-**Gate outcome**:
-The successful disposition assigned by the sub-task readiness gate: `fixed` (findings resolved in the proposed body, persist it and proceed), `not-actionable` (duplicate or already implemented, so the host closes and drops the child), or `assumed` (semantic ambiguity resolved by a recorded recommended-default assumption, persist it and proceed). Invocation, parsing, or persistence exhaustion is a parent-level technical failure rather than a gate outcome or child stuck classification.
-_Avoid_: Reviewer verdict, readiness label, needs-info, stuck
+**Sub-task improvement outcome**:
+The result of just-in-time sub-task improvement: `improved` persists a stronger actionable title or body, `unchanged` confirms with evidence that the child is already implementation-ready, and `redundant` proves that the work is duplicate or already implemented and removes it from the queue. Missing human decisions remain explicit in an actionable child rather than becoming assumptions; invocation, parsing, or persistence exhaustion is a parent-level technical failure.
+_Avoid_: Gate outcome, reviewer verdict, readiness label, needs-info, stuck
 
 **Dropped sub-task**:
-A sub-task child issue the readiness gate closes without coding because evidence shows there is no work to do (duplicate or already implemented). It is removed from the inner drain queue and never gets a branch. Distinct from a stuck sub-task, which was attempted and failed.
+A sub-task child issue that just-in-time sub-task improvement closes without coding because evidence proves there is no work to do (duplicate or already implemented). It is removed from the inner drain queue and never gets a branch. Distinct from a stuck sub-task, which was attempted and failed.
 _Avoid_: Stuck sub-task, skipped sub-task, not-actionable issue
 
 ### Companion TUI
@@ -113,7 +121,7 @@ The smallest unit of loop activity the Companion TUI displays and times. A step 
 _Avoid_: Stage, phase, task, action
 
 **Agent step**:
-A step that is one sandboxed agent invocation (initial decomposer, sub-task readiness, coder, rework, reviewer, or an extra-review session such as code-quality, two-axis, issue-decomposer, or escalation). It is the only kind of step that produces a working log.
+A step that is one sandboxed agent invocation (initial decomposer, just-in-time sub-task improvement, coder, rework, reviewer, or an extra-review session such as code-quality, two-axis, issue-decomposer, or escalation). It is the only kind of step that produces a working log.
 _Avoid_: Agent run, invocation, agent stage
 
 **Host step**:
@@ -139,7 +147,7 @@ _Avoid_: Right pane, log pane, output pane
 ### PR review loop
 
 **PR risk rating**:
-A 0–5 assessment assigned by the coordinating `pr-review` agent to the combined change (original PR plus any fixes it applied). It judges the change itself, not CI or external check status. Distinct from a specialist severity or confidence score.
+A 0–5 assessment assigned by the `pr-review` fixer to the combined change (original PR plus any fixes it applied). It judges the change itself, not CI or external check status. Distinct from a specialist severity or confidence score.
 _Avoid_: Risk score, severity, confidence
 
 **Risk label**:
@@ -147,11 +155,15 @@ A GitHub label `risk-N` (0 ≤ N ≤ 5) applied by the PR review loop after a su
 _Avoid_: Severity label, priority label
 
 **PR review result artifact**:
-The JSON file the coordinating agent writes to `RESULT_PATH` before emitting the completion signal. It carries the risk rating, summary, findings, fixes applied, rejected findings with reasons, and optional notes. The host validates it and uses it to produce the PR comment and risk label.
+The host-owned JSON file constructed from the immutable Standards and Spec findings plus the validated PR review fix-result artifact. It carries the risk rating, summary, every specialist finding, fixes applied, unresolved findings with reasons, and optional notes. The host uses it to produce the PR comment and risk label.
 _Avoid_: Review report, findings file, output JSON
 
+**PR review fix-result artifact**:
+The JSON file the `pr-review` fixer writes after the two independent specialist sessions. It assigns every immutable specialist finding ID exactly one `fixed` or `not_fixed` disposition and supplies the combined-change risk rating and summary. The host rejects missing, duplicate, or unknown dispositions before constructing the PR review result artifact.
+_Avoid_: PR review result artifact, specialist report, findings file
+
 **Reviewed HEAD SHA**:
-The commit SHA the PR review loop reviewed, recorded in the result artifact and the posted comment. External automation can compare it to the PR's current HEAD to detect staleness.
+The commit SHA at the end of the PR review loop, recorded in the posted comment after any fixer commit. External automation can compare it to the PR's current HEAD to detect staleness.
 _Avoid_: Review SHA, head commit
 
 **Re-review**:

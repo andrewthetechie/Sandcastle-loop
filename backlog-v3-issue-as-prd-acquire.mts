@@ -57,6 +57,7 @@ export interface AcquireNextIssueAsPrdParentDeps extends FreshParentClaimDeps {
   viewParent(parentNumber: number): Promise<GitHubIssueRecord> | GitHubIssueRecord;
   observeRecovery(parent: GitHubIssueRecord): Promise<ObservedParentRecoveryState> | ObservedParentRecoveryState;
   updateStateComment(input: {
+    parentNumber: number;
     commentId: number;
     body: string;
   }): Promise<void> | void;
@@ -107,7 +108,7 @@ export async function acquireNextIssueAsPrdParent(input: {
         };
       }
     }
-    return resumeSelection(parent, reconciled);
+    return resumeSelection(parent, reconciled, deps);
   }
 
   switch (reconciled.kind) {
@@ -168,6 +169,7 @@ async function requeueFailedParent(
   });
   await deps.addInProgressLabel(parent.number);
   await deps.updateStateComment({
+    parentNumber: parent.number,
     commentId: reconciled.commentId,
     body: renderParentStateComment(requeuedState),
   });
@@ -246,12 +248,41 @@ async function claimParentAndConfirm(
   };
 }
 
-function resumeSelection(
+async function resumeSelection(
   parent: GitHubIssueRecord,
   reconciled: ResumableParentState,
-): AcquireNextIssueAsPrdParentResult {
+  deps: AcquireNextIssueAsPrdParentDeps,
+): Promise<AcquireNextIssueAsPrdParentResult> {
   switch (reconciled.kind) {
     case "resume":
+      if (hasSchemaVersionOneStateComment(parent)) {
+        // Migration is durable before the parent resumes. The parsed state has
+        // already mapped readiness phases to queue phases and cleared any old
+        // marker authority; the verified read prevents a crash from stranding
+        // an active v1 parent between conversion and its next child.
+        await deps.updateStateComment({
+          parentNumber: parent.number,
+          commentId: reconciled.commentId,
+          body: renderParentStateComment(reconciled.state),
+        });
+        const verified = await deps.viewParent(parent.number);
+        const parsed = parseSingleMarkedStateComment(verified.comments);
+        if (!parsed || parsed.schemaVersion !== 2) {
+          return {
+            kind: "ownership_ambiguous",
+            parent: verified,
+            diagnostics: ["Schema-version-1 parent state migration did not persist a readable version-2 comment."],
+            normalizedContext: reconciled.normalizedContext,
+          };
+        }
+        return {
+          kind: "resumed",
+          parent: verified,
+          commentId: reconciled.commentId,
+          state: parsed,
+          normalizedContext: reconciled.normalizedContext,
+        };
+      }
       return {
         kind: "resumed",
         parent,
@@ -276,6 +307,14 @@ function resumeSelection(
         normalizedContext: reconciled.normalizedContext,
       };
   }
+}
+
+function hasSchemaVersionOneStateComment(parent: GitHubIssueRecord): boolean {
+  return parent.comments.some(
+    (comment) =>
+      comment.body.includes(ISSUE_AS_PRD_STATE_MARKER) &&
+      /"schemaVersion"\s*:\s*1\b/u.test(comment.body),
+  );
 }
 
 function parseSingleMarkedStateComment(

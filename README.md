@@ -8,12 +8,13 @@ The three live entrypoints:
 
 | Runner | What it does |
 | --- | --- |
-| `run-backlog-v3.mts` | **Issue-as-PRD backlog loop.** Claims a triaged parent issue, decomposes it into child issues, drives each through coder↔reviewer, accumulates approved work on a durable branch, reviews the whole thing once, delivers review-ready. |
-| `run-pr-review-v1.mts` | **PR review loop.** Polls open PRs, runs a review agent that fans out to Standards and Spec sub-agents, applies the fixes, pushes, labels `ai-review-complete`. |
+| `run-backlog-v3.mts` | **Issue-as-PRD backlog loop.** Claims a triaged parent issue, improves each selected child just in time, drives coder↔reviewer, continuously refreshes the durable accumulation onto mainline, reviews the whole parent once, and delivers review-ready. |
+| `run-pr-review-v1.mts` | **PR review loop.** Polls open PRs, host-runs independent Standards and Spec sessions, gives their immutable findings to a fresh fixer session, pushes, labels `ai-review-complete`. |
 | `tui-companion.mts` | **Companion TUI.** Read-only second-terminal view of a running loop. |
 
-Older `run-prd-*` and `run-backlog-*` versions are kept as frozen snapshots — see
-[docs/runners.md](docs/runners.md).
+Older `run-prd-*` and `run-backlog-*` versions are kept as frozen snapshots. PRD 006
+explicitly designates backlog v3 as the active Issue-as-PRD lineage while leaving v4
+outside that capability; see [ADR 0004](docs/adr/0004-backlog-v3-is-the-active-issue-as-prd-lineage.md).
 
 ## Documentation
 

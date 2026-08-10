@@ -14,6 +14,11 @@ export const ISSUE_AS_PRD_LABELS = {
     color: "d4c5f9",
     description: "Review-ready branch needs a manual rebase onto current mainline",
   },
+  diverged: {
+    name: "agent-diverged",
+    color: "b60205",
+    description: "Automatic accumulation rebases are exhausted; human rebase is required",
+  },
   parentQueue: {
     color: "1d76db",
     description: "Temporary Issue-as-PRD queue for parent #N",
@@ -172,6 +177,31 @@ export function rebaseNeededPartialDeliveryLabelPlan(): LabelMutationPlan {
       REVIEW_LABEL,
       ISSUE_AS_PRD_LABELS.partial.name,
       ISSUE_AS_PRD_LABELS.rebaseNeeded.name,
+    ],
+    deleteQueueLabel: true,
+  };
+}
+
+export function divergedCleanDeliveryLabelPlan(): LabelMutationPlan {
+  return {
+    remove: [ISSUE_AS_PRD_LABELS.inProgress.name],
+    add: [
+      REVIEW_LABEL,
+      ISSUE_AS_PRD_LABELS.rebaseNeeded.name,
+      ISSUE_AS_PRD_LABELS.diverged.name,
+    ],
+    deleteQueueLabel: true,
+  };
+}
+
+export function divergedPartialDeliveryLabelPlan(): LabelMutationPlan {
+  return {
+    remove: [ISSUE_AS_PRD_LABELS.inProgress.name],
+    add: [
+      REVIEW_LABEL,
+      ISSUE_AS_PRD_LABELS.partial.name,
+      ISSUE_AS_PRD_LABELS.rebaseNeeded.name,
+      ISSUE_AS_PRD_LABELS.diverged.name,
     ],
     deleteQueueLabel: true,
   };

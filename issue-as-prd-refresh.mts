@@ -26,6 +26,324 @@ export interface RefreshGitDeps {
   revParse(ref: string): Promise<string> | string;
 }
 
+export interface MainlineRefreshJournal {
+  preRebaseAccumulationSha: string;
+  targetMainlineSha: string;
+  candidateSha: string;
+}
+
+export type ContinuousMainlineRefreshResult =
+  | {
+      kind: "unchanged" | "refreshed";
+      accumulationHeadSha: string;
+      attemptedMainlineSha: string;
+    }
+  | {
+      kind: "diverged";
+      accumulationHeadSha: string;
+      attemptedMainlineSha: string;
+      diagnostics: string[];
+    };
+
+export interface ContinuousMainlineRefreshDeps {
+  readAccumulationHeads(input: {
+    accumulationBranch: string;
+  }): Promise<{ localHeadSha: string; remoteHeadSha: string }> | {
+    localHeadSha: string;
+    remoteHeadSha: string;
+  };
+  fetchMainline(input: { mainlineRef: string }): Promise<string> | string;
+  isAncestor(input: {
+    ancestorSha: string;
+    descendantSha: string;
+  }): Promise<boolean> | boolean;
+  buildDeterministicCandidate(input: {
+    accumulationBranch: string;
+    preRebaseAccumulationSha: string;
+    targetMainlineSha: string;
+  }): Promise<
+    | { kind: "candidate"; candidateSha: string }
+    | { kind: "conflict"; diagnostics: string[] }
+    | { kind: "failure"; diagnostics: string[] }
+  >;
+  runRebaseAgent(input: {
+    accumulationBranch: string;
+    preRebaseAccumulationSha: string;
+    targetMainlineSha: string;
+  }): Promise<
+    | {
+        kind: "resolved";
+        preRebaseAccumulationSha: string;
+        targetMainlineSha: string;
+        candidateSha: string;
+      }
+    | { kind: "unresolved"; diagnostics: string[] }
+    | { kind: "invalid"; diagnostics: string[] }
+  >;
+  verifyCandidate(input: {
+    candidateSha: string;
+    targetMainlineSha: string;
+    validation: "structural" | "full";
+  }): Promise<{ ok: true } | { ok: false; diagnostics: string[] }>;
+  verifyPreservedCheckpoint(input: {
+    accumulationBranch: string;
+    expectedSha: string;
+  }): Promise<{ ok: true } | { ok: false; diagnostics: string[] }>;
+  persistJournal(journal: MainlineRefreshJournal | null): Promise<void>;
+  promoteCandidate(input: {
+    accumulationBranch: string;
+    preRebaseAccumulationSha: string;
+    candidateSha: string;
+  }): Promise<void>;
+}
+
+export async function refreshAccumulationContinuously(input: {
+  accumulationBranch: string;
+  mainlineRef: string;
+  accumulationHeadSha: string;
+}, deps: ContinuousMainlineRefreshDeps): Promise<ContinuousMainlineRefreshResult> {
+  const heads = await deps.readAccumulationHeads({
+    accumulationBranch: input.accumulationBranch,
+  });
+  if (
+    heads.localHeadSha !== input.accumulationHeadSha ||
+    heads.remoteHeadSha !== input.accumulationHeadSha
+  ) {
+    throw new Error(
+      `Refresh requires verified accumulation checkpoint ${input.accumulationHeadSha}; local=${heads.localHeadSha} remote=${heads.remoteHeadSha}.`,
+    );
+  }
+
+  // One trigger observes exactly one freshly fetched mainline tip. Every
+  // later decision, including the agent path, stays bound to this SHA.
+  const targetMainlineSha = await deps.fetchMainline({ mainlineRef: input.mainlineRef });
+  if (await deps.isAncestor({
+    ancestorSha: targetMainlineSha,
+    descendantSha: input.accumulationHeadSha,
+  })) {
+    return {
+      kind: "unchanged",
+      accumulationHeadSha: input.accumulationHeadSha,
+      attemptedMainlineSha: targetMainlineSha,
+    };
+  }
+
+  const deterministic = await deps.buildDeterministicCandidate({
+    accumulationBranch: input.accumulationBranch,
+    preRebaseAccumulationSha: input.accumulationHeadSha,
+    targetMainlineSha,
+  });
+  if (deterministic.kind === "failure") {
+    throw new Error(
+      `Deterministic mainline refresh failed: ${sanitizeRefreshDiagnostics(deterministic.diagnostics).join("; ")}`,
+    );
+  }
+  if (deterministic.kind === "candidate") {
+    const verified = await deps.verifyCandidate({
+      candidateSha: deterministic.candidateSha,
+      targetMainlineSha,
+      validation: "structural",
+    });
+    if (!verified.ok) {
+      return divergedResult({
+        accumulationBranch: input.accumulationBranch,
+        accumulationHeadSha: input.accumulationHeadSha,
+        targetMainlineSha,
+        diagnostics: verified.diagnostics,
+        deps,
+      });
+    }
+    await journalAndPromote({
+      accumulationBranch: input.accumulationBranch,
+      preRebaseAccumulationSha: input.accumulationHeadSha,
+      targetMainlineSha,
+      candidateSha: deterministic.candidateSha,
+      deps,
+    });
+    return {
+      kind: "refreshed",
+      accumulationHeadSha: deterministic.candidateSha,
+      attemptedMainlineSha: targetMainlineSha,
+    };
+  }
+
+  let agent:
+    | Awaited<ReturnType<ContinuousMainlineRefreshDeps["runRebaseAgent"]>>
+    | { kind: "invalid"; diagnostics: string[] };
+  try {
+    agent = await deps.runRebaseAgent({
+      accumulationBranch: input.accumulationBranch,
+      preRebaseAccumulationSha: input.accumulationHeadSha,
+      targetMainlineSha,
+    });
+  } catch (error) {
+    agent = {
+      kind: "invalid",
+      diagnostics: [
+        `Rebase agent invocation failed: ${error instanceof Error ? error.message : String(error)}`,
+      ],
+    };
+  }
+  if (agent.kind !== "resolved") {
+    return divergedResult({
+      accumulationBranch: input.accumulationBranch,
+      accumulationHeadSha: input.accumulationHeadSha,
+      targetMainlineSha,
+      diagnostics: [...deterministic.diagnostics, ...agent.diagnostics],
+      deps,
+    });
+  }
+  if (
+    agent.preRebaseAccumulationSha !== input.accumulationHeadSha ||
+    agent.targetMainlineSha !== targetMainlineSha
+  ) {
+    return divergedResult({
+      accumulationBranch: input.accumulationBranch,
+      accumulationHeadSha: input.accumulationHeadSha,
+      targetMainlineSha,
+      diagnostics: [
+        ...deterministic.diagnostics,
+        "Rebase agent result did not bind to the requested checkpoint and mainline target.",
+      ],
+      deps,
+    });
+  }
+
+  const verified = await deps.verifyCandidate({
+    candidateSha: agent.candidateSha,
+    targetMainlineSha,
+    validation: "full",
+  });
+  if (!verified.ok) {
+    return divergedResult({
+      accumulationBranch: input.accumulationBranch,
+      accumulationHeadSha: input.accumulationHeadSha,
+      targetMainlineSha,
+      diagnostics: [...deterministic.diagnostics, ...verified.diagnostics],
+      deps,
+    });
+  }
+  await journalAndPromote({
+    accumulationBranch: input.accumulationBranch,
+    preRebaseAccumulationSha: input.accumulationHeadSha,
+    targetMainlineSha,
+    candidateSha: agent.candidateSha,
+    deps,
+  });
+  return {
+    kind: "refreshed",
+    accumulationHeadSha: agent.candidateSha,
+    attemptedMainlineSha: targetMainlineSha,
+  };
+}
+
+export interface MainlineRefreshRecoveryDeps {
+  readAccumulationHeads(input: {
+    accumulationBranch: string;
+  }): Promise<{ localHeadSha: string; remoteHeadSha: string }> | {
+    localHeadSha: string;
+    remoteHeadSha: string;
+  };
+  updateLocalAccumulation(input: {
+    accumulationBranch: string;
+    expectedCurrentSha: string;
+    targetSha: string;
+  }): Promise<void> | void;
+  persistJournal(journal: null): Promise<void>;
+}
+
+export async function recoverMainlineRefreshJournal(input: {
+  accumulationBranch: string;
+  journal: MainlineRefreshJournal;
+}, deps: MainlineRefreshRecoveryDeps): Promise<{
+  kind: "completed" | "abandoned";
+  accumulationHeadSha: string;
+}> {
+  const heads = await deps.readAccumulationHeads({
+    accumulationBranch: input.accumulationBranch,
+  });
+  const { preRebaseAccumulationSha, candidateSha } = input.journal;
+  const allowed = new Set([preRebaseAccumulationSha, candidateSha]);
+  if (!allowed.has(heads.localHeadSha) || !allowed.has(heads.remoteHeadSha)) {
+    throw new Error(
+      `Refresh journal cannot own local=${heads.localHeadSha} remote=${heads.remoteHeadSha}; expected ${preRebaseAccumulationSha} or ${candidateSha}.`,
+    );
+  }
+
+  if (heads.remoteHeadSha === candidateSha) {
+    if (heads.localHeadSha !== candidateSha) {
+      await deps.updateLocalAccumulation({
+        accumulationBranch: input.accumulationBranch,
+        expectedCurrentSha: heads.localHeadSha,
+        targetSha: candidateSha,
+      });
+    }
+    await deps.persistJournal(null);
+    return { kind: "completed", accumulationHeadSha: candidateSha };
+  }
+
+  if (heads.localHeadSha !== preRebaseAccumulationSha) {
+    await deps.updateLocalAccumulation({
+      accumulationBranch: input.accumulationBranch,
+      expectedCurrentSha: heads.localHeadSha,
+      targetSha: preRebaseAccumulationSha,
+    });
+  }
+  await deps.persistJournal(null);
+  return { kind: "abandoned", accumulationHeadSha: preRebaseAccumulationSha };
+}
+
+async function journalAndPromote(input: {
+  accumulationBranch: string;
+  preRebaseAccumulationSha: string;
+  targetMainlineSha: string;
+  candidateSha: string;
+  deps: ContinuousMainlineRefreshDeps;
+}): Promise<void> {
+  await input.deps.persistJournal({
+    preRebaseAccumulationSha: input.preRebaseAccumulationSha,
+    targetMainlineSha: input.targetMainlineSha,
+    candidateSha: input.candidateSha,
+  });
+  await input.deps.promoteCandidate({
+    accumulationBranch: input.accumulationBranch,
+    preRebaseAccumulationSha: input.preRebaseAccumulationSha,
+    candidateSha: input.candidateSha,
+  });
+  await input.deps.persistJournal(null);
+}
+
+async function divergedResult(input: {
+  accumulationBranch: string;
+  accumulationHeadSha: string;
+  targetMainlineSha: string;
+  diagnostics: string[];
+  deps: ContinuousMainlineRefreshDeps;
+}): Promise<ContinuousMainlineRefreshResult> {
+  const preserved = await input.deps.verifyPreservedCheckpoint({
+    accumulationBranch: input.accumulationBranch,
+    expectedSha: input.accumulationHeadSha,
+  });
+  if (!preserved.ok) {
+    throw new Error(
+      `Could not verify preserved accumulation checkpoint: ${sanitizeRefreshDiagnostics(preserved.diagnostics).join("; ")}`,
+    );
+  }
+  return {
+    kind: "diverged",
+    accumulationHeadSha: input.accumulationHeadSha,
+    attemptedMainlineSha: input.targetMainlineSha,
+    diagnostics: sanitizeRefreshDiagnostics(input.diagnostics),
+  };
+}
+
+export function sanitizeRefreshDiagnostics(diagnostics: readonly string[]): string[] {
+  return diagnostics
+    .map((diagnostic) => sanitizeGitStderr(diagnostic).trim())
+    .filter(Boolean)
+    .slice(0, 20);
+}
+
 export async function refreshAccumulationBeforeReview(input: {
   accumulationBranch: string;
   mainlineRef: string;

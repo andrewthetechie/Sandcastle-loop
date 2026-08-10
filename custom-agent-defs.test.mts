@@ -6,9 +6,14 @@ import {
   CODER_AGENT_CONFIG,
   DECOMPOSER_AGENT_CONFIG,
   INITIAL_ISSUE_DECOMPOSER_AGENT_CONFIG,
+  PR_REVIEW_AGENT_CONFIG,
+  PR_SPEC_REVIEW_AGENT_CONFIG,
+  PR_STANDARDS_REVIEW_AGENT_CONFIG,
   REVIEWER_AGENT_CONFIG,
   REWORK_AGENT_CONFIG,
+  REBASE_AGENT_CONFIG,
   SUBTASK_READINESS_AGENT_CONFIG,
+  SUBTASK_IMPROVEMENT_AGENT_CONFIG,
   TWO_AXIS_AGENT_CONFIG,
   buildAgentDefinition,
 } from "./custom-agent-defs.mts";
@@ -67,7 +72,7 @@ BODY`,
   );
 });
 
-test("all eight configs emit expected values and shared deny permissions", () => {
+test("all configs emit expected values and shared deny permissions", () => {
   const cases = [
     {
       config: CODER_AGENT_CONFIG,
@@ -117,6 +122,33 @@ test("all eight configs emit expected values and shared deny permissions", () =>
       temperature: 0.1,
       edit: "deny",
     },
+    {
+      config: SUBTASK_IMPROVEMENT_AGENT_CONFIG,
+      description: "Read-only evidence-backed improvement of one child issue immediately before coding",
+      temperature: 0.1,
+      edit: "deny",
+    },
+    {
+      config: PR_REVIEW_AGENT_CONFIG,
+      description:
+        "Fixes host-verified PR review findings, records every disposition, and commits",
+      temperature: 0.2,
+      edit: "allow",
+    },
+    {
+      config: PR_STANDARDS_REVIEW_AGENT_CONFIG,
+      description:
+        "Read-only sub-agent: reviews a PR diff against coding standards and the Fowler smell baseline",
+      temperature: 0.1,
+      edit: "deny",
+    },
+    {
+      config: PR_SPEC_REVIEW_AGENT_CONFIG,
+      description:
+        "Read-only sub-agent: reviews a PR diff against the PR description and linked issues for spec compliance",
+      temperature: 0.1,
+      edit: "deny",
+    },
   ] as const;
 
   for (const { config, description, temperature, edit } of cases) {
@@ -131,6 +163,32 @@ test("all eight configs emit expected values and shared deny permissions", () =>
     assert.match(definition, /^  websearch: deny$/m);
     assert.ok(definition.endsWith("\n\nSYSTEM BODY"));
   }
+});
+
+test("rebase agent explicitly enables only the pinned rebase skill", () => {
+  const definition = buildAgentDefinition(REBASE_AGENT_CONFIG, "model/x", "BODY");
+  assert.match(definition, /^  skill:$/m);
+  assert.match(definition, /^    "\*": deny$/m);
+  assert.match(definition, /^    "rebase-on-main": allow$/m);
+  assert.match(definition, /^  edit: allow$/m);
+  assert.match(definition, /^  task: deny$/m);
+  assert.match(definition, /^    "\*": deny$/m);
+  assert.match(definition, /^    "git \*": allow$/m);
+  assert.match(definition, /^    "git push \*": deny$/m);
+  assert.match(definition, /^    "git fetch \*": deny$/m);
+  assert.match(definition, /^    "gh \*": deny$/m);
+});
+
+test("subtask improvement bash permission is read-only by default", () => {
+  const definition = buildAgentDefinition(
+    SUBTASK_IMPROVEMENT_AGENT_CONFIG,
+    "model/x",
+    "BODY",
+  );
+  assert.match(definition, /^    "\*": deny$/m);
+  assert.match(definition, /^    "git diff \*": allow$/m);
+  assert.match(definition, /^    "rg \*": allow$/m);
+  assert.doesNotMatch(definition, /^  bash: allow$/m);
 });
 
 function escapeRegExp(value: string): string {

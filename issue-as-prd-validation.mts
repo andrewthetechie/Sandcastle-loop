@@ -1,6 +1,7 @@
 import type { GitHubIssueRecord } from "./github-issues.mts";
 import type { PublishChildDraft, ChildPublicationResult } from "./issue-as-prd-children.mts";
 import type { ReadinessBatchResult } from "./subtask-readiness.mts";
+import type { SubtaskImprovementResult } from "./subtask-improvement.mts";
 import type { PerBranchEngineOutcome } from "./per-branch-engine.mts";
 import type { ChildIntegrationInput } from "./issue-as-prd-integration.mts";
 import { runVerifiedHostMutation } from "./verified-host-mutation.mts";
@@ -20,6 +21,10 @@ export interface AggregateValidationDeps {
   accumulationBranch: string;
   queueLabel: string;
   siblingSummaries: readonly { number: number; title: string; body: string }[];
+  listSiblingSummaries?(input: {
+    childNumber: number;
+  }): Promise<readonly { number: number; title: string; body: string }[]> |
+    readonly { number: number; title: string; body: string }[];
   runValidationCommand(input: {
     gate: AggregateGate;
     command: string;
@@ -32,11 +37,16 @@ export interface AggregateValidationDeps {
     gate: AggregateGate;
     childNumber: number;
   }): Promise<void> | void;
-  readiness(input: {
+  readiness?(input: {
     children: readonly GitHubIssueRecord[];
     siblingSummaries: readonly { number: number; title: string; body: string }[];
     accumulationSha: string;
   }): Promise<ReadinessBatchResult>;
+  improveChild?(input: {
+    child: GitHubIssueRecord;
+    siblingSummaries: readonly { number: number; title: string; body: string }[];
+    accumulationSha: string;
+  }): Promise<SubtaskImprovementResult>;
   runEngine(input: {
     child: GitHubIssueRecord;
     accumulationSha: string;
@@ -106,6 +116,44 @@ export async function runAggregateValidation(input: {
   }
   await deps.markRepairBudgetUsed({ gate: input.gate, childNumber: child.number });
 
+  let childForEngine = child;
+  if (deps.improveChild) {
+    const currentSiblingSummaries = deps.listSiblingSummaries
+      ? await deps.listSiblingSummaries({ childNumber: child.number })
+      : deps.siblingSummaries;
+    const improved = await deps.improveChild({
+      child,
+      siblingSummaries: currentSiblingSummaries,
+      accumulationSha: input.accumulationSha,
+    });
+    if (improved.kind === "parent_failure") {
+      return { kind: "parent_failure", failure: firstFailure, diagnostics: improved.diagnostics };
+    }
+    if (improved.kind === "redundant") {
+      const rerunFailure = await runValidationCommands(
+        input.gate,
+        input.commands,
+        input.accumulationSha,
+        deps,
+      );
+      if (!rerunFailure) {
+        return { kind: "repaired", childNumber: child.number, accumulationSha: input.accumulationSha };
+      }
+      return {
+        kind: "parent_failure",
+        failure: rerunFailure,
+        diagnostics: ["Repair child was redundant but aggregate validation remains red."],
+      };
+    }
+    childForEngine = improved.child;
+  } else {
+  if (!deps.readiness) {
+    return {
+      kind: "parent_failure",
+      failure: firstFailure,
+      diagnostics: ["Legacy repair readiness workflow has no readiness dependency."],
+    };
+  }
   const readiness = await deps.readiness({
     children: [child],
     siblingSummaries: deps.siblingSummaries,
@@ -156,22 +204,25 @@ export async function runAggregateValidation(input: {
     };
   }
 
+  childForEngine = readiness.ready[0]!;
+  }
+
   const engine = await deps.runEngine({
-    child: readiness.ready[0]!,
+    child: childForEngine,
     accumulationSha: input.accumulationSha,
     gate: input.gate,
   });
   switch (engine.kind) {
     case "approved": {
       const integrated = await deps.integrate({
-        childNumber: child.number,
+        childNumber: childForEngine.number,
         accumulationBranch: deps.accumulationBranch,
         reviewedBaseSha: engine.reviewedBaseSha,
         approvedHeadSha: engine.approvedHeadSha,
       });
       if (!integrated.ok) {
         return markRepairChildStuck({
-          childNumber: child.number,
+          childNumber: childForEngine.number,
           failure: firstFailure,
           diagnostics: integrated.diagnostics,
           deps,
@@ -185,7 +236,7 @@ export async function runAggregateValidation(input: {
       );
       if (rerunFailure) {
         return markRepairChildStuck({
-          childNumber: child.number,
+          childNumber: childForEngine.number,
           failure: rerunFailure,
           diagnostics: ["Aggregate validation remained red after repair child integration."],
           deps,
@@ -193,7 +244,7 @@ export async function runAggregateValidation(input: {
       }
       return {
         kind: "repaired",
-        childNumber: child.number,
+        childNumber: childForEngine.number,
         accumulationSha: integrated.accumulationHeadSha,
       };
     }
@@ -206,7 +257,7 @@ export async function runAggregateValidation(input: {
       );
       if (rerunFailure) {
         return markRepairChildStuck({
-          childNumber: child.number,
+          childNumber: childForEngine.number,
           failure: rerunFailure,
           diagnostics: ["Aggregate validation remained red after already-satisfied repair child."],
           deps,
@@ -215,10 +266,10 @@ export async function runAggregateValidation(input: {
       const closeVerification = await runVerifiedHostMutation({
         mutate: () =>
           deps.closeChild({
-            childNumber: child.number,
+            childNumber: childForEngine.number,
             comment: `Aggregate validation gate '${input.gate}' is now green without additional branch changes.`,
           }),
-        readBack: () => deps.readChild({ childNumber: child.number }),
+        readBack: () => deps.readChild({ childNumber: childForEngine.number }),
         verify: (value) => value.state === "CLOSED",
         describe: (value) => `issue state=${value.state}`,
       });
@@ -231,20 +282,20 @@ export async function runAggregateValidation(input: {
       }
       return {
         kind: "repaired",
-        childNumber: child.number,
+        childNumber: childForEngine.number,
         accumulationSha: input.accumulationSha,
       };
     }
     case "stuck":
       return markRepairChildStuck({
-        childNumber: child.number,
+        childNumber: childForEngine.number,
         failure: firstFailure,
         diagnostics: [engine.lastFeedback],
         deps,
       });
     case "crashed":
       return markRepairChildStuck({
-        childNumber: child.number,
+        childNumber: childForEngine.number,
         failure: firstFailure,
         diagnostics: [engine.error],
         deps,

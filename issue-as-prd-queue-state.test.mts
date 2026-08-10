@@ -170,6 +170,11 @@ test("label constants and parentQueueLabel use the exact names, colors, descript
       color: "d4c5f9",
       description: "Review-ready branch needs a manual rebase onto current mainline",
     },
+    diverged: {
+      name: "agent-diverged",
+      color: "b60205",
+      description: "Automatic accumulation rebases are exhausted; human rebase is required",
+    },
     parentQueue: {
       color: "1d76db",
       description: "Temporary Issue-as-PRD queue for parent #N",

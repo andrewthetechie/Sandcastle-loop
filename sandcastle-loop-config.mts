@@ -13,8 +13,13 @@ export interface SandcastleLoopRoleModels {
   /** Rework tier 3 — used from `coderEscalation.tier3FromRound` (backlog v4). */
   reworkTier3: string;
   reviewer: string;
+  prReviewStandards: string;
+  prReviewSpec: string;
+  prReviewFixer: string;
   initialIssueDecomposer: string;
   subtaskReadiness: string;
+  subtaskImprovement: string;
+  rebase: string;
   codeQuality: string;
   twoAxis: string;
   issueDecomposer: string;
@@ -99,8 +104,13 @@ const DEFAULT_MODELS: SandcastleLoopRoleModels = {
   reworkTier2: "zai-coding-plan/glm-5.2",
   reworkTier3: "anthropic/claude-sonnet-4-5",
   reviewer: "zai-coding-plan/glm-5.2",
+  prReviewStandards: "zai-coding-plan/glm-5.2",
+  prReviewSpec: "zai-coding-plan/glm-5.2",
+  prReviewFixer: "zai-coding-plan/glm-5.2",
   initialIssueDecomposer: "zai-coding-plan/glm-5.2",
   subtaskReadiness: "zai-coding-plan/glm-5.2",
+  subtaskImprovement: "zai-coding-plan/glm-5.2",
+  rebase: "anthropic/claude-sonnet-4-5",
   codeQuality: "zai-coding-plan/glm-5.2",
   twoAxis: "zai-coding-plan/glm-5.2",
   issueDecomposer: "zai-coding-plan/glm-5.2",
@@ -155,6 +165,19 @@ export async function loadSandcastleLoopConfig(
         userConfig.models?.initialIssueDecomposer ?? resolvedReviewerModel,
       subtaskReadiness:
         userConfig.models?.subtaskReadiness ?? resolvedReviewerModel,
+      // v3 improvement has a dedicated override but deliberately inherits the
+      // existing readiness/reviewer choice for deployed configurations.
+      subtaskImprovement:
+        userConfig.models?.subtaskImprovement ??
+        userConfig.models?.subtaskReadiness ??
+        resolvedReviewerModel,
+      rebase: userConfig.models?.rebase ?? configuredModels.reworkTier3,
+      prReviewStandards:
+        userConfig.models?.prReviewStandards ?? resolvedReviewerModel,
+      prReviewSpec:
+        userConfig.models?.prReviewSpec ?? resolvedReviewerModel,
+      prReviewFixer:
+        userConfig.models?.prReviewFixer ?? resolvedReviewerModel,
     },
     validationCommands:
       userConfig.validationCommands ?? [...DEFAULT_VALIDATION_COMMANDS],

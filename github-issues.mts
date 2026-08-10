@@ -207,6 +207,27 @@ export class GitHubIssuesClient {
     ]);
   }
 
+  // GitHub's issue edit command updates both fields in one tracker mutation.
+  // Improvement must never leave a title/body pair from two different issue
+  // contracts after a crash or a rejected write.
+  editIssueTitleAndBody(input: {
+    issueNumber: number;
+    title: string;
+    body: string;
+  }): void {
+    this.runner.run([
+      "issue",
+      "edit",
+      String(input.issueNumber),
+      "--repo",
+      this.repoSelector(),
+      "--title",
+      input.title,
+      "--body",
+      input.body,
+    ]);
+  }
+
   createComment(issueNumber: number, body: string): { id: number } {
     const response = this.apiJson<{ id: unknown }>([
       "api",

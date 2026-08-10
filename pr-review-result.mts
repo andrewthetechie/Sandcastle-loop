@@ -2,6 +2,8 @@
 // markdown rendering for the comment the host posts on the PR.
 
 export interface PrReviewFinding {
+  id?: string;
+  axis?: "standards" | "spec";
   severity: "info" | "warning" | "error" | "blocked";
   description: string;
   file?: string;
@@ -9,6 +11,7 @@ export interface PrReviewFinding {
 }
 
 export interface PrReviewRejectedFinding {
+  finding_id?: string;
   original_finding: string;
   reason: string;
 }
@@ -72,6 +75,16 @@ function validateFinding(value: unknown, index: number): string | undefined {
   ) {
     return `finding[${index}].severity must be one of ${VALID_SEVERITIES.join(", ")}`;
   }
+  if (value.id !== undefined && !isString(value.id)) {
+    return `finding[${index}].id must be a string`;
+  }
+  if (
+    value.axis !== undefined &&
+    value.axis !== "standards" &&
+    value.axis !== "spec"
+  ) {
+    return `finding[${index}].axis must be standards or spec`;
+  }
   if (value.file !== undefined && !isString(value.file)) {
     return `finding[${index}].file must be a string`;
   }
@@ -87,6 +100,9 @@ function validateRejectedFinding(
 ): string | undefined {
   if (!isObject(value)) {
     return `not_fixed[${index}] is not an object`;
+  }
+  if (value.finding_id !== undefined && !isString(value.finding_id)) {
+    return `not_fixed[${index}].finding_id must be a string`;
   }
   if (
     !isString(value.original_finding) ||
@@ -226,13 +242,16 @@ function formatFindingList(findings: PrReviewFinding[]): string {
   }
   return findings
     .map((finding) => {
+      const identity = finding.id
+        ? `**${finding.id}${finding.axis ? ` · ${finding.axis}` : ""}** — `
+        : "";
       const location =
         finding.file !== undefined
           ? `**${finding.file}${
               finding.line !== undefined ? `:${finding.line}` : ""
             }** — `
           : "";
-      return `- ${location}[${finding.severity}] ${finding.description}`;
+      return `- ${identity}${location}[${finding.severity}] ${finding.description}`;
     })
     .join("\n");
 }
@@ -244,7 +263,7 @@ function formatRejectedList(findings: PrReviewRejectedFinding[]): string {
   return findings
     .map(
       (finding) =>
-        `- **${finding.original_finding}** — ${finding.reason}`,
+        `- **${finding.finding_id ? `${finding.finding_id}: ` : ""}${finding.original_finding}** — ${finding.reason}`,
     )
     .join("\n");
 }

@@ -4,16 +4,18 @@ import type {
 } from "./issue-as-prd-state-contracts.mts";
 import { ISSUE_AS_PRD_STATE_MARKER } from "./issue-parent-context.mts";
 
-export const ISSUE_AS_PRD_STATE_SCHEMA_VERSION = 1 as const;
+export const ISSUE_AS_PRD_STATE_SCHEMA_VERSION = 2 as const;
 
 export type ParentPhase =
   | "claimed"
   | "decomposed"
   | "initial_ready"
+  | "initial_queue"
   | "initial_drained"
   | "pre_review_ready"
   | "full_parent_reviewed"
   | "followups_ready"
+  | "followup_queue"
   | "followups_drained"
   | "pre_delivery_ready"
   | "delivered"
@@ -23,18 +25,26 @@ export const PARENT_PHASES: readonly ParentPhase[] = [
   "claimed",
   "decomposed",
   "initial_ready",
+  "initial_queue",
   "initial_drained",
   "pre_review_ready",
   "full_parent_reviewed",
   "followups_ready",
+  "followup_queue",
   "followups_drained",
   "pre_delivery_ready",
   "delivered",
   "failed",
 ];
 
+export interface MainlineRefreshJournal {
+  preRebaseAccumulationSha: string;
+  targetMainlineSha: string;
+  candidateSha: string;
+}
+
 export interface IssueAsPrdParentState {
-  schemaVersion: typeof ISSUE_AS_PRD_STATE_SCHEMA_VERSION;
+  schemaVersion: 1 | typeof ISSUE_AS_PRD_STATE_SCHEMA_VERSION;
   parentNumber: number;
   accumulationBranch: string;
   originalForkSha: string;
@@ -46,6 +56,10 @@ export interface IssueAsPrdParentState {
   completedExtraReviewRounds: number;
   aggregateValidationRepairs: { pre_review: 0 | 1; pre_delivery: 0 | 1 };
   rebaseConflictDiagnostics: string[];
+  // Optional only at the TypeScript boundary so persisted v1 fixture shapes
+  // remain constructible; parser/claim/transition always materialize them.
+  accumulationDiverged?: boolean;
+  mainlineRefresh?: MainlineRefreshJournal | null;
   partialCauseChildNumber: number | null;
   lastTransitionAt: string;
 }
@@ -103,7 +117,7 @@ export function parseParentStateComment(
     return { ok: false, diagnostics };
   }
 
-  const state = parseStateObject(parsed, diagnostics);
+  const state = parseStateObject(migrateSchemaOneState(parsed), diagnostics);
   if (!state || diagnostics.length > 0) return { ok: false, diagnostics };
   return { ok: true, state };
 }
@@ -152,13 +166,20 @@ export function reconcileParentState(input: {
 
 export function nextParentState(input: {
   previous: IssueAsPrdParentState | null;
-  next: Omit<IssueAsPrdParentState, "lastTransitionAt">;
+  next: Omit<IssueAsPrdParentState, "lastTransitionAt" | "accumulationDiverged" | "mainlineRefresh"> &
+    Partial<Pick<IssueAsPrdParentState, "accumulationDiverged" | "mainlineRefresh">>;
   now: string;
 }): IssueAsPrdParentState {
-  const nextState: IssueAsPrdParentState = {
+  const durableNext = {
     ...input.next,
+    schemaVersion: ISSUE_AS_PRD_STATE_SCHEMA_VERSION,
+    accumulationDiverged: input.next.accumulationDiverged ?? false,
+    mainlineRefresh: input.next.mainlineRefresh ?? null,
+  };
+  const nextState: IssueAsPrdParentState = {
+    ...durableNext,
     lastTransitionAt:
-      input.previous && durableFieldsEqual(input.previous, input.next)
+      input.previous && durableFieldsEqual(input.previous, durableNext)
         ? input.previous.lastTransitionAt
         : input.now,
   };
@@ -190,6 +211,8 @@ function parseStateObject(
     "completedExtraReviewRounds",
     "aggregateValidationRepairs",
     "rebaseConflictDiagnostics",
+    "accumulationDiverged",
+    "mainlineRefresh",
     "partialCauseChildNumber",
     "lastTransitionAt",
   ]);
@@ -235,6 +258,8 @@ function parseStateObject(
     "rebaseConflictDiagnostics",
     diagnostics,
   );
+  const accumulationDiverged = booleanField(value, "accumulationDiverged", diagnostics);
+  const mainlineRefresh = mainlineRefreshField(value, "mainlineRefresh", diagnostics);
   const partialCauseChildNumber = nullablePositiveIntegerField(
     value,
     "partialCauseChildNumber",
@@ -269,6 +294,8 @@ function parseStateObject(
     completedExtraReviewRounds === undefined ||
     aggregateValidationRepairs === undefined ||
     rebaseConflictDiagnostics === undefined ||
+    accumulationDiverged === undefined ||
+    mainlineRefresh === undefined ||
     partialCauseChildNumber === undefined ||
     lastTransitionAt === undefined
   ) {
@@ -288,6 +315,8 @@ function parseStateObject(
     completedExtraReviewRounds,
     aggregateValidationRepairs,
     rebaseConflictDiagnostics,
+    accumulationDiverged,
+    mainlineRefresh,
     partialCauseChildNumber,
     lastTransitionAt,
   };
@@ -314,10 +343,41 @@ function reconcileObservedState(
   if (observed.remoteAccumulationHeadSha === null) {
     diagnostics.push("Remote accumulation head SHA is missing.");
   }
+  const journalOwnedHeads = state.mainlineRefresh
+    ? new Set([
+        state.mainlineRefresh.preRebaseAccumulationSha,
+        state.mainlineRefresh.candidateSha,
+      ])
+    : null;
+  const inFlightPromotion =
+    journalOwnedHeads !== null &&
+    observed.localAccumulationHeadSha !== null &&
+    observed.remoteAccumulationHeadSha !== null &&
+    journalOwnedHeads.has(observed.localAccumulationHeadSha) &&
+    journalOwnedHeads.has(observed.remoteAccumulationHeadSha);
+  if (
+    state.mainlineRefresh &&
+    observed.localAccumulationHeadSha !== null &&
+    !journalOwnedHeads!.has(observed.localAccumulationHeadSha)
+  ) {
+    diagnostics.push(
+      `In-flight refresh journal does not own local accumulation SHA ${observed.localAccumulationHeadSha}.`,
+    );
+  }
+  if (
+    state.mainlineRefresh &&
+    observed.remoteAccumulationHeadSha !== null &&
+    !journalOwnedHeads!.has(observed.remoteAccumulationHeadSha)
+  ) {
+    diagnostics.push(
+      `In-flight refresh journal does not own remote accumulation SHA ${observed.remoteAccumulationHeadSha}.`,
+    );
+  }
   if (
     observed.localAccumulationHeadSha !== null &&
     observed.remoteAccumulationHeadSha !== null &&
-    observed.localAccumulationHeadSha !== observed.remoteAccumulationHeadSha
+    observed.localAccumulationHeadSha !== observed.remoteAccumulationHeadSha &&
+    !inFlightPromotion
   ) {
     diagnostics.push(
       `Accumulation branch head mismatch: local ${observed.localAccumulationHeadSha} != remote ${observed.remoteAccumulationHeadSha}.`,
@@ -390,7 +450,40 @@ function durableFieldsEqual(
     lastTransitionAt: _previousLastTransitionAt,
     ...previousWithoutTimestamp
   } = previous;
-  return JSON.stringify(previousWithoutTimestamp) === JSON.stringify(next);
+  const previousKeys = Object.keys(previousWithoutTimestamp);
+  const nextKeys = Object.keys(next);
+  return previousKeys.length === nextKeys.length && previousKeys.every(
+    (key) =>
+      key in next &&
+      JSON.stringify(previousWithoutTimestamp[key as keyof typeof previousWithoutTimestamp]) ===
+        JSON.stringify(next[key as keyof typeof next]),
+  );
+}
+
+function withoutTimestamp(
+  state: IssueAsPrdParentState,
+): Omit<IssueAsPrdParentState, "lastTransitionAt"> {
+  const { lastTransitionAt: _lastTransitionAt, ...durable } = state;
+  return durable;
+}
+
+// Version 1 published readiness-oriented phases. A resume must be able to
+// write version 2 before further work, without spending another agent session
+// or accepting an old readiness marker as proof of current context.
+function migrateSchemaOneState(value: Record<string, unknown>): Record<string, unknown> {
+  if (value.schemaVersion !== 1) return value;
+  const phase = value.phase === "decomposed" || value.phase === "initial_ready"
+    ? "initial_queue"
+    : value.phase === "followups_ready"
+      ? "followup_queue"
+      : value.phase;
+  return {
+    ...value,
+    schemaVersion: ISSUE_AS_PRD_STATE_SCHEMA_VERSION,
+    phase,
+    accumulationDiverged: false,
+    mainlineRefresh: null,
+  };
 }
 
 function renderEnvelope(json: string): string {
@@ -619,6 +712,58 @@ function stringArrayField(
     items.push(item);
   }
   return items;
+}
+
+function booleanField(
+  value: Record<string, unknown>,
+  key: string,
+  diagnostics: string[],
+): boolean | undefined {
+  if (!(key in value)) {
+    diagnostics.push(`Missing required field '${key}'.`);
+    return undefined;
+  }
+  if (typeof value[key] !== "boolean") {
+    diagnostics.push(`Field '${key}' must be a boolean.`);
+    return undefined;
+  }
+  return value[key] as boolean;
+}
+
+function mainlineRefreshField(
+  value: Record<string, unknown>,
+  key: string,
+  diagnostics: string[],
+): MainlineRefreshJournal | null | undefined {
+  if (!(key in value)) {
+    diagnostics.push(`Missing required field '${key}'.`);
+    return undefined;
+  }
+  if (value[key] === null) return null;
+  if (!isRecord(value[key])) {
+    diagnostics.push(`Field '${key}' must be null or an object.`);
+    return undefined;
+  }
+  const journal = value[key];
+  const expected = new Set([
+    "preRebaseAccumulationSha",
+    "targetMainlineSha",
+    "candidateSha",
+  ]);
+  for (const journalKey of Object.keys(journal)) {
+    if (!expected.has(journalKey)) {
+      diagnostics.push(`Unexpected field '${key}.${journalKey}'.`);
+    }
+  }
+  const preRebaseAccumulationSha = shaField(
+    journal,
+    "preRebaseAccumulationSha",
+    diagnostics,
+  );
+  const targetMainlineSha = shaField(journal, "targetMainlineSha", diagnostics);
+  const candidateSha = shaField(journal, "candidateSha", diagnostics);
+  if (!preRebaseAccumulationSha || !targetMainlineSha || !candidateSha) return undefined;
+  return { preRebaseAccumulationSha, targetMainlineSha, candidateSha };
 }
 
 function isoTimestampField(

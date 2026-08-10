@@ -2,9 +2,10 @@
 //
 // Backlog Issue-as-PRD loop. Processes one triaged parent issue at a time from
 // the configured backlog label set. Each claimed parent owns a durable
-// accumulation branch, may decompose into true GitHub child issues, readiness-
-// gates those children before coding, fast-forwards approved child work into
-// the accumulation branch, runs exactly one full-parent extra-review round,
+// accumulation branch, may decompose into true GitHub child issues, improves
+// the next selected child against that exact accumulation before coding,
+// checkpoints and refreshes approved child work onto mainline, runs exactly
+// one full-parent extra-review round,
 // drains any follow-up children once, and then delivers a review-ready parent
 // branch for a human to inspect and turn into a pull request.
 //
@@ -21,7 +22,7 @@
 import * as sandcastle from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -32,7 +33,8 @@ import {
   INITIAL_ISSUE_DECOMPOSER_AGENT_CONFIG,
   REVIEWER_AGENT_CONFIG,
   REWORK_AGENT_CONFIG,
-  SUBTASK_READINESS_AGENT_CONFIG,
+  REBASE_AGENT_CONFIG,
+  SUBTASK_IMPROVEMENT_AGENT_CONFIG,
   TWO_AXIS_AGENT_CONFIG,
 } from "./custom-agent-defs.mts";
 import { enforceArgvSizeLimit } from "./custom-agent-argv-guard.mts";
@@ -94,6 +96,7 @@ import {
 import {
   AGENT_STUCK_LABEL,
   ISSUE_AS_PRD_LABELS,
+  parentFailureLabelPlan,
 } from "./issue-as-prd-queue-state.mts";
 import {
   accumulationBranchName,
@@ -102,8 +105,12 @@ import {
   terminalActionForParentResult,
   terminalRepairLabelPlan,
   queueLabelName,
+  type BacklogTerminalAction,
 } from "./backlog-v3-issue-as-prd-adapter.mts";
-import { nextParentState } from "./issue-as-prd-state.mts";
+import {
+  nextParentState,
+  parseParentStateComment,
+} from "./issue-as-prd-state.mts";
 import { acquireNextIssueAsPrdParent } from "./backlog-v3-issue-as-prd-acquire.mts";
 import { verifyIssueAsPrdParentOwnership } from "./backlog-v3-issue-as-prd-ownership.mts";
 import { persistIssueAsPrdParentStateComment } from "./backlog-v3-issue-as-prd-state-comment.mts";
@@ -135,19 +142,29 @@ import type { ObservedParentRecoveryState } from "./issue-as-prd-state-contracts
 import { splitQueueChildren } from "./backlog-v3-issue-as-prd-recovery-state.mts";
 import {
   INITIAL_ISSUE_DECOMPOSER_USER_PROMPT_FILE,
-  SUBTASK_READINESS_USER_PROMPT_FILE,
+  SUBTASK_IMPROVEMENT_USER_PROMPT_FILE,
   acquireInitialDecomposition,
-  acquireSubtaskReadiness,
+  acquireSubtaskImprovement,
   buildInitialIssueDecomposerRunName,
-  buildSubtaskReadinessRunName,
+  buildSubtaskImprovementRunName,
   extractSingleTaggedOutput,
 } from "./issue-as-prd-sessions.mts";
-import { runSubtaskReadinessBatch } from "./subtask-readiness.mts";
+import {
+  improveSubtaskJustInTime,
+  validateImprovementForCurrentIssue,
+} from "./subtask-improvement.mts";
 import { formatCompactSiblingSummary } from "./subtask-readiness-body.mts";
 import { runAggregateValidation } from "./issue-as-prd-validation.mts";
 import { runIssueAsPrdExtraReview } from "./issue-as-prd-extra-review.mts";
 import { runIssueAsPrdParent } from "./issue-as-prd-orchestrator.mts";
 import { runVerifiedHostMutation } from "./verified-host-mutation.mts";
+import { parseRebaseAgentResult } from "./rebase-agent-result.mts";
+import {
+  recoverMainlineRefreshJournal,
+  refreshAccumulationContinuously,
+  sanitizeRefreshDiagnostics,
+  type ContinuousMainlineRefreshResult,
+} from "./issue-as-prd-refresh.mts";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -160,7 +177,8 @@ const LOOP_CONFIG = await loadSandcastleLoopConfig(REPO_ROOT);
 
 const REVIEWER_MODEL = LOOP_CONFIG.models.reviewer;
 const INITIAL_ISSUE_DECOMPOSER_MODEL = LOOP_CONFIG.models.initialIssueDecomposer;
-const SUBTASK_READINESS_MODEL = LOOP_CONFIG.models.subtaskReadiness;
+const SUBTASK_IMPROVEMENT_MODEL = LOOP_CONFIG.models.subtaskImprovement;
+const REBASE_MODEL = LOOP_CONFIG.models.rebase;
 const CODE_QUALITY_MODEL = LOOP_CONFIG.models.codeQuality;
 const TWO_AXIS_MODEL = LOOP_CONFIG.models.twoAxis;
 const ISSUE_DECOMPOSER_MODEL = LOOP_CONFIG.models.issueDecomposer;
@@ -188,8 +206,17 @@ const DECOMPOSER_USER_PROMPT_FILE =
 const INITIAL_ISSUE_DECOMPOSER_AGENT_SYSTEM_PROMPT_FILE = fileURLToPath(
   new URL("./initial-issue-decomposer-agent-system-prompt-prd.md", import.meta.url),
 );
-const SUBTASK_READINESS_AGENT_SYSTEM_PROMPT_FILE = fileURLToPath(
-  new URL("./subtask-readiness-agent-system-prompt-prd.md", import.meta.url),
+const SUBTASK_IMPROVEMENT_AGENT_SYSTEM_PROMPT_FILE = fileURLToPath(
+  new URL("./subtask-improvement-agent-system-prompt-prd.md", import.meta.url),
+);
+const REBASE_AGENT_SYSTEM_PROMPT_FILE = fileURLToPath(
+  new URL("./rebase-agent-system-prompt-prd.md", import.meta.url),
+);
+const REBASE_USER_PROMPT_FILE = fileURLToPath(
+  new URL("./rebase-user-prompt-prd.md", import.meta.url),
+);
+const REBASE_ON_MAIN_SKILL_SOURCE_DIR = fileURLToPath(
+  new URL("./rebase-on-main-skill", import.meta.url),
 );
 
 // Labels
@@ -313,7 +340,7 @@ console.log(
     LOOP_CONFIG.loadedConfig
       ? `Sandcastle config: ${LOOP_CONFIG.configPath}`
       : `Sandcastle config: using built-in defaults; ${LOOP_CONFIG.configPath} not found`,
-    `models=coder:${CODER_MODEL},rework:${REWORK_MODEL},reviewer:${REVIEWER_MODEL}`,
+    `models=coder:${CODER_MODEL},rework:${REWORK_MODEL},reviewer:${REVIEWER_MODEL},subtaskImprovement:${SUBTASK_IMPROVEMENT_MODEL},rebase:${REBASE_MODEL}`,
     `reviewerMaxAttempts=${LOOP_CONFIG.reviewer.maxAttempts}`,
     `setupCommands=${SANDBOX_READY_COMMANDS.length}`,
     `validationCommands=${VALIDATION_COMMANDS.length}`,
@@ -497,6 +524,11 @@ function ensureLabels(): void {
       description: ISSUE_AS_PRD_LABELS.rebaseNeeded.description,
     },
     {
+      name: ISSUE_AS_PRD_LABELS.diverged.name,
+      color: ISSUE_AS_PRD_LABELS.diverged.color,
+      description: ISSUE_AS_PRD_LABELS.diverged.description,
+    },
+    {
       name: AGENT_AUTHORED_LABEL,
       color: "5319e7",
       description: "Pull request created by the agent loop.",
@@ -666,7 +698,7 @@ function pickNextIssue(skip: ReadonlySet<number>): IssueDetail | null {
 }
 
 function observeIssueAsPrdParentRecoveryState(
-  parent: Pick<IssueDetail, "number" | "labels">,
+  parent: Pick<IssueDetail, "number" | "labels" | "comments">,
 ): ObservedParentRecoveryState {
   const accumulationBranch = accumulationBranchName(parent.number);
   const queueLabel = queueLabelName(parent.number);
@@ -688,6 +720,7 @@ function observeIssueAsPrdParentRecoveryState(
   // the common case where a prior run pushed work but the local branch wasn't
   // updated, or where the remote was updated but the local wasn't pulled.
   if (
+    !parentHasInFlightMainlineRefresh(parent) &&
     accumulationBranchExists &&
     localAccumulationHeadSha !== null &&
     remoteAccumulationHeadSha !== null &&
@@ -729,6 +762,17 @@ function observeIssueAsPrdParentRecoveryState(
     openChildNumbers: childNumbers.openChildNumbers,
     closedChildNumbers: childNumbers.closedChildNumbers,
   };
+}
+
+function parentHasInFlightMainlineRefresh(
+  parent: Pick<IssueDetail, "comments">,
+): boolean {
+  for (const comment of parent.comments) {
+    if (!comment.body.includes("sandcastle-issue-as-prd-state")) continue;
+    const parsed = parseParentStateComment(comment.body);
+    if (parsed.ok && parsed.state.mainlineRefresh !== null) return true;
+  }
+  return false;
 }
 
 function readRemoteHead(branch: string): string | null {
@@ -988,8 +1032,21 @@ async function acquireNextIssueAsPrdParentForLoop() {
         ]);
         return response.id;
       },
-      updateStateComment({ commentId, body }) {
-        issueClient().updateComment(commentId, body);
+      async updateStateComment({ parentNumber, commentId, body }) {
+        const client = issueClient();
+        const verification = await runVerifiedHostMutation({
+          mutate: () => client.updateComment(commentId, body),
+          readBack: () =>
+            client
+              .viewIssue(parentNumber)
+              .comments.find((comment) => comment.id === commentId) ?? null,
+          verify: (comment) => comment !== null && comment.body === body,
+          describe: (comment) =>
+            comment === null
+              ? `state comment #${commentId} missing`
+              : `state comment #${comment.id} body_bytes=${Buffer.byteLength(comment.body, "utf8")}`,
+        });
+        if (!verification.ok) throw new Error(verification.diagnostics.join("\n"));
       },
       removeStuckLabelFromOpenChildren({ parentNumber, queueLabel }) {
         const stuckChildren = listIssueAsPrdParentChildren({
@@ -1205,22 +1262,13 @@ function createAggregateValidationCommandRunner(parentNumber: number) {
 async function runIssueAsPrdPromptSession(input: {
   branch: string;
   baseRef: string;
-  stage: "initial_issue_decomposer" | "subtask_readiness";
+  stage: "initial_issue_decomposer" | "subtask_improvement" | "rebase";
   runName: string;
   model: string;
   promptFile: string;
   promptArgs: Record<string, string>;
 }): Promise<{ stdout: string }> {
-  const agentDefinition =
-    input.stage === "initial_issue_decomposer"
-      ? {
-          config: INITIAL_ISSUE_DECOMPOSER_AGENT_CONFIG,
-          systemPromptFile: INITIAL_ISSUE_DECOMPOSER_AGENT_SYSTEM_PROMPT_FILE,
-        }
-      : {
-          config: SUBTASK_READINESS_AGENT_CONFIG,
-          systemPromptFile: SUBTASK_READINESS_AGENT_SYSTEM_PROMPT_FILE,
-        };
+  const agentDefinition = promptAgentDefinition(input.stage);
   const sandbox = await sandcastle.createSandbox({
     sandbox: dockerSandboxProvider(),
     branch: input.branch,
@@ -1238,12 +1286,17 @@ async function runIssueAsPrdPromptSession(input: {
       readFileSync(agentDefinition.systemPromptFile, "utf8"),
     ),
   );
+  if (input.stage === "rebase") {
+    installRebaseOnMainSkill(sandbox.worktreePath);
+  }
 
   const activeLogPath = tuiWorkingLogPath(input.runName);
   const sessionLogPath = agentRunLogPath(input.branch, input.runName);
   const outputTag = input.stage === "initial_issue_decomposer"
     ? "initial_issue_decomposition"
-    : "subtask_readiness";
+    : input.stage === "subtask_improvement"
+        ? "subtask_improvement"
+        : "rebase_result";
   try {
     const result = await sandbox.run({
       name: input.runName,
@@ -1252,9 +1305,7 @@ async function runIssueAsPrdPromptSession(input: {
       }),
       maxIterations: 1,
       completionSignal:
-        input.stage === "initial_issue_decomposer"
-          ? "</initial_issue_decomposition>"
-          : "</subtask_readiness>",
+        `</${outputTag}>`,
       idleTimeoutSeconds,
       promptFile: input.promptFile,
       promptArgs: input.promptArgs,
@@ -1272,6 +1323,32 @@ async function runIssueAsPrdPromptSession(input: {
   } finally {
     await sandbox.close();
   }
+}
+
+function promptAgentDefinition(stage: "initial_issue_decomposer" | "subtask_improvement" | "rebase") {
+  switch (stage) {
+    case "initial_issue_decomposer":
+      return {
+        config: INITIAL_ISSUE_DECOMPOSER_AGENT_CONFIG,
+        systemPromptFile: INITIAL_ISSUE_DECOMPOSER_AGENT_SYSTEM_PROMPT_FILE,
+      };
+    case "subtask_improvement":
+      return {
+        config: SUBTASK_IMPROVEMENT_AGENT_CONFIG,
+        systemPromptFile: SUBTASK_IMPROVEMENT_AGENT_SYSTEM_PROMPT_FILE,
+      };
+    case "rebase":
+      return {
+        config: REBASE_AGENT_CONFIG,
+        systemPromptFile: REBASE_AGENT_SYSTEM_PROMPT_FILE,
+      };
+  }
+}
+
+function installRebaseOnMainSkill(worktreePath: string): void {
+  const destination = join(worktreePath, ".opencode", "skills", "rebase-on-main");
+  mkdirSync(destination, { recursive: true });
+  cpSync(REBASE_ON_MAIN_SKILL_SOURCE_DIR, destination, { recursive: true, force: true });
 }
 
 interface ReviewContext {
@@ -2988,6 +3065,7 @@ function readAccumulationHeads(accumulationBranch: string): {
 function pushAccumulationBranchWithLease(input: {
   accumulationBranch: string;
   expectedHeadSha: string;
+  expectedRemoteSha?: string;
 }): void {
   const localHeadSha = git(["rev-parse", input.accumulationBranch]).trim();
   if (localHeadSha !== input.expectedHeadSha) {
@@ -2995,7 +3073,7 @@ function pushAccumulationBranchWithLease(input: {
       `Local accumulation head mismatch for ${input.accumulationBranch}: expected ${input.expectedHeadSha}, observed ${localHeadSha}.`,
     );
   }
-  const remoteHeadSha = readRemoteHead(input.accumulationBranch);
+  const remoteHeadSha = input.expectedRemoteSha ?? readRemoteHead(input.accumulationBranch);
   if (!remoteHeadSha) {
     throw new Error(`Missing remote accumulation branch ${input.accumulationBranch}.`);
   }
@@ -3270,6 +3348,394 @@ async function runRefreshForAccumulation(input: {
   }
 }
 
+// Every candidate is built away from the durable accumulation ref. This keeps
+// an interrupted/unsafe rebase from changing the checkpoint that already
+// closed a child issue, and reserves remote promotion for this host process.
+async function runContinuousMainlineRefresh(input: {
+  parentNumber: number;
+  accumulationBranch: string;
+  accumulationHeadSha: string;
+  persistJournal(journal: { preRebaseAccumulationSha: string; targetMainlineSha: string; candidateSha: string } | null): Promise<void>;
+}): Promise<ContinuousMainlineRefreshResult> {
+  return refreshAccumulationContinuously(
+    {
+      accumulationBranch: input.accumulationBranch,
+      mainlineRef: originBaseRef(),
+      accumulationHeadSha: input.accumulationHeadSha,
+    },
+    {
+      readAccumulationHeads: ({ accumulationBranch }) =>
+        readAccumulationHeads(accumulationBranch),
+      fetchMainline: () => fetchOriginBase(),
+      isAncestor: ({ ancestorSha, descendantSha }) =>
+        isAncestorSha(ancestorSha, descendantSha),
+      buildDeterministicCandidate: async (candidateInput) =>
+        buildDeterministicRebaseCandidate(candidateInput),
+      runRebaseAgent: (agentInput) =>
+        runMeasuredRebaseAgent(input.parentNumber, agentInput),
+      verifyCandidate: (candidateInput) =>
+        verifyRebaseCandidateOnHost(input.parentNumber, candidateInput),
+      verifyPreservedCheckpoint: async ({ accumulationBranch, expectedSha }) => {
+        const heads = readAccumulationHeads(accumulationBranch);
+        return heads.localHeadSha === expectedSha && heads.remoteHeadSha === expectedSha
+          ? { ok: true as const }
+          : {
+              ok: false as const,
+              diagnostics: [
+                `Expected preserved checkpoint ${expectedSha}; local=${heads.localHeadSha} remote=${heads.remoteHeadSha}.`,
+              ],
+            };
+      },
+      persistJournal: input.persistJournal,
+      promoteCandidate: promoteRebaseCandidate,
+    },
+  );
+}
+
+async function recoverInFlightMainlineRefresh(input: {
+  state: import("./issue-as-prd-state.mts").IssueAsPrdParentState;
+  persist(state: import("./issue-as-prd-state.mts").IssueAsPrdParentState): Promise<void>;
+}): Promise<import("./issue-as-prd-state.mts").IssueAsPrdParentState> {
+  const journal = input.state.mainlineRefresh;
+  if (!journal) return input.state;
+  let recoveredState = input.state;
+  await recoverMainlineRefreshJournal({
+    accumulationBranch: input.state.accumulationBranch,
+    journal,
+  }, {
+    readAccumulationHeads: ({ accumulationBranch }) =>
+      readAccumulationHeads(accumulationBranch),
+    updateLocalAccumulation: ({ accumulationBranch, expectedCurrentSha, targetSha }) => {
+      execFileSync(
+        "git",
+        ["update-ref", `refs/heads/${accumulationBranch}`, targetSha, expectedCurrentSha],
+        { stdio: "inherit" },
+      );
+    },
+    persistJournal: async () => {
+      const next = nextParentState({
+        previous: recoveredState,
+        now: new Date().toISOString(),
+        next: { ...recoveredState, mainlineRefresh: null },
+      });
+      await input.persist(next);
+      recoveredState = next;
+    },
+  });
+  return recoveredState;
+}
+
+function isAncestorSha(ancestor: string, descendant: string): boolean {
+  return spawnSync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
+    encoding: "utf8",
+  }).status === 0;
+}
+
+function removeManagedRefreshWorktree(worktreePath: string): void {
+  if (existsSync(worktreePath)) {
+    spawnSync("git", ["worktree", "remove", "--force", worktreePath], { encoding: "utf8" });
+  }
+}
+
+function buildDeterministicRebaseCandidate(input: {
+  accumulationBranch: string;
+  preRebaseAccumulationSha: string;
+  targetMainlineSha: string;
+}):
+  | { kind: "candidate"; candidateSha: string }
+  | { kind: "conflict"; diagnostics: string[] }
+  | { kind: "failure"; diagnostics: string[] } {
+  const candidateWorktree = join(
+    REPO_ROOT,
+    ".sandcastle",
+    "worktrees",
+    `${input.accumulationBranch}-refresh-${input.targetMainlineSha.slice(0, 12)}-candidate`,
+  );
+  try {
+    removeManagedRefreshWorktree(candidateWorktree);
+    execFileSync(
+      "git",
+      ["worktree", "add", "--detach", candidateWorktree, input.preRebaseAccumulationSha],
+      { stdio: "inherit" },
+    );
+    const rebase = gitSpawn(["rebase", input.targetMainlineSha], candidateWorktree);
+    if (rebase.status === 0) {
+      return {
+        kind: "candidate",
+        candidateSha: git(["rev-parse", "HEAD"], candidateWorktree).trim(),
+      };
+    }
+    const diagnostics = sanitizeRefreshDiagnostics([
+      `${rebase.stdout ?? ""}${rebase.stderr ?? ""}`,
+    ]);
+    const unmerged = gitSpawn(
+      ["diff", "--name-only", "--diff-filter=U"],
+      candidateWorktree,
+    );
+    const hasConflicts =
+      unmerged.status === 0 && Boolean(String(unmerged.stdout ?? "").trim());
+    gitSpawn(["rebase", "--abort"], candidateWorktree);
+    return hasConflicts
+      ? { kind: "conflict", diagnostics }
+      : { kind: "failure", diagnostics };
+  } catch (error) {
+    return {
+      kind: "failure",
+      diagnostics: [error instanceof Error ? error.message : String(error)],
+    };
+  } finally {
+    removeManagedRefreshWorktree(candidateWorktree);
+  }
+}
+
+async function runMeasuredRebaseAgent(
+  parentNumber: number,
+  input: {
+    accumulationBranch: string;
+    preRebaseAccumulationSha: string;
+    targetMainlineSha: string;
+  },
+): Promise<
+  | {
+      kind: "resolved";
+      preRebaseAccumulationSha: string;
+      targetMainlineSha: string;
+      candidateSha: string;
+    }
+  | { kind: "unresolved"; diagnostics: string[] }
+  | { kind: "invalid"; diagnostics: string[] }
+> {
+  const agentBranch = `${input.accumulationBranch}-refresh-${input.targetMainlineSha.slice(0, 12)}-agent`;
+  const runName = `rebase accumulation #${parentNumber} ${input.targetMainlineSha.slice(0, 12)}`;
+  const promptArgs = {
+    PRE_REBASE_SHA: input.preRebaseAccumulationSha,
+    TARGET_MAINLINE_SHA: input.targetMainlineSha,
+  };
+  const activeLogPath = tuiWorkingLogPath(runName);
+  const agentRun = await recordMeasuredAgentRun(
+    {
+      prd: label,
+      issue: parentNumber,
+      stage: "rebase",
+      agent: REBASE_AGENT_CONFIG.name,
+      round: input.targetMainlineSha.slice(0, 12),
+      model: REBASE_MODEL,
+      runName,
+      promptFile: REBASE_USER_PROMPT_FILE,
+      promptArgs,
+      activeLogPath,
+    },
+    () => runIssueAsPrdPromptSession({
+      branch: agentBranch,
+      baseRef: input.preRebaseAccumulationSha,
+      stage: "rebase",
+      runName,
+      model: REBASE_MODEL,
+      promptFile: REBASE_USER_PROMPT_FILE,
+      promptArgs,
+    }),
+    {
+      beginAgentStep: (agentStep) => {
+        tuiEmitter.setTicket({
+          number: parentNumber,
+          title: `Parent #${parentNumber}`,
+          branch: input.accumulationBranch,
+        });
+        tuiEmitter.beginAgentStep(agentStep);
+      },
+    },
+  );
+  const parsed = parseRebaseAgentResult(agentRun.stdout);
+  if (!parsed.ok) return { kind: "invalid", diagnostics: parsed.diagnostics };
+  if (parsed.result.outcome === "unresolved") {
+    return { kind: "unresolved", diagnostics: parsed.result.diagnostics };
+  }
+  if (!branchExists(agentBranch)) {
+    return { kind: "invalid", diagnostics: [`Rebase agent branch '${agentBranch}' is missing.`] };
+  }
+  const candidateSha = git(["rev-parse", agentBranch]).trim();
+  if (candidateSha !== parsed.result.rebased_sha) {
+    return {
+      kind: "invalid",
+      diagnostics: [
+        `Rebase agent reported ${parsed.result.rebased_sha}, but branch resolves to ${candidateSha}.`,
+      ],
+    };
+  }
+  return {
+    kind: "resolved",
+    preRebaseAccumulationSha: parsed.result.pre_rebase_sha,
+    targetMainlineSha: parsed.result.target_mainline_sha,
+    candidateSha,
+  };
+}
+
+function verifyRebaseCandidate(input: {
+  candidateWorktree: string;
+  candidateSha: string;
+  targetMainlineSha: string;
+}): void {
+  const status = git(["status", "--porcelain"], input.candidateWorktree).trim();
+  if (status) throw new Error(`Rebase candidate worktree is dirty: ${status}`);
+  if (!isAncestorSha(input.targetMainlineSha, input.candidateSha)) {
+    throw new Error(`Rebase candidate ${input.candidateSha} does not contain ${input.targetMainlineSha}.`);
+  }
+  const conflictMarkers = spawnSync(
+    "git",
+    ["grep", "-n", "-E", "^(<<<<<<<|=======|>>>>>>>)", "--", "."],
+    { cwd: input.candidateWorktree, encoding: "utf8" },
+  );
+  if (conflictMarkers.status === 0) throw new Error("Rebase candidate contains conflict markers.");
+  if (conflictMarkers.status !== 1) {
+    throw new Error(`Could not inspect rebase candidate for conflict markers: ${conflictMarkers.stderr ?? ""}`);
+  }
+}
+
+async function promoteRebaseCandidate(input: {
+  accumulationBranch: string;
+  preRebaseAccumulationSha: string;
+  candidateSha: string;
+}): Promise<void> {
+  const remotePromotion = await runVerifiedHostMutation({
+    mutate: () => {
+      const observed = readRemoteHead(input.accumulationBranch);
+      if (observed === input.candidateSha) return;
+      if (observed !== input.preRebaseAccumulationSha) {
+        throw new Error(
+          `Cannot promote over remote ${observed ?? "(missing)"}; expected ${input.preRebaseAccumulationSha}.`,
+        );
+      }
+      execFileSync(
+        "git",
+        [
+          "push",
+          `--force-with-lease=refs/heads/${input.accumulationBranch}:${input.preRebaseAccumulationSha}`,
+          "origin",
+          `${input.candidateSha}:refs/heads/${input.accumulationBranch}`,
+        ],
+        { stdio: "inherit" },
+      );
+    },
+    readBack: () => readRemoteHead(input.accumulationBranch),
+    verify: (value) => value === input.candidateSha,
+    describe: (value) =>
+      `remote ${input.accumulationBranch}=${value ?? "(missing)"}`,
+  });
+  if (!remotePromotion.ok) {
+    throw new Error(remotePromotion.diagnostics.join("\n"));
+  }
+
+  const localPromotion = await runVerifiedHostMutation({
+    mutate: () => {
+      const observed = git(["rev-parse", input.accumulationBranch]).trim();
+      if (observed === input.candidateSha) return;
+      if (observed !== input.preRebaseAccumulationSha) {
+        throw new Error(
+          `Cannot update local accumulation ref from ${observed}; expected ${input.preRebaseAccumulationSha}.`,
+        );
+      }
+      execFileSync(
+        "git",
+        [
+          "update-ref",
+          `refs/heads/${input.accumulationBranch}`,
+          input.candidateSha,
+          input.preRebaseAccumulationSha,
+        ],
+        { stdio: "inherit" },
+      );
+    },
+    readBack: () => git(["rev-parse", input.accumulationBranch]).trim(),
+    verify: (value) => value === input.candidateSha,
+    describe: (value) => `local ${input.accumulationBranch}=${value}`,
+  });
+  if (!localPromotion.ok) {
+    throw new Error(localPromotion.diagnostics.join("\n"));
+  }
+}
+
+async function verifyRebaseCandidateOnHost(
+  parentNumber: number,
+  input: {
+    candidateSha: string;
+    targetMainlineSha: string;
+    validation: "structural" | "full";
+  },
+): Promise<{ ok: true } | { ok: false; diagnostics: string[] }> {
+  const worktreePath = join(
+    REPO_ROOT,
+    ".sandcastle",
+    "worktrees",
+    `rebase-validation-${parentNumber}-${input.candidateSha.slice(0, 12)}-${Date.now()}`,
+  );
+  try {
+    execFileSync("git", ["worktree", "add", "--detach", worktreePath, input.candidateSha], {
+      stdio: "inherit",
+    });
+    verifyRebaseCandidate({
+      candidateWorktree: worktreePath,
+      candidateSha: input.candidateSha,
+      targetMainlineSha: input.targetMainlineSha,
+    });
+    if (input.validation === "structural") return { ok: true };
+
+    for (const setup of aggregateDependencySetupCommands({
+      hasPackageLock: existsSync(join(worktreePath, "package-lock.json")),
+      hasUvLock: existsSync(join(worktreePath, "uv.lock")),
+    })) {
+      const setupResult = spawnSync(setup, {
+        shell: true,
+        cwd: worktreePath,
+        encoding: "utf8",
+        env: HOST_COMMAND_ENV,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      if (setupResult.status !== 0) {
+        throw new Error(`Rebase validation setup failed: ${setup}\n${`${setupResult.stdout ?? ""}${setupResult.stderr ?? ""}`.trim()}`);
+      }
+    }
+    for (const [commandIndex, command] of VALIDATION_COMMANDS.entries()) {
+      const startedMs = Date.now();
+      const result = spawnSync(resolveHostValidationCommand(command, REPO_ROOT), {
+        shell: true,
+        cwd: worktreePath,
+        encoding: "utf8",
+        env: HOST_COMMAND_ENV,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      recordValidationRun(
+        {
+          prd: label,
+          issue: parentNumber,
+          round: "rebase",
+          gate: "issue",
+          command,
+          commandIndex,
+        },
+        {
+          startedMs,
+          endedMs: Date.now(),
+          status: result.status === 0 ? "success" : "failed",
+          exitCode: result.status ?? 1,
+        },
+      );
+      if (result.status !== 0) {
+        throw new Error(`Rebase validation failed: ${command}\n${`${result.stdout ?? ""}${result.stderr ?? ""}`.trim()}`);
+      }
+    }
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      diagnostics: sanitizeRefreshDiagnostics([
+        `Rebase validation could not run: ${error instanceof Error ? error.message : String(error)}`,
+      ]),
+    };
+  } finally {
+    removeManagedRefreshWorktree(worktreePath);
+  }
+}
+
 // A crash between the terminal state-comment write and the terminal label
 // apply leaves a parent recorded as delivered/failed while its labels still
 // say in-progress. Finish the label plan so the parent leaves the queue the
@@ -3331,8 +3797,58 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
 
   let stateCommentId = input.commentId;
   let currentState = input.state;
-  const parent = input.parent;
+  let parent = input.parent;
   const client = issueClient();
+
+  try {
+    currentState = await recoverInFlightMainlineRefresh({
+      state: currentState,
+      persist: async (state) => {
+        const persisted = await persistIssueAsPrdParentStateComment(
+          { parentNumber: parent.number, commentId: stateCommentId, state },
+          {
+            createComment: ({ parentNumber, body }) => client.createComment(parentNumber, body).id,
+            updateComment: ({ commentId, body }) => client.updateComment(commentId, body),
+            readComments: ({ parentNumber }) => client.viewIssue(parentNumber).comments,
+          },
+        );
+        stateCommentId = persisted.commentId;
+      },
+    });
+    // Recovery may have cleared the journal in the host-owned state comment.
+    // Refresh the parent record so the orchestrator's ownership check sees
+    // exactly the state we are about to pass it.
+    parent = client.viewIssue(parent.number);
+  } catch (error) {
+    recordLoopFailureDiagnostic({
+      scope: "parent",
+      outcome: "mainline_refresh_recovery_failed",
+      issue: parent.number,
+      branch: currentState.accumulationBranch,
+      lastFeedback: error instanceof Error ? error.message : String(error),
+    });
+    return { stopLoop: false, skippedParentNumber: parent.number };
+  }
+
+  if (currentState.accumulationDiverged) {
+    const repaired = await runVerifiedHostMutation({
+      mutate: () => client.addLabel(parent.number, ISSUE_AS_PRD_LABELS.diverged.name),
+      readBack: () => client.viewIssue(parent.number),
+      verify: (value) => value.labels.some((label) => label.name === ISSUE_AS_PRD_LABELS.diverged.name),
+      describe: (value) => `issue #${value.number} labels=${value.labels.map((label) => label.name).join(",")}`,
+    });
+    if (!repaired.ok) {
+      recordLoopFailureDiagnostic({
+        scope: "parent",
+        outcome: "divergence_label_repair_failed",
+        issue: parent.number,
+        branch: currentState.accumulationBranch,
+        lastFeedback: repaired.diagnostics.join("\n"),
+      });
+      return { stopLoop: false, skippedParentNumber: parent.number };
+    }
+    parent = client.viewIssue(parent.number);
+  }
 
   // The durable state comment is the source of truth for recovery, so the
   // terminal phase must land there BEFORE the terminal label plan mutates the
@@ -3354,6 +3870,7 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
           client.createComment(parentNumber, body).id,
         updateComment: ({ commentId, body }) =>
           client.updateComment(commentId, body),
+        readComments: ({ parentNumber }) => client.viewIssue(parentNumber).comments,
       },
     );
     currentState = next;
@@ -3370,12 +3887,21 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
   const result = await runIssueAsPrdParent(
     {
       parent,
-      state: input.state,
+      state: currentState,
       normalizedContext: input.normalizedContext,
     },
     {
       now: () => new Date().toISOString(),
       verifyOwnership: async ({ parent, state }) => {
+        if (
+          parent.labels.some((label) => label.name === ISSUE_AS_PRD_LABELS.diverged.name) &&
+          !state.accumulationDiverged
+        ) {
+          return {
+            ok: false as const,
+            diagnostics: ["Parent has agent-diverged but durable state does not record accumulationDiverged."],
+          };
+        }
         const observed = observeIssueAsPrdParentRecoveryState(parent);
         return verifyIssueAsPrdParentOwnership({
           parent,
@@ -3414,6 +3940,17 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
             }),
         }),
       persistState: async (state) => {
+        // A concurrent host refresh journals and may mark divergence between
+        // orchestration transitions. Never let a stale transition erase that
+        // durable stop condition.
+        if (currentState.accumulationDiverged && !state.accumulationDiverged) {
+          state = {
+            ...state,
+            accumulationDiverged: true,
+            attemptedMainlineSha: currentState.attemptedMainlineSha,
+            rebaseConflictDiagnostics: currentState.rebaseConflictDiagnostics,
+          };
+        }
         const persisted = await persistIssueAsPrdParentStateComment(
           {
             parentNumber: parent.number,
@@ -3425,6 +3962,7 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
               client.createComment(parentNumber, body).id,
             updateComment: ({ commentId, body }) =>
               client.updateComment(commentId, body),
+            readComments: ({ parentNumber }) => client.viewIssue(parentNumber).comments,
           },
         );
         currentState = state;
@@ -3449,37 +3987,41 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
           queueLabel,
           client,
         }).filter((child) => child.state === "OPEN"),
-      readiness: async ({
+      workflow: "just_in_time_improvement",
+      improveChild: async ({
         parentContext,
-        children,
+        child,
         siblingSummaries,
         accumulationSha,
+        source,
       }) => {
-        tuiEmitter.beginHostStep("readiness_apply", accumulationSha);
-        return runSubtaskReadinessBatch({
-          parentContext,
-          children,
-          siblingSummaries,
+        tuiEmitter.beginHostStep("subtask_improvement_apply", accumulationSha);
+        return improveSubtaskJustInTime({
+          child,
           accumulationSha,
           client,
-          acquire: (child, activeSiblings) =>
-            acquireSubtaskReadiness({
+          acquire: (currentChild) =>
+            acquireSubtaskImprovement({
               prd: label,
               childIssueNumber: child.number,
-              model: SUBTASK_READINESS_MODEL,
-              round: 1,
-              promptFile: SUBTASK_READINESS_USER_PROMPT_FILE,
+              model: SUBTASK_IMPROVEMENT_MODEL,
+              round: source,
+              promptFile: SUBTASK_IMPROVEMENT_USER_PROMPT_FILE,
               promptArgs: {
                 PARENT_ISSUE_NUMBER: String(parent.number),
                 PARENT_ISSUE_TITLE: parent.title,
+                ORIGINAL_FORK_SHA: currentState.originalForkSha,
                 ACCUMULATION_HEAD_SHA: accumulationSha,
-                SUBTASK_TITLE: child.title,
-                ACTIVE_SIBLINGS: activeSiblings
+                SUBTASK_TITLE: currentChild.title,
+                ACTIVE_SIBLINGS: siblingSummaries
                   .map((sibling) => formatCompactSiblingSummary(sibling))
                   .join("\n\n"),
                 PARENT_CONTEXT: parentContext.rendered,
-                SUBTASK_BODY: child.body,
+                SUBTASK_BODY: currentChild.body,
+                SUBTASK_DISCUSSION: flattenComments(currentChild.comments),
               },
+              validateResult: (result) =>
+                validateImprovementForCurrentIssue({ current: currentChild, result }),
               measuredRunDeps: {
                 beginAgentStep: (agentStep) => {
                   tuiEmitter.setTicket({
@@ -3490,28 +4032,68 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
                   tuiEmitter.beginAgentStep(agentStep);
                 },
               },
-              runAttempt: async (attempt) =>
+              runAttempt: (attempt) =>
                 runIssueAsPrdPromptSession({
-                  branch: `issue-${parent.number}-readiness-${child.number}-a${attempt}`,
+                  branch: `issue-${parent.number}-improvement-${child.number}-a${attempt}`,
                   baseRef: accumulationSha,
-                  stage: "subtask_readiness",
-                  runName: buildSubtaskReadinessRunName(child.number, attempt),
-                  model: SUBTASK_READINESS_MODEL,
-                  promptFile: SUBTASK_READINESS_USER_PROMPT_FILE,
+                  stage: "subtask_improvement",
+                  runName: buildSubtaskImprovementRunName(child.number, attempt),
+                  model: SUBTASK_IMPROVEMENT_MODEL,
+                  promptFile: SUBTASK_IMPROVEMENT_USER_PROMPT_FILE,
                   promptArgs: {
                     PARENT_ISSUE_NUMBER: String(parent.number),
                     PARENT_ISSUE_TITLE: parent.title,
+                    ORIGINAL_FORK_SHA: currentState.originalForkSha,
                     ACCUMULATION_HEAD_SHA: accumulationSha,
-                    SUBTASK_TITLE: child.title,
-                    ACTIVE_SIBLINGS: activeSiblings
+                    SUBTASK_TITLE: currentChild.title,
+                    ACTIVE_SIBLINGS: siblingSummaries
                       .map((sibling) => formatCompactSiblingSummary(sibling))
                       .join("\n\n"),
                     PARENT_CONTEXT: parentContext.rendered,
-                    SUBTASK_BODY: child.body,
+                    SUBTASK_BODY: currentChild.body,
+                    SUBTASK_DISCUSSION: flattenComments(currentChild.comments),
                   },
                 }),
             }),
         });
+      },
+      refreshAfterAccumulationAdvance: async ({
+        accumulationHeadSha,
+        trigger,
+      }) => {
+        tuiEmitter.beginHostStep("mainline_refresh", `${trigger}:${accumulationHeadSha}`);
+        return runContinuousMainlineRefresh({
+          parentNumber: parent.number,
+          accumulationBranch: currentState.accumulationBranch,
+          accumulationHeadSha,
+          persistJournal: async (mainlineRefresh) => {
+            const next = nextParentState({
+              previous: currentState,
+              now: new Date().toISOString(),
+              next: { ...currentState, mainlineRefresh },
+            });
+            const persisted = await persistIssueAsPrdParentStateComment(
+              { parentNumber: parent.number, commentId: stateCommentId, state: next },
+              {
+                createComment: ({ parentNumber, body }) => client.createComment(parentNumber, body).id,
+                updateComment: ({ commentId, body }) => client.updateComment(commentId, body),
+                readComments: ({ parentNumber }) => client.viewIssue(parentNumber).comments,
+              },
+            );
+            currentState = next;
+            stateCommentId = persisted.commentId;
+          },
+        });
+      },
+      markAccumulationDiverged: async ({ parentNumber }) => {
+        tuiEmitter.beginHostStep("accumulation_diverged", currentState.accumulationBranch);
+        const verification = await runVerifiedHostMutation({
+          mutate: () => client.addLabel(parentNumber, ISSUE_AS_PRD_LABELS.diverged.name),
+          readBack: () => client.viewIssue(parentNumber),
+          verify: (value) => value.labels.some((label) => label.name === ISSUE_AS_PRD_LABELS.diverged.name),
+          describe: (value) => `issue #${value.number} labels=${value.labels.map((label) => label.name).join(",")}`,
+        });
+        if (!verification.ok) throw new Error(verification.diagnostics.join("\n"));
       },
       runChildEngine: async ({ child, accumulationSha }) =>
         runIssueAsPrdChildEngine({
@@ -3531,6 +4113,46 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
           accumulationSha,
           renderedContext: context.rendered,
         }),
+      checkpointDirectParent: async ({
+        accumulationBranch,
+        previousAccumulationSha,
+        approvedHeadSha,
+      }) => {
+        tuiEmitter.beginHostStep("accumulation_checkpoint", approvedHeadSha);
+        const checkpoint = await runVerifiedHostMutation({
+          mutate: () => {
+            const heads = readAccumulationHeads(accumulationBranch);
+            if (
+              heads.localHeadSha === approvedHeadSha &&
+              heads.remoteHeadSha === approvedHeadSha
+            ) return;
+            if (heads.localHeadSha !== approvedHeadSha) {
+              throw new Error(
+                `Direct-parent checkpoint expected local ${approvedHeadSha}, observed ${heads.localHeadSha}.`,
+              );
+            }
+            if (heads.remoteHeadSha !== previousAccumulationSha) {
+              throw new Error(
+                `Direct-parent checkpoint expected remote ${previousAccumulationSha}, observed ${heads.remoteHeadSha}.`,
+              );
+            }
+            pushAccumulationBranchWithLease({
+              accumulationBranch,
+              expectedHeadSha: approvedHeadSha,
+              expectedRemoteSha: previousAccumulationSha,
+            });
+          },
+          readBack: () => readAccumulationHeads(accumulationBranch),
+          verify: (heads) =>
+            heads.localHeadSha === approvedHeadSha &&
+            heads.remoteHeadSha === approvedHeadSha,
+          describe: (heads) =>
+            `accumulation local=${heads.localHeadSha} remote=${heads.remoteHeadSha}`,
+        });
+        return checkpoint.ok
+          ? { ok: true as const, accumulationHeadSha: approvedHeadSha }
+          : { ok: false as const, diagnostics: checkpoint.diagnostics };
+      },
       verifyInitialAlreadySatisfied: async ({ reviewedBaseSha, headSha }) => {
         if (!reviewedBaseSha || !headSha) {
           return {
@@ -3592,10 +4214,15 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
                 { stdio: "inherit" },
               );
             },
-            pushAccumulationBranch: ({ accumulationBranch, expectedHeadSha }) =>
+            pushAccumulationBranch: ({
+              accumulationBranch,
+              expectedHeadSha,
+              expectedRemoteSha,
+            }) =>
               pushAccumulationBranchWithLease({
                 accumulationBranch,
                 expectedHeadSha,
+                expectedRemoteSha,
               }),
             closeChildIssue: ({ childNumber, comment }) => {
               const record = client.viewIssue(childNumber);
@@ -3636,6 +4263,20 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
             accumulationBranch: input.state.accumulationBranch,
             queueLabel: input.state.queueLabel,
             siblingSummaries: [],
+            listSiblingSummaries: ({ childNumber }) =>
+              listIssueAsPrdParentChildren({
+                parentNumber: parent.number,
+                queueLabel: currentState.queueLabel,
+                client,
+              })
+                .filter((candidate) =>
+                  candidate.state === "OPEN" && candidate.number !== childNumber
+                )
+                .map((candidate) => ({
+                  number: candidate.number,
+                  title: candidate.title,
+                  body: candidate.body,
+                })),
             runValidationCommand: aggregateValidationRunner.run,
             publishChildren: ({ drafts }) =>
               publishIssueAsPrdParentChildren({
@@ -3663,36 +4304,39 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
                     client.createComment(parentNumber, body).id,
                   updateComment: ({ commentId, body }) =>
                     client.updateComment(commentId, body),
+                  readComments: ({ parentNumber }) => client.viewIssue(parentNumber).comments,
                 },
               );
               currentState = nextState;
               stateCommentId = persisted.commentId;
             },
-            readiness: ({ children, siblingSummaries, accumulationSha }) =>
-              runSubtaskReadinessBatch({
-                parentContext: input.normalizedContext,
-                children,
-                siblingSummaries,
+            improveChild: ({ child, siblingSummaries, accumulationSha }) =>
+              improveSubtaskJustInTime({
+                child,
                 accumulationSha,
                 client,
-                acquire: (child, activeSiblings) =>
-                  acquireSubtaskReadiness({
+                acquire: (currentChild) =>
+                  acquireSubtaskImprovement({
                     prd: label,
                     childIssueNumber: child.number,
-                    model: SUBTASK_READINESS_MODEL,
+                    model: SUBTASK_IMPROVEMENT_MODEL,
                     round: gate,
-                    promptFile: SUBTASK_READINESS_USER_PROMPT_FILE,
+                    promptFile: SUBTASK_IMPROVEMENT_USER_PROMPT_FILE,
                     promptArgs: {
                       PARENT_ISSUE_NUMBER: String(parent.number),
                       PARENT_ISSUE_TITLE: parent.title,
+                      ORIGINAL_FORK_SHA: currentState.originalForkSha,
                       ACCUMULATION_HEAD_SHA: accumulationSha,
-                      SUBTASK_TITLE: child.title,
-                      ACTIVE_SIBLINGS: activeSiblings
+                      SUBTASK_TITLE: currentChild.title,
+                      ACTIVE_SIBLINGS: siblingSummaries
                         .map((sibling) => formatCompactSiblingSummary(sibling))
                         .join("\n\n"),
                       PARENT_CONTEXT: input.normalizedContext.rendered,
-                      SUBTASK_BODY: child.body,
+                      SUBTASK_BODY: currentChild.body,
+                      SUBTASK_DISCUSSION: flattenComments(currentChild.comments),
                     },
+                    validateResult: (result) =>
+                      validateImprovementForCurrentIssue({ current: currentChild, result }),
                     measuredRunDeps: {
                       beginAgentStep: (agentStep) => {
                         tuiEmitter.setTicket({
@@ -3703,24 +4347,26 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
                         tuiEmitter.beginAgentStep(agentStep);
                       },
                     },
-                    runAttempt: async (attempt) =>
+                    runAttempt: (attempt) =>
                       runIssueAsPrdPromptSession({
-                        branch: `issue-${parent.number}-repair-readiness-${child.number}-a${attempt}`,
+                        branch: `issue-${parent.number}-repair-improvement-${child.number}-a${attempt}`,
                         baseRef: accumulationSha,
-                        stage: "subtask_readiness",
-                        runName: buildSubtaskReadinessRunName(child.number, attempt),
-                        model: SUBTASK_READINESS_MODEL,
-                        promptFile: SUBTASK_READINESS_USER_PROMPT_FILE,
+                        stage: "subtask_improvement",
+                        runName: buildSubtaskImprovementRunName(child.number, attempt),
+                        model: SUBTASK_IMPROVEMENT_MODEL,
+                        promptFile: SUBTASK_IMPROVEMENT_USER_PROMPT_FILE,
                         promptArgs: {
                           PARENT_ISSUE_NUMBER: String(parent.number),
                           PARENT_ISSUE_TITLE: parent.title,
+                          ORIGINAL_FORK_SHA: currentState.originalForkSha,
                           ACCUMULATION_HEAD_SHA: accumulationSha,
-                          SUBTASK_TITLE: child.title,
-                          ACTIVE_SIBLINGS: activeSiblings
+                          SUBTASK_TITLE: currentChild.title,
+                          ACTIVE_SIBLINGS: siblingSummaries
                             .map((sibling) => formatCompactSiblingSummary(sibling))
                             .join("\n\n"),
                           PARENT_CONTEXT: input.normalizedContext.rendered,
-                          SUBTASK_BODY: child.body,
+                          SUBTASK_BODY: currentChild.body,
+                          SUBTASK_DISCUSSION: flattenComments(currentChild.comments),
                         },
                       }),
                   }),
@@ -3747,10 +4393,15 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
                     { stdio: "inherit" },
                   );
                 },
-                pushAccumulationBranch: ({ accumulationBranch, expectedHeadSha }) =>
+                pushAccumulationBranch: ({
+                  accumulationBranch,
+                  expectedHeadSha,
+                  expectedRemoteSha,
+                }) =>
                   pushAccumulationBranchWithLease({
                     accumulationBranch,
                     expectedHeadSha,
+                    expectedRemoteSha,
                   }),
                 closeChildIssue: ({ childNumber, comment }) => {
                   const record = client.viewIssue(childNumber);
@@ -3924,7 +4575,23 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
     },
   );
 
-  const terminal = terminalActionForParentResult(result);
+  const mappedTerminal = terminalActionForParentResult(result);
+  let terminal: Exclude<BacklogTerminalAction, { kind: "close_complete" }>;
+  if (mappedTerminal.kind === "close_complete") {
+    // Backlog v3 never auto-closes a parent. The just-in-time workflow routes
+    // verified no-change direct work through normal review and delivery, so
+    // reaching this legacy action is an invariant failure, not permission to
+    // mutate the parent closed.
+    terminal = {
+      kind: "mark_parent_stuck",
+      labelPlan: parentFailureLabelPlan(),
+      shouldStopLoop: false,
+      reason: "unexpected_parent_auto_close_action",
+      diagnostics: ["Backlog v3 refused a legacy close_complete terminal action."],
+    };
+  } else {
+    terminal = mappedTerminal;
+  }
   if (terminal.kind === "ownership_ambiguous") {
     console.error(
       `Ownership ambiguous after processing parent #${parent.number}:\n${terminal.diagnostics.join("\n")}`,
@@ -3967,9 +4634,11 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
       );
       return { stopLoop: true };
     }
+    const deliveryHeadSha = git(["rev-parse", currentState.accumulationBranch]).trim();
     pushAccumulationBranchWithLease({
       accumulationBranch: currentState.accumulationBranch,
-      expectedHeadSha: git(["rev-parse", currentState.accumulationBranch]).trim(),
+      expectedHeadSha: deliveryHeadSha,
+      expectedRemoteSha: deliveryHeadSha,
     });
     await persistTerminalPhase("delivered");
     const add = terminal.labelPlan.add.filter((label) => !finalParent.labels.some((value) => value.name === label));
@@ -4068,82 +4737,16 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
     return { stopLoop: false };
   }
 
-  if (terminal.kind === "close_complete") {
-    tuiEmitter.beginHostStep("deliver_review_ready", currentState.accumulationBranch);
-    const childVerification = verifyTerminalChildren({
-      parentNumber: parent.number,
-      result: { kind: "clean_delivery" },
-      queueLabel: currentState.queueLabel,
-      client,
-    });
-    if (!childVerification.ok) {
-      console.error(
-        `Already-complete child verification failed for parent #${parent.number}:\n${childVerification.diagnostics.join("\n")}`,
-      );
-      return { stopLoop: true };
-    }
-    await persistTerminalPhase("delivered");
-    const add = terminal.labelPlan.add.filter((label) => !finalParent.labels.some((value) => value.name === label));
-    const remove = terminal.labelPlan.remove.filter((label) => finalParent.labels.some((value) => value.name === label));
-    const labelVerification = await applyVerifiedParentTerminalLabels({
-      parentNumber: parent.number,
-      add,
-      remove,
-      client,
-    });
-    if (!labelVerification.ok) {
-      console.error(
-        `Already-complete label verification failed for parent #${parent.number}:\n${labelVerification.diagnostics.join("\n")}`,
-      );
-      return { stopLoop: true };
-    }
-    if (terminal.labelPlan.deleteQueueLabel) {
-      try {
-        gh(["label", "delete", currentState.queueLabel, "--yes"]);
-      } catch (err) {
-        console.warn(
-          `Warning: failed to delete queue label ${currentState.queueLabel}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }
-    const closeVerification = await runVerifiedHostMutation({
-      mutate: () =>
-        client.closeIssue(
-          parent.number,
-          [
-            "Closing as already complete: the deliverable already exists on the current base with a host-verified empty diff.",
-            "",
-            "Evidence:",
-            terminal.evidence,
-          ].join("\n"),
-        ),
-      readBack: () => client.viewIssue(parent.number),
-      verify: (value) => value.state === "CLOSED",
-      describe: (value) => `issue #${value.number} state=${value.state}`,
-    });
-    if (!closeVerification.ok) {
-      console.error(
-        `Already-complete close verification failed for parent #${parent.number}:\n${closeVerification.diagnostics.join("\n")}`,
-      );
-      return { stopLoop: true };
-    }
-    recordIssueOutcome({
-      prd: label,
-      issue: parent.number,
-      outcome: "already_satisfied",
-      roundsUsed: 1,
-    });
-    return { stopLoop: false };
-  }
-
   tuiEmitter.setTicket({
     number: parent.number,
     title: parent.title,
     branch: currentState.accumulationBranch,
   });
+  const failedHeadSha = git(["rev-parse", currentState.accumulationBranch]).trim();
   pushAccumulationBranchWithLease({
     accumulationBranch: currentState.accumulationBranch,
-    expectedHeadSha: git(["rev-parse", currentState.accumulationBranch]).trim(),
+    expectedHeadSha: failedHeadSha,
+    expectedRemoteSha: failedHeadSha,
   });
   await persistTerminalPhase("failed");
   const add = terminal.labelPlan.add.filter((label) => !finalParent.labels.some((value) => value.name === label));

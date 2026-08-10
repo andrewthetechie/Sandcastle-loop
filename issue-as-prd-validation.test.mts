@@ -93,6 +93,53 @@ test("approved repair child reruns the full gate from the beginning", async () =
   assert.match(deps.publishedDrafts[0]!.body, /TOKEN[:=] \[REDACTED\]|TOKEN=\[REDACTED\]/);
 });
 
+test("repair child is improved just in time with freshly listed siblings before coding", async () => {
+  const deps = createDeps({
+    commandResults: [
+      { ok: false, exitCode: 1, output: "fail" },
+      { ok: true },
+    ],
+    integratedHeadSha: "acc-2",
+  });
+  deps.readiness = undefined;
+  deps.listSiblingSummaries = ({ childNumber }) => {
+    deps.events.push(`list-siblings:${childNumber}`);
+    return [{ number: 72, title: "Sibling", body: "Current sibling body" }];
+  };
+  deps.improveChild = async ({ child, siblingSummaries, accumulationSha }) => {
+    deps.events.push(
+      `improve:${child.number}:${siblingSummaries.map((sibling) => sibling.number).join(",")}:${accumulationSha}`,
+    );
+    return { kind: "actionable" as const, child, reused: false };
+  };
+
+  const result = await runAggregateValidation(
+    {
+      gate: "pre_review",
+      commands: ["test"],
+      accumulationSha: "acc-1",
+      repairAlreadyUsed: false,
+    },
+    deps,
+  );
+
+  assert.deepEqual(result, {
+    kind: "repaired",
+    childNumber: 71,
+    accumulationSha: "acc-2",
+  });
+  assert.deepEqual(deps.events, [
+    "command:test:acc-1",
+    "publish",
+    "mark-budget:pre_review:71",
+    "list-siblings:71",
+    "improve:71:72:acc-1",
+    "engine:71:pre_review",
+    "integrate:71",
+    "command:test:acc-2",
+  ]);
+});
+
 test("readiness drop or failure becomes parent_failure", async () => {
   const dropped = createDeps({
     commandResults: [{ ok: false, exitCode: 1, output: "fail" }],

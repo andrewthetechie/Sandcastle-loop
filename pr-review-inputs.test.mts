@@ -9,7 +9,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { writePrReviewInputs } from "./pr-review-inputs.mts";
+import {
+  writePrReviewInputs,
+  writePrReviewSpecialistArtifacts,
+} from "./pr-review-inputs.mts";
 
 test("PR review input writer persists file-backed review inputs", () => {
   withTempDir((worktree) => {
@@ -18,6 +21,8 @@ test("PR review input writer persists file-backed review inputs", () => {
       title: "Fix the thing",
       body: "PR body line 1\nPR body line 2\n",
       linkedIssues: "### Issue #42: The thing\n\nIssue body.\n",
+      commitList: "abc1234 Implement the thing (#42)\n",
+      standardsFiles: ["AGENTS.md", "docs/conventions.md"],
       baseSha: "abc123def456",
       diff: "diff --git a/file.ts b/file.ts\n+change\n",
       diffStat: " file.ts | 1 +\n 1 file changed, 1 insertion(+)\n",
@@ -52,6 +57,16 @@ test("PR review input writer persists file-backed review inputs", () => {
       "linked issues file should exist",
     );
     assert.equal(
+      existsSync(join(worktree, result.paths.commitList)),
+      true,
+      "commit list file should exist",
+    );
+    assert.equal(
+      existsSync(join(worktree, result.paths.standardsFiles)),
+      true,
+      "standards files list should exist",
+    );
+    assert.equal(
       existsSync(join(worktree, result.paths.metadata)),
       true,
       "metadata file should exist",
@@ -68,6 +83,14 @@ test("PR review input writer persists file-backed review inputs", () => {
       read(worktree, result.paths.linkedIssues),
       result.inputs.linkedIssues,
     );
+    assert.equal(
+      read(worktree, result.paths.commitList),
+      result.inputs.commitList,
+    );
+    assert.equal(
+      read(worktree, result.paths.standardsFiles),
+      result.inputs.standardsFiles.join("\n"),
+    );
 
     const metadata = JSON.parse(read(worktree, result.paths.metadata));
     assert.equal(metadata.pr_number, 328);
@@ -79,6 +102,14 @@ test("PR review input writer persists file-backed review inputs", () => {
     assert.equal(
       metadata.input_files.diff,
       `.sandcastle/pr-review/pr-328/review-input.diff`,
+    );
+    assert.equal(
+      metadata.input_files.commitList,
+      `.sandcastle/pr-review/pr-328/review-input.commits.txt`,
+    );
+    assert.equal(
+      metadata.input_files.standardsFiles,
+      `.sandcastle/pr-review/pr-328/review-input.standards-files.txt`,
     );
 
     assert.equal(
@@ -95,6 +126,8 @@ test("PR review input writer accepts empty optional arrays/bodies", () => {
       title: "Tiny fix",
       body: "",
       linkedIssues: "(no linked issues)",
+      commitList: "",
+      standardsFiles: [],
       baseSha: "000000000000",
       diff: "",
       diffStat: "",
@@ -111,6 +144,56 @@ test("PR review input writer accepts empty optional arrays/bodies", () => {
     assert.deepEqual(metadata.review_aspects, []);
     assert.deepEqual(metadata.ecosystems, []);
     assert.equal(metadata.diff_bytes, 0);
+  });
+});
+
+test("specialist artifact writer persists parsed reviews and combined findings", () => {
+  withTempDir((worktree) => {
+    const paths = writePrReviewSpecialistArtifacts(
+      worktree,
+      ".sandcastle/pr-review/pr-9",
+      {
+        standardsRaw: "<standards_findings>raw standards</standards_findings>",
+        standardsReview: { status: "complete", summary: "standards", findings: [] },
+        specRaw: "<spec_findings>raw spec</spec_findings>",
+        specReview: { status: "complete", summary: "spec", findings: [] },
+        findings: [
+          {
+            id: "SPEC-001",
+            axis: "spec",
+            severity: "high",
+            confidence: 95,
+            problem: "Required behavior is missing.",
+            impact: "The main user flow cannot complete.",
+            fix: "Implement the requirement.",
+            reference: "Issue #9 — acceptance criterion 1",
+          },
+        ],
+      },
+    );
+
+    assert.equal(
+      paths.standardsRaw,
+      ".sandcastle/pr-review/pr-9/review-output.standards.raw.txt",
+    );
+    assert.equal(
+      paths.standardsReview,
+      ".sandcastle/pr-review/pr-9/review-output.standards.json",
+    );
+    assert.equal(
+      paths.fixResult,
+      ".sandcastle/pr-review/pr-9/review-fix-result.json",
+    );
+    assert.equal(
+      JSON.parse(read(worktree, paths.findings))[0].id,
+      "SPEC-001",
+    );
+    assert.equal(
+      JSON.parse(read(worktree, paths.specReview)).summary,
+      "spec",
+    );
+    assert.match(read(worktree, paths.standardsRaw), /raw standards/);
+    assert.match(read(worktree, paths.specRaw), /raw spec/);
   });
 });
 

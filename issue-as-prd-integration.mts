@@ -30,6 +30,7 @@ export interface ChildIntegrationDeps {
   pushAccumulationBranch(input: {
     accumulationBranch: string;
     expectedHeadSha: string;
+    expectedRemoteSha: string;
   }): Promise<void> | void;
   closeChildIssue(input: {
     childNumber: number;
@@ -155,6 +156,7 @@ export async function integrateApprovedChild(
         deps.pushAccumulationBranch({
           accumulationBranch: input.accumulationBranch,
           expectedHeadSha: input.approvedHeadSha,
+          expectedRemoteSha: heads.remoteHeadSha,
         }),
       "push_failed",
       "Push failed",

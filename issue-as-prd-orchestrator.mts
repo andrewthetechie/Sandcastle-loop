@@ -17,6 +17,7 @@ import {
 import type { ChildIntegrationInput } from "./issue-as-prd-integration.mts";
 import type { PerBranchEngineOutcome } from "./per-branch-engine.mts";
 import type { ReadinessBatchResult } from "./subtask-readiness.mts";
+import type { SubtaskImprovementResult } from "./subtask-improvement.mts";
 import type {
   AggregateGate,
   AggregateValidationFailure,
@@ -31,19 +32,17 @@ export type ParentRunResult =
       accumulationHeadSha: string;
       observedMainlineSha: string;
       rebaseNeeded: boolean;
+      accumulationDiverged?: boolean;
     }
   | {
       kind: "partial_delivery";
       accumulationHeadSha: string;
       observedMainlineSha: string;
       rebaseNeeded: boolean;
+      accumulationDiverged?: boolean;
       stuckChildNumber: number;
     }
   | {
-      // The parent's deliverable already exists on the accumulation base with
-      // a host-verified empty diff: there is nothing to implement or review.
-      // The caller should close the parent with the evidence instead of
-      // marking it stuck.
       kind: "parent_already_complete";
       accumulationHeadSha: string;
       evidence: string;
@@ -57,6 +56,9 @@ export type ParentRunResult =
   | { kind: "ownership_ambiguous"; reason: string; diagnostics: string[] };
 
 export interface IssueAsPrdOrchestratorDeps {
+  // The legacy batch gate stays available for frozen runner lineages. v3 opts
+  // into just-in-time improvement so no child is assessed before it is next.
+  workflow?: "legacy_readiness" | "just_in_time_improvement";
   now(): string;
   verifyOwnership(input: {
     parent: GitHubIssueRecord;
@@ -79,12 +81,19 @@ export interface IssueAsPrdOrchestratorDeps {
     parent: GitHubIssueRecord;
     queueLabel: string;
   }): Promise<GitHubIssueRecord[]>;
-  readiness(input: {
+  readiness?(input: {
     parentContext: NormalizedParentContext;
     children: readonly GitHubIssueRecord[];
     siblingSummaries: readonly { number: number; title: string; body: string }[];
     accumulationSha: string;
   }): Promise<ReadinessBatchResult>;
+  improveChild?(input: {
+    parentContext: NormalizedParentContext;
+    child: GitHubIssueRecord;
+    siblingSummaries: readonly { number: number; title: string; body: string }[];
+    accumulationSha: string;
+    source: "initial" | "review_followup" | "aggregate_repair";
+  }): Promise<SubtaskImprovementResult>;
   runChildEngine(input: {
     child: GitHubIssueRecord;
     accumulationSha: string;
@@ -96,6 +105,14 @@ export interface IssueAsPrdOrchestratorDeps {
     accumulationBranch: string;
     accumulationSha: string;
   }): Promise<PerBranchEngineOutcome>;
+  checkpointDirectParent?(input: {
+    accumulationBranch: string;
+    previousAccumulationSha: string;
+    approvedHeadSha: string;
+  }): Promise<
+    | { ok: true; accumulationHeadSha: string }
+    | { ok: false; diagnostics: string[] }
+  >;
   verifyInitialAlreadySatisfied(input: {
     child: GitHubIssueRecord;
     reviewedBaseSha: string;
@@ -141,6 +158,18 @@ export interface IssueAsPrdOrchestratorDeps {
         diagnostics: string[];
       }
   >;
+  refreshAfterAccumulationAdvance?(input: {
+    state: IssueAsPrdParentState;
+    accumulationHeadSha: string;
+    trigger: "child_integration" | "direct_parent" | "aggregate_repair" | "pre_review";
+  }): Promise<
+    | { kind: "unchanged" | "refreshed"; accumulationHeadSha: string; attemptedMainlineSha: string }
+    | { kind: "diverged"; accumulationHeadSha: string; attemptedMainlineSha: string; diagnostics: string[] }
+  >;
+  markAccumulationDiverged?(input: {
+    parentNumber: number;
+    attemptedMainlineSha: string;
+  }): Promise<void>;
   runAggregateValidation(input: {
     gate: AggregateGate;
     commands: readonly string[];
@@ -243,12 +272,12 @@ export async function runIssueAsPrdParent(input: {
     accumulationHeadSha = prepared.accumulationHeadSha;
   }
 
-  if (state.phase === "decomposed") {
+  if (state.phase === "decomposed" && !usesJustInTimeImprovement(deps)) {
     const children = await deps.listChildren({
       parent: input.parent,
       queueLabel: state.queueLabel,
     });
-    const readiness = await deps.readiness({
+    const readiness = await runLegacyReadiness(deps, {
       parentContext: input.normalizedContext,
       children,
       siblingSummaries: siblingSummaries(children),
@@ -264,8 +293,12 @@ export async function runIssueAsPrdParent(input: {
     state = await transition(state, deps, { phase: "initial_ready" });
   }
 
+  if (state.phase === "decomposed" && usesJustInTimeImprovement(deps)) {
+    state = await transition(state, deps, { phase: "initial_queue" });
+  }
+
   let redecompositionAttempted = false;
-  while (state.phase === "initial_ready") {
+  while (state.phase === "initial_ready" || state.phase === "initial_queue") {
     const drained = await drainInitialChildren({
       parent: input.parent,
       context: input.normalizedContext,
@@ -308,21 +341,40 @@ export async function runIssueAsPrdParent(input: {
   }
 
   if (state.phase === "initial_drained") {
-    const refreshed = await deps.refreshBeforeReview({
-      accumulationBranch: state.accumulationBranch,
-      mainlineRef: deps.mainlineRef,
-      originalForkSha: state.originalForkSha,
-      currentReviewBaseSha: state.fullParentReviewBaseSha,
-    });
-    accumulationHeadSha = refreshed.accumulationHeadSha;
-    state = await transition(state, deps, {
-      fullParentReviewBaseSha: refreshed.reviewBaseSha,
-      attemptedMainlineSha:
-        refreshed.kind === "conflict" ? refreshed.attemptedMainlineSha : refreshed.fetchedMainlineSha,
-      rebaseConflictDiagnostics:
-        refreshed.kind === "conflict" ? refreshed.diagnostics : [],
-      phase: "initial_drained",
-    });
+    if (usesJustInTimeImprovement(deps) && deps.refreshAfterAccumulationAdvance) {
+      const refreshed = await refreshAfterAccumulationAdvance({
+        state,
+        accumulationHeadSha,
+        trigger: "pre_review",
+        deps,
+      });
+      if (refreshed.kind === "parent_failure") {
+        return parentStuck(accumulationHeadSha, "pre_review_mainline_refresh_failed", refreshed.diagnostics);
+      }
+      accumulationHeadSha = refreshed.accumulationHeadSha;
+      state = await transition(refreshed.state, deps, {
+        fullParentReviewBaseSha: refreshed.state.accumulationDiverged
+          ? refreshed.state.fullParentReviewBaseSha
+          : refreshed.state.attemptedMainlineSha ?? refreshed.state.fullParentReviewBaseSha,
+        phase: "initial_drained",
+      });
+    } else if (!state.accumulationDiverged) {
+      const refreshed = await deps.refreshBeforeReview({
+        accumulationBranch: state.accumulationBranch,
+        mainlineRef: deps.mainlineRef,
+        originalForkSha: state.originalForkSha,
+        currentReviewBaseSha: state.fullParentReviewBaseSha,
+      });
+      accumulationHeadSha = refreshed.accumulationHeadSha;
+      state = await transition(state, deps, {
+        fullParentReviewBaseSha: refreshed.reviewBaseSha,
+        attemptedMainlineSha:
+          refreshed.kind === "conflict" ? refreshed.attemptedMainlineSha : refreshed.fetchedMainlineSha,
+        rebaseConflictDiagnostics:
+          refreshed.kind === "conflict" ? refreshed.diagnostics : [],
+        phase: "initial_drained",
+      });
+    }
 
     const preReview = await deps.runAggregateValidation({
       gate: "pre_review",
@@ -353,6 +405,17 @@ export async function runIssueAsPrdParent(input: {
           pre_review: 1,
         },
       });
+      const refreshed = await refreshAfterAccumulationAdvance({
+        state,
+        accumulationHeadSha,
+        trigger: "aggregate_repair",
+        deps,
+      });
+      if (refreshed.kind === "parent_failure") {
+        return parentStuck(accumulationHeadSha, "pre_review_repair_mainline_refresh_failed", refreshed.diagnostics);
+      }
+      state = refreshed.state;
+      accumulationHeadSha = refreshed.accumulationHeadSha;
     }
     state = await transition(state, deps, { phase: "pre_review_ready" });
   }
@@ -393,7 +456,12 @@ export async function runIssueAsPrdParent(input: {
           publication.diagnostics,
         );
       }
-      const readiness = await deps.readiness({
+      if (usesJustInTimeImprovement(deps)) {
+        state = await transition(state, deps, { phase: "followup_queue" });
+        // Publication only makes follow-ups eligible. The selected child is
+        // improved against the accumulation immediately before coding.
+      } else {
+      const readiness = await runLegacyReadiness(deps, {
         parentContext: input.normalizedContext,
         children: publication.children,
         siblingSummaries: siblingSummaries(publication.children),
@@ -409,6 +477,7 @@ export async function runIssueAsPrdParent(input: {
       state = await transition(state, deps, {
         phase: "followups_ready",
       });
+      }
     } else {
       state = await transition(state, deps, {
         phase: "followups_drained",
@@ -416,7 +485,7 @@ export async function runIssueAsPrdParent(input: {
     }
   }
 
-  if (state.phase === "followups_ready") {
+  if (state.phase === "followups_ready" || state.phase === "followup_queue") {
     const drained = await drainFollowupChildren({
       parent: input.parent,
       context: input.normalizedContext,
@@ -469,6 +538,17 @@ export async function runIssueAsPrdParent(input: {
           pre_delivery: 1,
         },
       });
+      const refreshed = await refreshAfterAccumulationAdvance({
+        state,
+        accumulationHeadSha,
+        trigger: "aggregate_repair",
+        deps,
+      });
+      if (refreshed.kind === "parent_failure") {
+        return parentStuck(accumulationHeadSha, "pre_delivery_repair_mainline_refresh_failed", refreshed.diagnostics);
+      }
+      state = refreshed.state;
+      accumulationHeadSha = refreshed.accumulationHeadSha;
     }
     state = await transition(state, deps, { phase: "pre_delivery_ready" });
   }
@@ -488,6 +568,7 @@ export async function runIssueAsPrdParent(input: {
       accumulationHeadSha,
       observedMainlineSha: terminal.observedMainlineSha,
       rebaseNeeded: terminal.rebaseNeeded,
+      ...(state.accumulationDiverged ? { accumulationDiverged: true } : {}),
       stuckChildNumber: partialCauseChildNumber,
     };
   }
@@ -497,6 +578,7 @@ export async function runIssueAsPrdParent(input: {
     accumulationHeadSha,
     observedMainlineSha: terminal.observedMainlineSha,
     rebaseNeeded: terminal.rebaseNeeded,
+    ...(state.accumulationDiverged ? { accumulationDiverged: true } : {}),
   };
 }
 
@@ -558,7 +640,11 @@ async function prepareInitialWorkFromDecomposition(input: {
     state = await transition(state, deps, {
       phase: "decomposed",
     });
-    const readiness = await deps.readiness({
+    if (usesJustInTimeImprovement(deps)) {
+      state = await transition(state, deps, { phase: "initial_queue" });
+      return { kind: "prepared", state, accumulationHeadSha };
+    }
+    const readiness = await runLegacyReadiness(deps, {
       parentContext: input.context,
       children: publication.children,
       siblingSummaries: siblingSummaries(publication.children),
@@ -584,10 +670,39 @@ async function prepareInitialWorkFromDecomposition(input: {
     accumulationSha: accumulationHeadSha,
   });
   if (direct.kind === "approved") {
-    accumulationHeadSha = direct.approvedHeadSha;
+    const checkpoint = deps.checkpointDirectParent
+      ? await deps.checkpointDirectParent({
+          accumulationBranch: state.accumulationBranch,
+          previousAccumulationSha: accumulationHeadSha,
+          approvedHeadSha: direct.approvedHeadSha,
+        })
+      : { ok: true as const, accumulationHeadSha: direct.approvedHeadSha };
+    if (!checkpoint.ok) {
+      return terminal(
+        parentStuck(
+          accumulationHeadSha,
+          "direct_parent_checkpoint_failed",
+          checkpoint.diagnostics,
+        ),
+      );
+    }
+    accumulationHeadSha = checkpoint.accumulationHeadSha;
     state = await transition(state, deps, {
       phase: "initial_drained",
     });
+    const refreshed = await refreshAfterAccumulationAdvance({
+      state,
+      accumulationHeadSha,
+      trigger: "direct_parent",
+      deps,
+    });
+    if (refreshed.kind === "parent_failure") {
+      return terminal(
+        parentStuck(accumulationHeadSha, "direct_parent_mainline_refresh_failed", refreshed.diagnostics),
+      );
+    }
+    state = refreshed.state;
+    accumulationHeadSha = refreshed.accumulationHeadSha;
     return { kind: "prepared", state, accumulationHeadSha };
   }
   if (direct.kind === "already_satisfied") {
@@ -601,13 +716,17 @@ async function prepareInitialWorkFromDecomposition(input: {
       headSha: direct.headSha,
     });
     if (verification.ok && verification.empty) {
-      return terminal({
-        kind: "parent_already_complete",
-        accumulationHeadSha,
-        evidence: [direct.evidence, verification.evidence]
-          .filter(Boolean)
-          .join("\n\n"),
-      });
+      if (!usesJustInTimeImprovement(deps)) {
+        return terminal({
+          kind: "parent_already_complete",
+          accumulationHeadSha,
+          evidence: [direct.evidence, verification.evidence]
+            .filter(Boolean)
+            .join("\n\n"),
+        });
+      }
+      state = await transition(state, deps, { phase: "initial_drained" });
+      return { kind: "prepared", state, accumulationHeadSha };
     }
     return terminal(
       parentStuck(
@@ -687,7 +806,29 @@ async function drainInitialChildren(input: {
       return { kind: "done", accumulationHeadSha, partialCauseChildNumber, state };
     }
 
-    const child = children.find((candidate) => candidate.number === selection.issue.number)!;
+    let child = children.find((candidate) => candidate.number === selection.issue.number)!;
+    if (usesJustInTimeImprovement(input.deps)) {
+      const improved = await improveSelectedChild({
+        parentContext: input.context,
+        child,
+        children,
+        accumulationSha: accumulationHeadSha,
+        source: "initial",
+        deps: input.deps,
+      });
+      if (improved.kind === "parent_failure") {
+        return {
+          kind: "parent_stuck",
+          result: parentStuck(
+            accumulationHeadSha,
+            "initial_child_improvement_failed",
+            improved.diagnostics,
+          ),
+        };
+      }
+      if (improved.kind === "redundant") continue;
+      child = improved.child;
+    }
     const outcome = await input.deps.runChildEngine({
       child,
       accumulationSha: accumulationHeadSha,
@@ -706,7 +847,17 @@ async function drainInitialChildren(input: {
           result: parentStuck(accumulationHeadSha, "initial_child_integration_failed", integrated.diagnostics),
         };
       }
-      accumulationHeadSha = integrated.accumulationHeadSha;
+      const refreshed = await refreshAfterAccumulationAdvance({
+        state,
+        accumulationHeadSha: integrated.accumulationHeadSha,
+        trigger: "child_integration",
+        deps: input.deps,
+      });
+      if (refreshed.kind === "parent_failure") {
+        return { kind: "parent_stuck", result: parentStuck(accumulationHeadSha, "initial_child_mainline_refresh_failed", refreshed.diagnostics) };
+      }
+      accumulationHeadSha = refreshed.accumulationHeadSha;
+      state = refreshed.state;
       continue;
     }
 
@@ -807,7 +958,29 @@ async function drainFollowupChildren(input: {
       return { kind: "done", accumulationHeadSha, partialCauseChildNumber, state };
     }
 
-    const child = children.find((candidate) => candidate.number === selection.issue.number)!;
+    let child = children.find((candidate) => candidate.number === selection.issue.number)!;
+    if (usesJustInTimeImprovement(input.deps)) {
+      const improved = await improveSelectedChild({
+        parentContext: input.context,
+        child,
+        children,
+        accumulationSha: accumulationHeadSha,
+        source: "review_followup",
+        deps: input.deps,
+      });
+      if (improved.kind === "parent_failure") {
+        return {
+          kind: "parent_stuck",
+          result: parentStuck(
+            accumulationHeadSha,
+            "review_followup_improvement_failed",
+            improved.diagnostics,
+          ),
+        };
+      }
+      if (improved.kind === "redundant") continue;
+      child = improved.child;
+    }
     const outcome = await input.deps.runChildEngine({
       child,
       accumulationSha: accumulationHeadSha,
@@ -826,7 +999,17 @@ async function drainFollowupChildren(input: {
           result: parentStuck(accumulationHeadSha, "review_followup_integration_failed", integrated.diagnostics),
         };
       }
-      accumulationHeadSha = integrated.accumulationHeadSha;
+      const refreshed = await refreshAfterAccumulationAdvance({
+        state,
+        accumulationHeadSha: integrated.accumulationHeadSha,
+        trigger: "child_integration",
+        deps: input.deps,
+      });
+      if (refreshed.kind === "parent_failure") {
+        return { kind: "parent_stuck", result: parentStuck(accumulationHeadSha, "review_followup_mainline_refresh_failed", refreshed.diagnostics) };
+      }
+      accumulationHeadSha = refreshed.accumulationHeadSha;
+      state = refreshed.state;
       continue;
     }
 
@@ -856,6 +1039,100 @@ function siblingSummaries(children: readonly GitHubIssueRecord[]) {
     title: child.title,
     body: child.body,
   }));
+}
+
+function usesJustInTimeImprovement(deps: IssueAsPrdOrchestratorDeps): boolean {
+  return deps.workflow === "just_in_time_improvement";
+}
+
+async function runLegacyReadiness(
+  deps: IssueAsPrdOrchestratorDeps,
+  input: {
+    parentContext: NormalizedParentContext;
+    children: readonly GitHubIssueRecord[];
+    siblingSummaries: readonly { number: number; title: string; body: string }[];
+    accumulationSha: string;
+  },
+): Promise<ReadinessBatchResult> {
+  if (!deps.readiness) {
+    return {
+      kind: "parent_failure",
+      ready: [],
+      dropped: [],
+      diagnostics: ["Legacy readiness workflow has no readiness dependency."],
+    };
+  }
+  return deps.readiness(input);
+}
+
+async function improveSelectedChild(input: {
+  parentContext: NormalizedParentContext;
+  child: GitHubIssueRecord;
+  children: readonly GitHubIssueRecord[];
+  accumulationSha: string;
+  source: "initial" | "review_followup" | "aggregate_repair";
+  deps: IssueAsPrdOrchestratorDeps;
+}): Promise<SubtaskImprovementResult> {
+  if (!input.deps.improveChild) {
+    return {
+      kind: "parent_failure",
+      diagnostics: ["Just-in-time improvement is enabled but no improveChild dependency was supplied."],
+    };
+  }
+  return input.deps.improveChild({
+    parentContext: input.parentContext,
+    child: input.child,
+    siblingSummaries: siblingSummaries(input.children).filter(
+      (sibling) => sibling.number !== input.child.number,
+    ),
+    accumulationSha: input.accumulationSha,
+    source: input.source,
+  });
+}
+
+async function refreshAfterAccumulationAdvance(input: {
+  state: IssueAsPrdParentState;
+  accumulationHeadSha: string;
+  trigger: "child_integration" | "direct_parent" | "aggregate_repair" | "pre_review";
+  deps: IssueAsPrdOrchestratorDeps;
+}): Promise<
+  | { kind: "ok"; state: IssueAsPrdParentState; accumulationHeadSha: string }
+  | { kind: "parent_failure"; diagnostics: string[] }
+> {
+  if (!input.deps.refreshAfterAccumulationAdvance || input.state.accumulationDiverged) {
+    return { kind: "ok", state: input.state, accumulationHeadSha: input.accumulationHeadSha };
+  }
+  try {
+    const result = await input.deps.refreshAfterAccumulationAdvance({
+      state: input.state,
+      accumulationHeadSha: input.accumulationHeadSha,
+      trigger: input.trigger,
+    });
+    const state = await transition(input.state, input.deps, {
+      attemptedMainlineSha: result.attemptedMainlineSha,
+      fullParentReviewBaseSha:
+        result.kind === "diverged"
+          ? input.state.fullParentReviewBaseSha
+          : result.attemptedMainlineSha,
+      accumulationDiverged: result.kind === "diverged" || input.state.accumulationDiverged,
+      rebaseConflictDiagnostics:
+        result.kind === "diverged" ? result.diagnostics : input.state.rebaseConflictDiagnostics,
+    });
+    if (result.kind === "diverged" && input.deps.markAccumulationDiverged) {
+      await input.deps.markAccumulationDiverged({
+        parentNumber: state.parentNumber,
+        attemptedMainlineSha: result.attemptedMainlineSha,
+      });
+    }
+    return { kind: "ok", state, accumulationHeadSha: result.accumulationHeadSha };
+  } catch (error) {
+    return {
+      kind: "parent_failure",
+      diagnostics: [
+        `Mainline refresh after ${input.trigger} failed: ${error instanceof Error ? error.message : String(error)}`,
+      ],
+    };
+  }
 }
 
 async function transition(
@@ -911,6 +1188,7 @@ async function finalizePartial(
     accumulationHeadSha,
     observedMainlineSha: terminal.observedMainlineSha,
     rebaseNeeded: terminal.rebaseNeeded,
+    ...(state.accumulationDiverged ? { accumulationDiverged: true } : {}),
     stuckChildNumber,
   };
 }

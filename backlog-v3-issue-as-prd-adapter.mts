@@ -1,5 +1,7 @@
 import {
   cleanDeliveryLabelPlan,
+  divergedCleanDeliveryLabelPlan,
+  divergedPartialDeliveryLabelPlan,
   ISSUE_AS_PRD_LABELS,
   parentFailureLabelPlan,
   parentQueueLabel,
@@ -28,9 +30,6 @@ export type BacklogTerminalAction =
       shouldStopLoop: false;
     }
   | {
-      // Host-verified: the parent's deliverable already exists on the
-      // accumulation base. Close the parent with the evidence instead of
-      // delivering an empty branch or marking it stuck.
       kind: "close_complete";
       labelPlan: {
         remove: string[];
@@ -87,7 +86,9 @@ export function terminalActionForParentResult(
     case "clean_delivery":
       return {
         kind: "deliver",
-        labelPlan: result.rebaseNeeded
+        labelPlan: result.accumulationDiverged
+          ? divergedCleanDeliveryLabelPlan()
+          : result.rebaseNeeded
           ? rebaseNeededCleanDeliveryLabelPlan()
           : cleanDeliveryLabelPlan(),
         shouldStopLoop: false,
@@ -95,7 +96,9 @@ export function terminalActionForParentResult(
     case "partial_delivery":
       return {
         kind: "deliver",
-        labelPlan: result.rebaseNeeded
+        labelPlan: result.accumulationDiverged
+          ? divergedPartialDeliveryLabelPlan()
+          : result.rebaseNeeded
           ? rebaseNeededPartialDeliveryLabelPlan()
           : partialDeliveryLabelPlan(),
         shouldStopLoop: false,
@@ -144,6 +147,9 @@ export function terminalRepairLabelPlan(state: IssueAsPrdParentState): {
     (state.latestMainlineShaAtDelivery !== null &&
       state.latestMainlineShaAtDelivery !== state.fullParentReviewBaseSha);
   const partial = state.partialCauseChildNumber !== null;
+  if (state.accumulationDiverged) {
+    return partial ? divergedPartialDeliveryLabelPlan() : divergedCleanDeliveryLabelPlan();
+  }
   if (partial && rebaseNeeded) return rebaseNeededPartialDeliveryLabelPlan();
   if (partial) return partialDeliveryLabelPlan();
   if (rebaseNeeded) return rebaseNeededCleanDeliveryLabelPlan();
@@ -155,5 +161,6 @@ export function permanentIssueAsPrdParentLabels() {
     ISSUE_AS_PRD_LABELS.inProgress,
     ISSUE_AS_PRD_LABELS.partial,
     ISSUE_AS_PRD_LABELS.rebaseNeeded,
+    ISSUE_AS_PRD_LABELS.diverged,
   ] as const;
 }

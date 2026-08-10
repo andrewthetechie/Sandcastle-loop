@@ -42,6 +42,7 @@ test("zero-draft direct parent approval still gets one full review and clean del
     "list-children",
     "acquire-initial",
     `direct-parent:${sha("1")}`,
+    `checkpoint-direct:${sha("1")}:${sha("2")}`,
     "persist:initial_drained",
     "refresh",
     "persist:initial_drained",
@@ -55,6 +56,30 @@ test("zero-draft direct parent approval still gets one full review and clean del
     "observe-terminal",
     "persist:pre_delivery_ready",
   ]);
+});
+
+test("approved direct-parent work checkpoints before its continuous refresh", async () => {
+  const deps = createDeps({
+    justInTime: true,
+    continuousRefresh: true,
+    initialDecomposition: successNoWork(),
+    directParentOutcome: approved(sha("1"), sha("2")),
+  });
+
+  const result = await runIssueAsPrdParent(input(), deps);
+
+  assert.equal(result.kind, "clean_delivery");
+  assert.ok(
+    deps.events.indexOf(`checkpoint-direct:${sha("1")}:${sha("2")}`) <
+      deps.events.indexOf(`continuous-refresh:direct_parent:${sha("2")}`),
+  );
+  assert.deepEqual(
+    deps.events.filter((event) => event.startsWith("continuous-refresh:")),
+    [
+      `continuous-refresh:direct_parent:${sha("2")}`,
+      `continuous-refresh:pre_review:${sha("2")}`,
+    ],
+  );
 });
 
 test("two approved initial children drain sequentially and second base equals first integration head", async () => {
@@ -82,6 +107,130 @@ test("two approved initial children drain sequentially and second base equals fi
     { childNumber: 101, accumulationSha: sha("1"), source: "initial" },
     { childNumber: 102, accumulationSha: sha("2"), source: "initial" },
   ]);
+});
+
+test("just-in-time improvement runs only for the selected child immediately before its coder", async () => {
+  const deps = createDeps({
+    justInTime: true,
+    initialDecomposition: successIssues([initialDraft("Child A"), initialDraft("Child B")]),
+    children: [child(101, "Child A"), child(102, "Child B")],
+    childOutcomes: new Map([
+      [101, approved(sha("1"), sha("2"))],
+      [102, approved(sha("2"), sha("3"))],
+    ]),
+    integratedHeads: new Map([[101, sha("2")], [102, sha("3")]]),
+    fullReview: { kind: "reviewed", followupDrafts: [], artifactPaths: [] },
+  });
+
+  const result = await runIssueAsPrdParent(input(), deps);
+
+  assert.equal(result.kind, "clean_delivery");
+  assert.equal(deps.events.includes("readiness"), false);
+  assert.ok(deps.events.indexOf(`improve:101:${sha("1")}`) < deps.events.indexOf(`child-engine:101:initial:${sha("1")}`));
+  assert.ok(deps.events.indexOf(`integrate:101`) < deps.events.indexOf(`improve:102:${sha("2")}`));
+});
+
+test("just-in-time redundant child closes and reselects before any coder invocation", async () => {
+  const deps = createDeps({
+    justInTime: true,
+    initialDecomposition: successIssues([initialDraft("Redundant"), initialDraft("Actionable")]),
+    children: [child(101, "Redundant"), child(102, "Actionable")],
+    improvementOutcomes: new Map([[101, "redundant"]]),
+    childOutcomes: new Map([[102, approved(sha("1"), sha("2"))]]),
+    integratedHeads: new Map([[102, sha("2")]]),
+    fullReview: { kind: "reviewed", followupDrafts: [], artifactPaths: [] },
+  });
+
+  const result = await runIssueAsPrdParent(input(), deps);
+
+  assert.equal(result.kind, "clean_delivery");
+  assert.ok(deps.events.includes(`improve:101:${sha("1")}`));
+  assert.equal(deps.events.some((event) => event.startsWith("child-engine:101:")), false);
+  assert.ok(deps.events.includes(`child-engine:102:initial:${sha("1")}`));
+});
+
+test("continuous refresh runs after every child advance and once more before review", async () => {
+  const deps = createDeps({
+    justInTime: true,
+    continuousRefresh: true,
+    initialDecomposition: successIssues([initialDraft("Child A"), initialDraft("Child B")]),
+    children: [child(101, "Child A"), child(102, "Child B")],
+    childOutcomes: new Map([
+      [101, approved(sha("1"), sha("2"))],
+      [102, approved(sha("2"), sha("3"))],
+    ]),
+    integratedHeads: new Map([[101, sha("2")], [102, sha("3")]]),
+  });
+
+  await runIssueAsPrdParent(input(), deps);
+
+  assert.deepEqual(
+    deps.events.filter((event) => event.startsWith("continuous-refresh:")),
+    [
+      `continuous-refresh:child_integration:${sha("2")}`,
+      `continuous-refresh:child_integration:${sha("3")}`,
+      `continuous-refresh:pre_review:${sha("3")}`,
+    ],
+  );
+});
+
+test("approved child checkpoint and verified close finish before its refresh", async () => {
+  const selectedChild = child(101, "Child A");
+  const deps = createDeps({
+    justInTime: true,
+    continuousRefresh: true,
+    children: [selectedChild],
+    initialDecomposition: successIssues([initialDraft("Child A")]),
+    childOutcomes: new Map([[101, approved(sha("1"), sha("2"))]]),
+  });
+  deps.integrateChild = async ({ childNumber }) => {
+    deps.events.push(`checkpoint:${childNumber}:${sha("2")}`);
+    deps.events.push(`close-verified:${childNumber}`);
+    selectedChild.state = "CLOSED";
+    return {
+      ok: true as const,
+      accumulationHeadSha: sha("2"),
+      recoveredFrom: null,
+    };
+  };
+
+  const result = await runIssueAsPrdParent(input(), deps);
+
+  assert.equal(result.kind, "clean_delivery");
+  const checkpointIndex = deps.events.indexOf(`checkpoint:101:${sha("2")}`);
+  const closeIndex = deps.events.indexOf("close-verified:101");
+  const refreshIndex = deps.events.indexOf(
+    `continuous-refresh:child_integration:${sha("2")}`,
+  );
+  assert.ok(checkpointIndex >= 0);
+  assert.ok(closeIndex > checkpointIndex);
+  assert.ok(refreshIndex > closeIndex);
+});
+
+test("durable divergence suppresses every later automatic refresh without stopping child drain", async () => {
+  const deps = createDeps({
+    justInTime: true,
+    continuousRefresh: true,
+    divergeOnRefreshCall: 1,
+    initialDecomposition: successIssues([initialDraft("Child A"), initialDraft("Child B")]),
+    children: [child(101, "Child A"), child(102, "Child B")],
+    childOutcomes: new Map([
+      [101, approved(sha("1"), sha("2"))],
+      [102, approved(sha("2"), sha("3"))],
+    ]),
+    integratedHeads: new Map([[101, sha("2")], [102, sha("3")]]),
+  });
+
+  const result = await runIssueAsPrdParent(input(), deps);
+
+  assert.equal(result.kind, "clean_delivery");
+  assert.deepEqual(deps.childEngineBases.map((entry) => entry.childNumber), [101, 102]);
+  assert.equal(
+    deps.events.filter((event) => event.startsWith("continuous-refresh:")).length,
+    1,
+  );
+  assert.equal(deps.state.accumulationDiverged, true);
+  assert.equal(deps.events.includes("mark-diverged"), true);
 });
 
 test("resuming after child publication applies readiness before draining children", async () => {
@@ -272,8 +421,9 @@ test("starved child queue re-decomposes once and drains the fresh children", asy
   ]);
 });
 
-test("direct parent already_satisfied with verified empty diff completes the parent", async () => {
+test("v3 direct parent already_satisfied still receives full review and is delivered open", async () => {
   const deps = createDeps({
+    justInTime: true,
     initialDecomposition: successNoWork(),
     directParentOutcome: alreadySatisfied(sha("1"), sha("1"), "feature already on base"),
     initialAlreadySatisfied: { ok: true, empty: true, evidence: "trees match" },
@@ -281,11 +431,8 @@ test("direct parent already_satisfied with verified empty diff completes the par
 
   const result = await runIssueAsPrdParent(input(), deps);
 
-  assert.deepEqual(result, {
-    kind: "parent_already_complete",
-    accumulationHeadSha: sha("1"),
-    evidence: "feature already on base\n\ntrees match",
-  });
+  assert.equal(result.kind, "clean_delivery");
+  assert.equal(deps.fullReviewCalls, 1);
 });
 
 test("terminal recorded phase refuses to run instead of falling through to delivery", async () => {
@@ -336,6 +483,8 @@ test("follow-up already_satisfied becomes partial delivery and never runs a seco
 
 test("pre-review and pre-delivery repair budgets are routed independently", async () => {
   const deps = createDeps({
+    justInTime: true,
+    continuousRefresh: true,
     state: state({ phase: "initial_drained" }),
     aggregation: new Map([
       ["pre_review", { kind: "repaired", childNumber: 301, accumulationSha: sha("4") }],
@@ -357,6 +506,14 @@ test("pre-review and pre-delivery repair budgets are routed independently", asyn
     { pre_review: 1, pre_delivery: 0 },
     { pre_review: 1, pre_delivery: 1 },
   ]);
+  assert.deepEqual(
+    deps.events.filter((event) => event.startsWith("continuous-refresh:")),
+    [
+      `continuous-refresh:pre_review:${sha("1")}`,
+      `continuous-refresh:aggregate_repair:${sha("4")}`,
+      `continuous-refresh:aggregate_repair:${sha("5")}`,
+    ],
+  );
 });
 
 test("resume from pre_delivery_ready skips earlier phases and returns rebase-needed clean delivery", async () => {
@@ -426,6 +583,10 @@ function createDeps(options: {
   aggregation?: Map<string, { kind: "green" } | { kind: "repaired"; childNumber: number; accumulationSha: string } | { kind: "repair_child_stuck"; childNumber: number; failure: { gate: "pre_review" | "pre_delivery"; command: string; exitCode: number; output: string; accumulationSha: string }; diagnostics: string[] } | { kind: "parent_failure"; failure: { gate: "pre_review" | "pre_delivery"; command: string; exitCode: number; output: string; accumulationSha: string }; diagnostics: string[] }>;
   fullReview?: { kind: "reviewed"; followupDrafts: any[]; artifactPaths: string[] } | { kind: "acquisition_failed"; diagnostics: string[]; artifactPaths: string[] };
   terminal?: { observedMainlineSha: string; rebaseNeeded: boolean };
+  justInTime?: boolean;
+  improvementOutcomes?: Map<number, "actionable" | "redundant">;
+  continuousRefresh?: boolean;
+  divergeOnRefreshCall?: number;
 } = {}): IssueAsPrdOrchestratorDeps & {
   state: IssueAsPrdParentState;
   events: string[];
@@ -439,8 +600,10 @@ function createDeps(options: {
   const children = options.children ? [...options.children] : [];
   const childOutcomes = options.childOutcomes ?? new Map();
   const integratedHeads = options.integratedHeads ?? new Map<number, string>();
+  const improvementOutcomes = options.improvementOutcomes ?? new Map<number, "actionable" | "redundant">();
   let accumulationHeadSha = options.accumulationHeadSha ?? sha("1");
   let fullReviewCalls = 0;
+  let refreshCalls = 0;
   const persistedRepairBudgets: Array<{ pre_review: 0 | 1; pre_delivery: 0 | 1 }> = [];
 
   return {
@@ -479,6 +642,8 @@ function createDeps(options: {
       currentState.attemptedMainlineSha = next.attemptedMainlineSha;
       currentState.rebaseConflictDiagnostics = next.rebaseConflictDiagnostics;
       currentState.latestMainlineShaAtDelivery = next.latestMainlineShaAtDelivery;
+      currentState.accumulationDiverged = next.accumulationDiverged;
+      currentState.mainlineRefresh = next.mainlineRefresh;
       persistedRepairBudgets.push({ ...next.aggregateValidationRepairs });
     },
     async publishChildren({ drafts }) {
@@ -498,6 +663,19 @@ function createDeps(options: {
       events.push("readiness");
       return { kind: "ready" as const, ready: [...children], dropped: [] };
     },
+    ...(options.justInTime
+      ? {
+          workflow: "just_in_time_improvement" as const,
+          async improveChild({ child, accumulationSha }: { child: GitHubIssueRecord; accumulationSha: string }) {
+            events.push(`improve:${child.number}:${accumulationSha}`);
+            if (improvementOutcomes.get(child.number) === "redundant") {
+              child.state = "CLOSED";
+              return { kind: "redundant" as const, childNumber: child.number, reused: false };
+            }
+            return { kind: "actionable" as const, child, reused: false };
+          },
+        }
+      : {}),
     async runChildEngine({ child, accumulationSha, source }) {
       events.push(`child-engine:${child.number}:${source}:${accumulationSha}`);
       childEngineBases.push({ childNumber: child.number, accumulationSha, source });
@@ -508,6 +686,11 @@ function createDeps(options: {
       const outcome = options.directParentOutcome ?? approved(accumulationSha, sha("2"));
       if (outcome.kind === "approved") accumulationHeadSha = outcome.approvedHeadSha;
       return outcome;
+    },
+    async checkpointDirectParent({ previousAccumulationSha, approvedHeadSha }) {
+      events.push(`checkpoint-direct:${previousAccumulationSha}:${approvedHeadSha}`);
+      accumulationHeadSha = approvedHeadSha;
+      return { ok: true as const, accumulationHeadSha: approvedHeadSha };
     },
     async verifyInitialAlreadySatisfied() {
       events.push("verify-initial-already-satisfied");
@@ -538,6 +721,30 @@ function createDeps(options: {
         fetchedMainlineSha: currentState.fullParentReviewBaseSha,
       };
     },
+    ...(options.continuousRefresh
+      ? {
+          async refreshAfterAccumulationAdvance({ accumulationHeadSha, trigger }) {
+            refreshCalls += 1;
+            events.push(`continuous-refresh:${trigger}:${accumulationHeadSha}`);
+            if (refreshCalls === options.divergeOnRefreshCall) {
+              return {
+                kind: "diverged" as const,
+                accumulationHeadSha,
+                attemptedMainlineSha: sha("9"),
+                diagnostics: ["unresolved conflict"],
+              };
+            }
+            return {
+              kind: "unchanged" as const,
+              accumulationHeadSha,
+              attemptedMainlineSha: sha("9"),
+            };
+          },
+          async markAccumulationDiverged() {
+            events.push("mark-diverged");
+          },
+        }
+      : {}),
     async runAggregateValidation({ gate, accumulationSha, repairAlreadyUsed }) {
       events.push(`aggregate:${gate}:${accumulationSha}:${repairAlreadyUsed ? 1 : 0}`);
       return options.aggregation?.get(gate) ?? { kind: "green" as const };
@@ -591,6 +798,8 @@ function state(
     completedExtraReviewRounds: 0,
     aggregateValidationRepairs: { pre_review: 0, pre_delivery: 0 },
     rebaseConflictDiagnostics: [],
+    accumulationDiverged: false,
+    mainlineRefresh: null,
     partialCauseChildNumber: null,
     lastTransitionAt: "2026-07-02T00:00:00.000Z",
     ...overrides,

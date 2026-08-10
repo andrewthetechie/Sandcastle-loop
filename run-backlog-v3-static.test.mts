@@ -79,9 +79,10 @@ test("backlog-v3 uses the Task 17 child and parent TUI host steps", () => {
   for (const step of [
     "parent_claim",
     "child_publication",
-    "readiness_apply",
+    "subtask_improvement_apply",
     "child_integration",
-    "pre_review_refresh",
+    "mainline_refresh",
+    "accumulation_diverged",
     "aggregate_validation",
     "full_parent_review",
     "deliver_review_ready",
@@ -99,7 +100,8 @@ test("backlog-v3 uses the Task 17 child and parent TUI host steps", () => {
 
 test("backlog-v3 wires Issue-as-PRD TUI agent stages and working logs", () => {
   assert.match(source, /stage: "initial_issue_decomposer"/);
-  assert.match(source, /stage: "subtask_readiness"/);
+  assert.match(source, /stage: "subtask_improvement"/);
+  assert.match(source, /stage: "rebase"/);
   assert.match(source, /sessionAgents:\s*\{\s*code_quality:/s);
   assert.match(source, /sessionAgents:\s*\{[\s\S]*two_axis:/);
   assert.match(source, /sessionAgents:\s*\{[\s\S]*issue_decomposer:/);
@@ -110,11 +112,13 @@ test("backlog-v3 wires Issue-as-PRD TUI agent stages and working logs", () => {
   assert.match(source, /tuiEmitter\.workingLogSink\(reviewerActiveLogPath\)/);
 });
 
-test("backlog-v3 runs decomposition and readiness through their strict agent definitions", () => {
+test("backlog-v3 runs decomposition, improvement, and rebase through strict agent definitions", () => {
   assert.match(source, /INITIAL_ISSUE_DECOMPOSER_AGENT_CONFIG/);
-  assert.match(source, /SUBTASK_READINESS_AGENT_CONFIG/);
+  assert.match(source, /SUBTASK_IMPROVEMENT_AGENT_CONFIG/);
+  assert.match(source, /REBASE_AGENT_CONFIG/);
   assert.match(source, /INITIAL_ISSUE_DECOMPOSER_AGENT_SYSTEM_PROMPT_FILE/);
-  assert.match(source, /SUBTASK_READINESS_AGENT_SYSTEM_PROMPT_FILE/);
+  assert.match(source, /SUBTASK_IMPROVEMENT_AGENT_SYSTEM_PROMPT_FILE/);
+  assert.match(source, /installRebaseOnMainSkill/);
   assert.match(source, /writeAgentDefinitionFile\(\s*sandbox\.worktreePath,\s*agentDefinition\.config\.name,/s);
   assert.match(source, /agent: sandcastle\.opencode\(input\.model,\s*\{\s*agent: agentDefinition\.config\.name,/s);
 });
@@ -154,7 +158,9 @@ test("backlog-v3 keeps loop stop reasons separate from parent terminal outcomes"
     source,
     /let stopReason:\s*\|\s*"no_eligible_issue"\s*\|\s*"max_iterations"\s*=\s*"no_eligible_issue"/s,
   );
-  assert.match(source, /const terminal = terminalActionForParentResult\(result\);/);
+  assert.match(source, /const mappedTerminal = terminalActionForParentResult\(result\);/);
+  assert.match(source, /if \(mappedTerminal\.kind === "close_complete"\) \{/);
+  assert.match(source, /Backlog v3 refused a legacy close_complete terminal action/);
   assert.match(source, /if \(terminal\.kind === "deliver"\) \{/);
   assert.match(source, /const commentBody = \[\s*`Parent issue cannot continue automatically: \$\{terminal\.reason\}`/s);
 });
@@ -177,13 +183,24 @@ test("backlog-v3 direct-parent work now targets the accumulation branch", () => 
   assert.doesNotMatch(source, /issue-\$\{input\.parent\.number\}-direct-parent/);
 });
 
-test("backlog-v3 formats readiness siblings compactly and excludes the child under evaluation", () => {
+test("backlog-v3 formats just-in-time improvement siblings compactly and excludes the child under evaluation", () => {
   assert.match(source, /import \{ formatCompactSiblingSummary \} from "\.\/subtask-readiness-body\.mts";/);
   assert.match(source, /formatCompactSiblingSummary\(sibling\)/);
   assert.doesNotMatch(
     source,
     /\`#\$\{sibling\.number\}: \$\{sibling\.title\}\\n\$\{sibling\.body\}\`/,
   );
+});
+
+test("backlog-v3 removes publication-time readiness and refreshes after every durable advance", () => {
+  assert.doesNotMatch(source, /runSubtaskReadinessBatch/);
+  assert.match(source, /workflow: "just_in_time_improvement"/);
+  assert.match(source, /improveSubtaskJustInTime/);
+  assert.match(source, /refreshAfterAccumulationAdvance/);
+  assert.match(source, /runContinuousMainlineRefresh/);
+  assert.match(source, /--force-with-lease=refs\/heads\/\$\{input\.accumulationBranch\}/);
+  assert.match(source, /parseRebaseAgentResult/);
+  assert.doesNotMatch(source, /client\.closeIssue\(\s*parent\.number/);
 });
 
 test("backlog-v3 accepts --no-pr flag", () => {

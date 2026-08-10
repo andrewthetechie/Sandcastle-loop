@@ -77,6 +77,8 @@ export async function claimFreshIssueAsPrdParent(input: {
     completedExtraReviewRounds: 0,
     aggregateValidationRepairs: { pre_review: 0, pre_delivery: 0 },
     rebaseConflictDiagnostics: [],
+    accumulationDiverged: false,
+    mainlineRefresh: null,
     partialCauseChildNumber: null,
     lastTransitionAt: input.now,
   };

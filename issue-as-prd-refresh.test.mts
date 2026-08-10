@@ -3,7 +3,10 @@ import { test } from "node:test";
 import {
   buildPreReviewDiagnosticBranch,
   observeTerminalMainline,
+  recoverMainlineRefreshJournal,
+  refreshAccumulationContinuously,
   refreshAccumulationBeforeReview,
+  type ContinuousMainlineRefreshDeps,
   type RefreshGitDeps,
 } from "./issue-as-prd-refresh.mts";
 
@@ -157,6 +160,257 @@ test("diagnostic branch helper uses the required suffix", () => {
     "issue-42-pre-review-bbbbbbbbbbbb",
   );
 });
+
+test("continuous deterministic refresh journals before verified promotion and skips full validation", async () => {
+  const deps = createContinuousDeps({ deterministic: "candidate" });
+
+  const result = await refreshAccumulationContinuously(continuousInput(), deps);
+
+  assert.deepEqual(result, {
+    kind: "refreshed",
+    accumulationHeadSha: sha40("d"),
+    attemptedMainlineSha: sha40("c"),
+  });
+  assert.deepEqual(deps.events, [
+    "read-heads",
+    "fetch-mainline",
+    "ancestor",
+    "deterministic",
+    "verify:structural",
+    "journal:d",
+    "promote",
+    "journal:clear",
+  ]);
+});
+
+test("continuous refresh fetches once and stops when the pinned mainline is already present", async () => {
+  const deps = createContinuousDeps({
+    deterministic: "candidate",
+    alreadyCurrent: true,
+  });
+
+  const result = await refreshAccumulationContinuously(continuousInput(), deps);
+
+  assert.deepEqual(result, {
+    kind: "unchanged",
+    accumulationHeadSha: sha40("b"),
+    attemptedMainlineSha: sha40("c"),
+  });
+  assert.deepEqual(deps.events, ["read-heads", "fetch-mainline", "ancestor"]);
+});
+
+test("unsafe deterministic candidate preserves the checkpoint and becomes divergence", async () => {
+  const deps = createContinuousDeps({
+    deterministic: "candidate",
+    candidateVerificationFails: true,
+  });
+
+  const result = await refreshAccumulationContinuously(continuousInput(), deps);
+
+  assert.deepEqual(result, {
+    kind: "diverged",
+    accumulationHeadSha: sha40("b"),
+    attemptedMainlineSha: sha40("c"),
+    diagnostics: ["unsafe candidate"],
+  });
+  assert.deepEqual(deps.events, [
+    "read-heads",
+    "fetch-mainline",
+    "ancestor",
+    "deterministic",
+    "verify:structural",
+    "verify-checkpoint",
+  ]);
+});
+
+test("continuous conflict runs exactly one agent and full host validation before promotion", async () => {
+  const deps = createContinuousDeps({ deterministic: "conflict", agent: "resolved" });
+
+  const result = await refreshAccumulationContinuously(continuousInput(), deps);
+
+  assert.equal(result.kind, "refreshed");
+  assert.deepEqual(deps.events, [
+    "read-heads",
+    "fetch-mainline",
+    "ancestor",
+    "deterministic",
+    "agent",
+    "verify:full",
+    "journal:e",
+    "promote",
+    "journal:clear",
+  ]);
+});
+
+test("unresolved refresh verifies the checkpoint, sanitizes diagnostics, and does not promote", async () => {
+  const deps = createContinuousDeps({ deterministic: "conflict", agent: "unresolved" });
+
+  const result = await refreshAccumulationContinuously(continuousInput(), deps);
+
+  assert.deepEqual(result, {
+    kind: "diverged",
+    accumulationHeadSha: sha40("b"),
+    attemptedMainlineSha: sha40("c"),
+    diagnostics: [
+      "conflict on https://user:[REDACTED]@example.test/repo.git",
+      "Bearer [REDACTED]",
+    ],
+  });
+  assert.deepEqual(deps.events, [
+    "read-heads",
+    "fetch-mainline",
+    "ancestor",
+    "deterministic",
+    "agent",
+    "verify-checkpoint",
+  ]);
+});
+
+test("promotion failure leaves the durable journal for restart recovery", async () => {
+  const deps = createContinuousDeps({ deterministic: "candidate", promotionFails: true });
+
+  await assert.rejects(
+    refreshAccumulationContinuously(continuousInput(), deps),
+    /promotion failed/,
+  );
+  assert.equal(deps.events.at(-1), "promote");
+  assert.equal(deps.events.includes("journal:clear"), false);
+});
+
+test("journal recovery completes or abandons only the two journal-owned SHAs", async () => {
+  const journal = {
+    preRebaseAccumulationSha: sha40("b"),
+    targetMainlineSha: sha40("c"),
+    candidateSha: sha40("d"),
+  };
+  const completedEvents: string[] = [];
+  const completed = await recoverMainlineRefreshJournal(
+    { accumulationBranch: "issue-42", journal },
+    {
+      readAccumulationHeads: () => ({
+        localHeadSha: sha40("b"),
+        remoteHeadSha: sha40("d"),
+      }),
+      updateLocalAccumulation: ({ expectedCurrentSha, targetSha }) => {
+        completedEvents.push(`update:${expectedCurrentSha[0]}:${targetSha[0]}`);
+      },
+      persistJournal: async () => {
+        completedEvents.push("clear");
+      },
+    },
+  );
+  assert.deepEqual(completed, { kind: "completed", accumulationHeadSha: sha40("d") });
+  assert.deepEqual(completedEvents, ["update:b:d", "clear"]);
+
+  const abandonedEvents: string[] = [];
+  const abandoned = await recoverMainlineRefreshJournal(
+    { accumulationBranch: "issue-42", journal },
+    {
+      readAccumulationHeads: () => ({
+        localHeadSha: sha40("d"),
+        remoteHeadSha: sha40("b"),
+      }),
+      updateLocalAccumulation: ({ expectedCurrentSha, targetSha }) => {
+        abandonedEvents.push(`update:${expectedCurrentSha[0]}:${targetSha[0]}`);
+      },
+      persistJournal: async () => {
+        abandonedEvents.push("clear");
+      },
+    },
+  );
+  assert.deepEqual(abandoned, { kind: "abandoned", accumulationHeadSha: sha40("b") });
+  assert.deepEqual(abandonedEvents, ["update:d:b", "clear"]);
+
+  await assert.rejects(
+    recoverMainlineRefreshJournal(
+      { accumulationBranch: "issue-42", journal },
+      {
+        readAccumulationHeads: () => ({
+          localHeadSha: sha40("b"),
+          remoteHeadSha: sha40("f"),
+        }),
+        updateLocalAccumulation() {},
+        async persistJournal() {},
+      },
+    ),
+    /cannot own/,
+  );
+});
+
+function continuousInput() {
+  return {
+    accumulationBranch: "issue-42",
+    mainlineRef: "origin/main",
+    accumulationHeadSha: sha40("b"),
+  };
+}
+
+function sha40(seed: string): string {
+  return seed.repeat(40);
+}
+
+function createContinuousDeps(options: {
+  deterministic: "candidate" | "conflict";
+  agent?: "resolved" | "unresolved";
+  promotionFails?: boolean;
+  alreadyCurrent?: boolean;
+  candidateVerificationFails?: boolean;
+}): ContinuousMainlineRefreshDeps & { events: string[] } {
+  const events: string[] = [];
+  return {
+    events,
+    readAccumulationHeads() {
+      events.push("read-heads");
+      return { localHeadSha: sha40("b"), remoteHeadSha: sha40("b") };
+    },
+    fetchMainline() {
+      events.push("fetch-mainline");
+      return sha40("c");
+    },
+    isAncestor() {
+      events.push("ancestor");
+      return options.alreadyCurrent ?? false;
+    },
+    async buildDeterministicCandidate() {
+      events.push("deterministic");
+      return options.deterministic === "candidate"
+        ? { kind: "candidate" as const, candidateSha: sha40("d") }
+        : {
+            kind: "conflict" as const,
+            diagnostics: ["conflict on https://user:secret@example.test/repo.git"],
+          };
+    },
+    async runRebaseAgent() {
+      events.push("agent");
+      return options.agent === "unresolved"
+        ? { kind: "unresolved" as const, diagnostics: ["Bearer abc"] }
+        : {
+            kind: "resolved" as const,
+            preRebaseAccumulationSha: sha40("b"),
+            targetMainlineSha: sha40("c"),
+            candidateSha: sha40("e"),
+          };
+    },
+    async verifyCandidate({ validation }) {
+      events.push(`verify:${validation}`);
+      if (options.candidateVerificationFails) {
+        return { ok: false as const, diagnostics: ["unsafe candidate"] };
+      }
+      return { ok: true as const };
+    },
+    async verifyPreservedCheckpoint() {
+      events.push("verify-checkpoint");
+      return { ok: true as const };
+    },
+    async persistJournal(journal) {
+      events.push(journal ? `journal:${journal.candidateSha[0]}` : "journal:clear");
+    },
+    async promoteCandidate() {
+      events.push("promote");
+      if (options.promotionFails) throw new Error("promotion failed");
+    },
+  };
+}
 
 function input() {
   return {

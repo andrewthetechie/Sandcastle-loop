@@ -11,6 +11,7 @@ export interface CustomAgentPermission {
   question: CustomAgentPermissionValue;
   webfetch: CustomAgentPermissionValue;
   websearch: CustomAgentPermissionValue;
+  skill?: Record<string, CustomAgentPermissionValue>;
 }
 
 export interface CustomAgentConfig {
@@ -115,6 +116,84 @@ export const SUBTASK_READINESS_AGENT_CONFIG: CustomAgentConfig = {
   },
 };
 
+export const SUBTASK_IMPROVEMENT_AGENT_CONFIG: CustomAgentConfig = {
+  name: "subtask-improvement",
+  description: "Read-only evidence-backed improvement of one child issue immediately before coding",
+  temperature: 0.1,
+  permission: {
+    edit: "deny",
+    bash: [
+      ["*", "deny"],
+      ["git status", "allow"],
+      ["git status *", "allow"],
+      ["git log *", "allow"],
+      ["git show *", "allow"],
+      ["git diff *", "allow"],
+      ["git grep *", "allow"],
+      ["git rev-parse *", "allow"],
+      ["git merge-base *", "allow"],
+      ["rg *", "allow"],
+      ["grep *", "allow"],
+      ["find *", "allow"],
+      ["ls", "allow"],
+      ["ls *", "allow"],
+      ["npm test", "allow"],
+      ["npm test *", "allow"],
+      ["npm run test", "allow"],
+      ["npm run test *", "allow"],
+    ],
+    ...DENY_ONLY_PERMISSION,
+  },
+};
+
+export const REBASE_AGENT_CONFIG: CustomAgentConfig = {
+  name: "rebase",
+  description: "Resolves one local accumulation rebase without remote or tracker mutation",
+  temperature: 0.1,
+  permission: {
+    edit: "allow",
+    bash: [
+      ["*", "deny"],
+      ["git *", "allow"],
+      ["git push", "deny"],
+      ["git push *", "deny"],
+      ["git fetch", "deny"],
+      ["git fetch *", "deny"],
+      ["git pull", "deny"],
+      ["git pull *", "deny"],
+      ["git clone *", "deny"],
+      ["git ls-remote *", "deny"],
+      ["git remote update *", "deny"],
+      ["git archive --remote *", "deny"],
+      ["gh", "deny"],
+      ["gh *", "deny"],
+      ["curl *", "deny"],
+      ["wget *", "deny"],
+      ["ssh *", "deny"],
+      ["scp *", "deny"],
+      ["npm test", "allow"],
+      ["npm test *", "allow"],
+      ["npm run test", "allow"],
+      ["npm run test *", "allow"],
+      ["npm run typecheck", "allow"],
+      ["npm run build", "allow"],
+      ["pnpm test", "allow"],
+      ["pnpm test *", "allow"],
+      ["yarn test", "allow"],
+      ["yarn test *", "allow"],
+      ["bun test", "allow"],
+      ["bun test *", "allow"],
+      ["pytest *", "allow"],
+      ["uv run pytest *", "allow"],
+      ["cargo test *", "allow"],
+      ["cargo check *", "allow"],
+      ["go test *", "allow"],
+    ],
+    ...DENY_ONLY_PERMISSION,
+    skill: { "*": "deny", "rebase-on-main": "allow" },
+  },
+};
+
 // ---------------------------------------------------------------------------
 // PR Review agents (run-pr-review-v1.mts)
 // ---------------------------------------------------------------------------
@@ -122,12 +201,12 @@ export const SUBTASK_READINESS_AGENT_CONFIG: CustomAgentConfig = {
 export const PR_REVIEW_AGENT_CONFIG: CustomAgentConfig = {
   name: "pr-review",
   description:
-    "Reviews a PR diff, invokes Standards and Spec sub-agents sequentially, fixes all actionable findings, and commits",
+    "Fixes host-verified PR review findings, records every disposition, and commits",
   temperature: 0.2,
   permission: {
     edit: "allow",
     bash: "allow",
-    task: "allow",
+    task: "deny",
     question: "deny",
     webfetch: "deny",
     websearch: "deny",
@@ -184,6 +263,14 @@ export function buildAgentDefinition(
     `  question: ${config.permission.question}`,
     `  webfetch: ${config.permission.webfetch}`,
     `  websearch: ${config.permission.websearch}`,
+    ...(config.permission.skill
+      ? [
+          "  skill:",
+          ...Object.entries(config.permission.skill).map(
+            ([name, decision]) => `    \"${name}\": ${decision}`,
+          ),
+        ]
+      : []),
     "---",
     "",
     systemBody,

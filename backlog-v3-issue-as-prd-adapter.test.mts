@@ -72,6 +72,45 @@ test("terminal action mapping covers clean, partial, stuck, and ownership ambigu
       accumulationHeadSha: "a",
       observedMainlineSha: "b",
       rebaseNeeded: true,
+      accumulationDiverged: true,
+      stuckChildNumber: 13,
+    }),
+    {
+      kind: "deliver",
+      labelPlan: {
+        remove: ["agent-in-progress"],
+        add: ["Review", "agent-partial", "agent-rebase-needed", "agent-diverged"],
+        deleteQueueLabel: true,
+      },
+      shouldStopLoop: false,
+    },
+  );
+
+  assert.deepEqual(
+    terminalActionForParentResult({
+      kind: "clean_delivery",
+      accumulationHeadSha: "a",
+      observedMainlineSha: "b",
+      rebaseNeeded: true,
+      accumulationDiverged: true,
+    }),
+    {
+      kind: "deliver",
+      labelPlan: {
+        remove: ["agent-in-progress"],
+        add: ["Review", "agent-rebase-needed", "agent-diverged"],
+        deleteQueueLabel: true,
+      },
+      shouldStopLoop: false,
+    },
+  );
+
+  assert.deepEqual(
+    terminalActionForParentResult({
+      kind: "partial_delivery",
+      accumulationHeadSha: "a",
+      observedMainlineSha: "b",
+      rebaseNeeded: true,
       stuckChildNumber: 13,
     }),
     {
@@ -138,7 +177,7 @@ test("terminal action mapping covers clean, partial, stuck, and ownership ambigu
   );
 });
 
-test("permanent parent labels are the Task 8 stable set", () => {
+test("permanent parent labels include the durable diverged stop condition", () => {
   assert.deepEqual(permanentIssueAsPrdParentLabels(), [
     {
       name: "agent-in-progress",
@@ -154,6 +193,11 @@ test("permanent parent labels are the Task 8 stable set", () => {
       name: "agent-rebase-needed",
       color: "d4c5f9",
       description: "Review-ready branch needs a manual rebase onto current mainline",
+    },
+    {
+      name: "agent-diverged",
+      color: "b60205",
+      description: "Automatic accumulation rebases are exhausted; human rebase is required",
     },
   ]);
 });

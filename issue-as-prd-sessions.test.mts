@@ -8,6 +8,7 @@ import {
   INITIAL_ISSUE_DECOMPOSER_STAGE,
   SUBTASK_READINESS_STAGE,
   acquireInitialDecomposition,
+  acquireSubtaskImprovement,
   acquireSubtaskReadiness,
   buildInitialIssueDecomposerRunName,
   buildSubtaskReadinessRunName,
@@ -204,6 +205,41 @@ test("acquireSubtaskReadiness retries after missing tag and succeeds on attempt 
       calls.map((call) => call.activeLogPath),
       ["/logs/readiness-1.log", "/logs/readiness-2.log"],
     );
+  });
+});
+
+test("acquireSubtaskImprovement spends the second attempt on an issue-specific contract failure", async () => {
+  await withTempCwd(async () => {
+    const result = await acquireSubtaskImprovement({
+      prd: 5,
+      childIssueNumber: 22,
+      model: "glm",
+      round: "initial",
+      promptFile: "./subtask-improvement-user-prompt-prd.md",
+      promptArgs: { SUBTASK_TITLE: "Child" },
+      validateResult: (candidate) =>
+        candidate.proposed_title === "Current"
+          ? ["Improved result did not change the issue."]
+          : [],
+      runAttempt: async (attempt) => ({
+        stdout: `<subtask_improvement>${JSON.stringify({
+          kind: "subtask_improvement",
+          outcome: "improved",
+          summary: "Evidence-backed improvement.",
+          proposed_title: attempt === 1 ? "Current" : "Improved",
+          proposed_body: "Implementation-ready body.",
+          changes: ["Tightened title."],
+          evidence: [{ claim: "Module exists.", classification: "Verified", source: "src/module.ts" }],
+          close_reason: "",
+        })}</subtask_improvement>`,
+      }),
+    });
+
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.attemptsUsed, 2);
+    assert.match(result.artifacts[0]!.diagnostics[0]!, /contract failure/);
+    assert.equal(result.result.proposed_title, "Improved");
   });
 });
 

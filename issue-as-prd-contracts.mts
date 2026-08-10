@@ -50,13 +50,44 @@ export interface SubtaskReadinessResult {
   close_reason: string;
 }
 
+export type SubtaskImprovementOutcome = "improved" | "unchanged" | "redundant";
+
+export type SubtaskImprovementEvidenceClassification =
+  | "Verified"
+  | "Contradicted"
+  | "Unsupported"
+  | "Ambiguous"
+  | "Outdated/Risky";
+
+export interface SubtaskImprovementEvidence {
+  claim: string;
+  classification: SubtaskImprovementEvidenceClassification;
+  source: string;
+}
+
+// This is deliberately a separate contract from the legacy batch readiness
+// result. Backlog v3 binds an improvement to one accumulation SHA immediately
+// before coding; older runners retain the readiness contract unchanged.
+export interface SubtaskImprovementResult {
+  kind: "subtask_improvement";
+  outcome: SubtaskImprovementOutcome;
+  summary: string;
+  proposed_title: string;
+  proposed_body: string;
+  changes: string[];
+  evidence: SubtaskImprovementEvidence[];
+  close_reason: string;
+}
+
 export type IssueAsPrdParserName =
   | "initial_issue_decomposition"
-  | "subtask_readiness";
+  | "subtask_readiness"
+  | "subtask_improvement";
 
 export type IssueAsPrdTag =
   | "initial_issue_decomposition"
-  | "subtask_readiness";
+  | "subtask_readiness"
+  | "subtask_improvement";
 
 export type IssueAsPrdParseFailureCode =
   | "missing_tag"
@@ -101,6 +132,11 @@ export interface SubtaskReadinessParseFailure {
   parse_failure: IssueAsPrdParseFailure;
 }
 
+export interface SubtaskImprovementParseFailure {
+  kind: "parse_failure";
+  parse_failure: IssueAsPrdParseFailure;
+}
+
 export type InitialIssueDecompositionParseResult =
   | InitialIssueDecomposition
   | InitialIssueDecompositionParseFailure;
@@ -108,6 +144,10 @@ export type InitialIssueDecompositionParseResult =
 export type SubtaskReadinessParseResult =
   | SubtaskReadinessResult
   | SubtaskReadinessParseFailure;
+
+export type SubtaskImprovementParseResult =
+  | SubtaskImprovementResult
+  | SubtaskImprovementParseFailure;
 
 export interface AgentAttemptArtifact {
   attempt: 1 | 2;
@@ -139,6 +179,10 @@ export type SubtaskReadinessAcquisition =
   | SuccessfulAcquisition<SubtaskReadinessResult>
   | ExhaustedAcquisitionFailure;
 
+export type SubtaskImprovementAcquisition =
+  | SuccessfulAcquisition<SubtaskImprovementResult>
+  | ExhaustedAcquisitionFailure;
+
 export const INITIAL_ISSUE_DECOMPOSITION_STATUSES: readonly InitialIssueDecompositionStatus[] =
   ["issues", "no_work", "needs_human_review"];
 
@@ -150,3 +194,17 @@ export const INITIAL_SUBTASK_PRIORITIES: readonly InitialSubtaskPriority[] = [
 
 export const SUBTASK_READINESS_DISPOSITIONS: readonly SubtaskReadinessDisposition[] =
   ["fixed", "assumed", "not_actionable"];
+
+export const SUBTASK_IMPROVEMENT_OUTCOMES: readonly SubtaskImprovementOutcome[] = [
+  "improved",
+  "unchanged",
+  "redundant",
+];
+
+export const SUBTASK_IMPROVEMENT_EVIDENCE_CLASSIFICATIONS: readonly SubtaskImprovementEvidenceClassification[] = [
+  "Verified",
+  "Contradicted",
+  "Unsupported",
+  "Ambiguous",
+  "Outdated/Risky",
+];

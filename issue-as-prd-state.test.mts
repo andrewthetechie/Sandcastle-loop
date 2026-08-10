@@ -28,6 +28,8 @@ function state(overrides: Partial<IssueAsPrdParentState> = {}): IssueAsPrdParent
     completedExtraReviewRounds: 0,
     aggregateValidationRepairs: { pre_review: 0, pre_delivery: 0 },
     rebaseConflictDiagnostics: [],
+    accumulationDiverged: false,
+    mainlineRefresh: null,
     partialCauseChildNumber: null,
     lastTransitionAt: "2026-07-02T12:00:00Z",
     ...overrides,
@@ -54,7 +56,7 @@ test("renderParentStateComment is deterministic pretty JSON and parse round-trip
 
   assert.match(
     rendered,
-    /<!-- sandcastle-issue-as-prd-state -->\n<sandcastle_issue_as_prd_state>\n\{\n  "schemaVersion": 1,/,
+    /<!-- sandcastle-issue-as-prd-state -->\n<sandcastle_issue_as_prd_state>\n\{\n  "schemaVersion": 2,/,
   );
   assert.equal(reparsed.ok, true);
   if (!reparsed.ok) return;
@@ -78,7 +80,7 @@ test("parseParentStateComment rejects missing and multiple markers", () => {
 test("parseParentStateComment rejects bad schema, phase, queue label, invalid budgets, and invalid timestamp", () => {
   const rendered = renderParentStateComment(state());
   const broken = rendered
-    .replace('"schemaVersion": 1', '"schemaVersion": 2')
+    .replace('"schemaVersion": 2', '"schemaVersion": 3')
     .replace('"phase": "claimed"', '"phase": "bogus"')
     .replace('"queueLabel": "parent-42"', '"queueLabel": "parent-41"')
     .replace('"pre_review": 0', '"pre_review": 2')
@@ -92,6 +94,20 @@ test("parseParentStateComment rejects bad schema, phase, queue label, invalid bu
   assert.match(parsed.diagnostics.join("\n"), /queueLabel must equal parent-42/);
   assert.match(parsed.diagnostics.join("\n"), /pre_review' must be 0 or 1|aggregateValidationRepairs\.pre_review/);
   assert.match(parsed.diagnostics.join("\n"), /valid ISO timestamp/);
+});
+
+test("schema-version-1 active parents migrate to queue phases with clear divergence", () => {
+  const legacy = renderParentStateComment({
+    ...state({ phase: "initial_ready" }),
+    schemaVersion: 1,
+  });
+  const parsed = parseParentStateComment(legacy);
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(parsed.state.schemaVersion, 2);
+  assert.equal(parsed.state.phase, "initial_queue");
+  assert.equal(parsed.state.accumulationDiverged, false);
+  assert.equal(parsed.state.mainlineRefresh, null);
 });
 
 test("nextParentState preserves the prior timestamp when no durable field changed", () => {
@@ -210,6 +226,50 @@ test("reconcileParentState resumes when observed state matches", () => {
   if (result.kind !== "resume") return;
   assert.equal(result.commentId, 9);
   assert.deepEqual(result.state, current);
+});
+
+test("in-flight refresh permits only journal-owned local and remote SHAs", () => {
+  const pre = sha("b");
+  const candidate = sha("d");
+  const current = state({
+    mainlineRefresh: {
+      preRebaseAccumulationSha: pre,
+      targetMainlineSha: sha("c"),
+      candidateSha: candidate,
+    },
+  });
+  const comments = [comment(9, renderParentStateComment(current))];
+
+  const recoverable = reconcileParentState({
+    parentNumber: 42,
+    comments,
+    observed: {
+      accumulationBranchExists: true,
+      localAccumulationHeadSha: pre,
+      remoteAccumulationHeadSha: candidate,
+      parentLabels: ["agent-in-progress", "parent-42"],
+      openChildNumbers: [],
+      closedChildNumbers: [],
+    },
+  });
+  assert.equal(recoverable.kind, "resume");
+
+  const unknown = reconcileParentState({
+    parentNumber: 42,
+    comments,
+    observed: {
+      accumulationBranchExists: true,
+      localAccumulationHeadSha: sha("f"),
+      remoteAccumulationHeadSha: sha("f"),
+      parentLabels: ["agent-in-progress", "parent-42"],
+      openChildNumbers: [],
+      closedChildNumbers: [],
+    },
+  });
+  assert.equal(unknown.kind, "disagreement");
+  if (unknown.kind !== "disagreement") return;
+  assert.match(unknown.diagnostics.join("\n"), /does not own local accumulation SHA/);
+  assert.match(unknown.diagnostics.join("\n"), /does not own remote accumulation SHA/);
 });
 
 test("rendered state comments remain excluded by normalizeParentContext", () => {

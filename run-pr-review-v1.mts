@@ -1,8 +1,8 @@
 // run-pr-review-v1.mts
 //
 // PR Review loop. Fetches open PRs matching optional label filters, reviews
-// each PR via a main agent that sequentially invokes Standards and Spec
-// sub-agents, fixes all actionable findings, commits, and pushes. Applies the
+// each PR through host-owned Standards and Spec sessions, then starts a fresh
+// fixer session with immutable findings, commits safe fixes, and pushes. Applies the
 // `ai-review-complete` label on success. Skips PRs with merge conflicts or
 // commits within `--settle-seconds` of the current time.
 //
@@ -12,6 +12,7 @@
 //
 // Usage:
 //   tsx run-pr-review-v1.mts [--label <name[,name2]>] [--model-reviewer <model>]
+//     [--model-standards <model>] [--model-spec <model>] [--model-fixer <model>]
 //     [--settle-seconds 300] [--loop-iterations 2500]
 //     [--iteration-sleep-seconds 300] [--base-branch main]
 //     [--idle-timeout 1800]
@@ -38,8 +39,21 @@ import {
 import { EXTRA_REVIEW_INPUT_DIFF_EXCLUDES } from "./extra-review-inputs.mts";
 import {
   writePrReviewInputs,
+  writePrReviewJsonArtifact,
+  writePrReviewSpecialistArtifacts,
   type PrReviewInputData,
 } from "./pr-review-inputs.mts";
+import { discoverPrReviewStandardsFiles } from "./pr-review-context.mts";
+import {
+  buildPrReviewResult,
+  combinePrReviewFindings,
+  parsePrReviewFixResult,
+  parseSpecReview,
+  parseStandardsReview,
+  type PrReviewSpecialistParseResult,
+  type SpecReview,
+  type StandardsReview,
+} from "./pr-review-specialists.mts";
 import { loadSandcastleLoopConfig } from "./sandcastle-loop-config.mts";
 import { hasFlag, readCliStringFlag } from "./cli-string-flag.mts";
 import { recordMeasuredAgentRun } from "./metrics-recorder.mts";
@@ -50,8 +64,6 @@ import {
   allRiskLabels,
   isRiskLabel,
   renderPrReviewComment,
-  validatePrReviewResult,
-  type PrReviewResult,
 } from "./pr-review-result.mts";
 
 // ---------------------------------------------------------------------------
@@ -75,6 +87,12 @@ const PR_SPEC_REVIEW_AGENT_SYSTEM_PROMPT_FILE = fileURLToPath(
 );
 const PR_REVIEW_USER_PROMPT_FILE = fileURLToPath(
   new URL("./pr-review-user-prompt.md", import.meta.url),
+);
+const PR_STANDARDS_REVIEW_USER_PROMPT_FILE = fileURLToPath(
+  new URL("./pr-standards-review-user-prompt.md", import.meta.url),
+);
+const PR_SPEC_REVIEW_USER_PROMPT_FILE = fileURLToPath(
+  new URL("./pr-spec-review-user-prompt.md", import.meta.url),
 );
 
 // Labels
@@ -116,7 +134,7 @@ const CACHE_MOUNTS = LOOP_CONFIG.cache.mounts.map((mount) => ({
 // ---------------------------------------------------------------------------
 
 const USAGE =
-  "Usage: tsx run-pr-review-v1.mts [--label <name[,name2]>] [--model-reviewer <model>] [--settle-seconds <N>] [--loop-iterations <N>] [--iteration-sleep-seconds <N>] [--base-branch <name>] [--idle-timeout <seconds>]";
+  "Usage: tsx run-pr-review-v1.mts [--label <name[,name2]>] [--model-reviewer <model>] [--model-standards <model>] [--model-spec <model>] [--model-fixer <model>] [--settle-seconds <N>] [--loop-iterations <N>] [--iteration-sleep-seconds <N>] [--base-branch <name>] [--idle-timeout <seconds>]";
 
 function readStringFlag(flag: string): string | undefined {
   try {
@@ -147,7 +165,18 @@ const labels: string[] = labelArg
   : [];
 
 const modelReviewerOverride = readStringFlag("--model-reviewer");
-const REVIEWER_MODEL = modelReviewerOverride ?? LOOP_CONFIG.models.reviewer;
+const PR_STANDARDS_MODEL =
+  readStringFlag("--model-standards") ??
+  modelReviewerOverride ??
+  LOOP_CONFIG.models.prReviewStandards;
+const PR_SPEC_MODEL =
+  readStringFlag("--model-spec") ??
+  modelReviewerOverride ??
+  LOOP_CONFIG.models.prReviewSpec;
+const PR_FIXER_MODEL =
+  readStringFlag("--model-fixer") ??
+  modelReviewerOverride ??
+  LOOP_CONFIG.models.prReviewFixer;
 
 const settleSeconds = readIntFlag("--settle-seconds", 1) ?? 300;
 const loopIterations = readIntFlag("--loop-iterations", 1) ?? 2500;
@@ -165,17 +194,20 @@ if (idleRaw !== undefined) {
   idleTimeoutSeconds = parsed;
 }
 
-// Max iterations for the main agent. Review + fix is a single pass, but the
-// agent may need a few turns to invoke sub-agents, read findings, fix, and
-// commit. 20 turns gives ample headroom without unbounded looping.
+// Each specialist gets an independent bounded session. The fresh fixer gets a
+// larger budget to verify immutable findings, edit, validate, and commit.
 const PR_REVIEW_MAX_ITERATIONS = 20;
+const PR_SPECIALIST_MAX_ITERATIONS = 15;
+const PR_SPECIALIST_MAX_ATTEMPTS = 2;
 
 // Max push recovery attempts for the PR branch.
 const MAX_PUSH_RECOVERY_ATTEMPTS = 2;
 
 console.log(`PR labels: ${labels.length > 0 ? labels.join(", ") : "(all open PRs)"}`);
 console.log(`Base branch: ${baseBranch}`);
-console.log(`Review model: ${REVIEWER_MODEL}`);
+console.log(`Standards model: ${PR_STANDARDS_MODEL}`);
+console.log(`Spec model: ${PR_SPEC_MODEL}`);
+console.log(`Fixer model: ${PR_FIXER_MODEL}`);
 console.log(`Settle seconds: ${settleSeconds}`);
 console.log(`Loop iterations: ${loopIterations}`);
 console.log(`Iteration sleep: ${iterationSleepSeconds}s`);
@@ -871,6 +903,93 @@ function sandboxReadyHooks() {
   };
 }
 
+async function acquirePrReviewSpecialist<T>(input: {
+  sandbox: Awaited<ReturnType<typeof sandcastle.createSandbox>>;
+  prNumber: number;
+  prBranch: string;
+  kind: "standards" | "spec";
+  agentName: string;
+  model: string;
+  promptFile: string;
+  promptArgs: Record<string, string>;
+  completionSignal: string;
+  parse: (stdout: string) => PrReviewSpecialistParseResult<T>;
+}): Promise<{ review: T; raw: string }> {
+  const rendered = renderSlimMessage(
+    readFileSync(input.promptFile, "utf8"),
+    input.promptArgs,
+  );
+  const sizeCheck = enforceArgvSizeLimit(rendered);
+  if (!sizeCheck.ok) {
+    throw new Error(`${input.kind} review prompt is too large for argv`);
+  }
+
+  const failures: string[] = [];
+  for (let attempt = 1; attempt <= PR_SPECIALIST_MAX_ATTEMPTS; attempt += 1) {
+    const runName = `pr-${input.kind}-review #${input.prNumber} a${attempt}`;
+    const activeLogPath = tuiWorkingLogPath(runName);
+    console.log(
+      `  invoking ${input.kind} specialist attempt ${attempt}/${PR_SPECIALIST_MAX_ATTEMPTS} (model: ${input.model})`,
+    );
+    try {
+      const result = await recordMeasuredAgentRun<{
+        stdout: string;
+        commits?: unknown[];
+      }>(
+        {
+          prd: `pr-review-${input.prNumber}`,
+          stage: `pr_review_${input.kind}`,
+          agent: input.agentName,
+          round: attempt,
+          model: input.model,
+          runName,
+          worktreePath: input.sandbox.worktreePath,
+          promptFile: input.promptFile,
+          promptArgs: input.promptArgs,
+          activeLogPath,
+        },
+        () =>
+          input.sandbox.run({
+            name: runName,
+            agent: sandcastle.opencode(input.model, {
+              agent: input.agentName,
+            }),
+            maxIterations: PR_SPECIALIST_MAX_ITERATIONS,
+            completionSignal: input.completionSignal,
+            idleTimeoutSeconds,
+            promptFile: input.promptFile,
+            promptArgs: input.promptArgs,
+            logging: {
+              type: "file",
+              path: agentRunLogPath(input.prBranch, runName),
+              onAgentStreamEvent: tuiEmitter.workingLogSink(activeLogPath),
+            },
+          }),
+      );
+      if ((result.commits?.length ?? 0) > 0) {
+        failures.push(`attempt ${attempt}: read-only specialist produced a commit`);
+        continue;
+      }
+      const parsed = input.parse(result.stdout);
+      if (parsed.kind === "review") {
+        return { review: parsed.review, raw: result.stdout };
+      }
+      if (parsed.kind === "blocked") {
+        throw new Error(`${input.kind} review blocked: ${parsed.summary}`);
+      }
+      failures.push(`attempt ${attempt}: ${parsed.message}`);
+    } catch (error) {
+      failures.push(
+        `attempt ${attempt}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  throw new Error(
+    `Could not acquire a valid ${input.kind} review: ${failures.join("; ")}`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Per-PR processing
 // ---------------------------------------------------------------------------
@@ -878,15 +997,6 @@ function sandboxReadyHooks() {
 async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
   const prBranch = pr.headRefName;
   console.log(`\n--- PR #${pr.number}: ${pr.title} (branch: ${prBranch}) ---`);
-
-  // Gather linked issues from the PR body.
-  const linkedIssues = gatherLinkedIssues(pr.body ?? "");
-  if (linkedIssues.startsWith("(no linked") || linkedIssues.startsWith("(linked issues could")) {
-    console.log(`  linked issues: ${linkedIssues}`);
-  } else {
-    const count = (linkedIssues.match(/^### Issue #/gm) ?? []).length;
-    console.log(`  gathered ${count} linked issue(s)`);
-  }
 
   // Fetch the PR branch and compute the review base (merge-base with origin/<base>).
   console.log(`  fetching origin/${prBranch}`);
@@ -902,7 +1012,7 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
   const originHead = git(["rev-parse", `origin/${prBranch}`]).trim();
   git(["branch", "-f", prBranch, originHead]);
 
-  const baseSha = fetchOriginBase();
+  fetchOriginBase();
   const mergeBase = git(["merge-base", originBaseRef(), prBranch]).trim();
   console.log(`  review base (merge-base): ${mergeBase.slice(0, 8)}`);
 
@@ -927,14 +1037,13 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
   ensureSandboxGitExclude(sandbox.worktreePath);
 
   try {
-    // Write all three agent definitions to the worktree so the main agent
-    // can invoke the sub-agents via the Task tool.
+    // Write the independent specialist and fixer agent definitions.
     writeAgentDefinitionFile(
       sandbox.worktreePath,
       PR_REVIEW_AGENT_CONFIG.name,
       buildAgentDefinition(
         PR_REVIEW_AGENT_CONFIG,
-        REVIEWER_MODEL,
+        PR_FIXER_MODEL,
         readFileSync(PR_REVIEW_AGENT_SYSTEM_PROMPT_FILE, "utf8"),
       ),
     );
@@ -943,7 +1052,7 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       PR_STANDARDS_REVIEW_AGENT_CONFIG.name,
       buildAgentDefinition(
         PR_STANDARDS_REVIEW_AGENT_CONFIG,
-        REVIEWER_MODEL,
+        PR_STANDARDS_MODEL,
         readFileSync(PR_STANDARDS_REVIEW_AGENT_SYSTEM_PROMPT_FILE, "utf8"),
       ),
     );
@@ -952,7 +1061,7 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       PR_SPEC_REVIEW_AGENT_CONFIG.name,
       buildAgentDefinition(
         PR_SPEC_REVIEW_AGENT_CONFIG,
-        REVIEWER_MODEL,
+        PR_SPEC_MODEL,
         readFileSync(PR_SPEC_REVIEW_AGENT_SYSTEM_PROMPT_FILE, "utf8"),
       ),
     );
@@ -962,6 +1071,35 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       sandbox.worktreePath,
       mergeBase,
     );
+    const commitList = execFileSync(
+      "git",
+      ["log", "--oneline", `${mergeBase}..HEAD`],
+      { cwd: sandbox.worktreePath, encoding: "utf8", maxBuffer: 1024 * 1024 },
+    );
+    const repositoryFiles = execFileSync(
+      "git",
+      ["ls-files"],
+      { cwd: sandbox.worktreePath, encoding: "utf8", maxBuffer: 4 * 1024 * 1024 },
+    )
+      .split("\n")
+      .map((file) => file.trim())
+      .filter(Boolean);
+    const standardsFiles = discoverPrReviewStandardsFiles(
+      repositoryFiles,
+      reviewContext.changedFiles,
+    );
+    const linkedIssues = gatherLinkedIssues(
+      `${pr.body ?? ""}\n\n${commitList}`,
+    );
+    if (
+      linkedIssues.startsWith("(no linked") ||
+      linkedIssues.startsWith("(linked issues could")
+    ) {
+      console.log(`  linked issues: ${linkedIssues}`);
+    } else {
+      const count = (linkedIssues.match(/^### Issue #/gm) ?? []).length;
+      console.log(`  gathered ${count} linked issue(s)`);
+    }
     console.log(
       `  review diff: ${reviewContext.diffBytes} bytes, ${reviewContext.changedFiles.length} file(s), aspects: ${reviewContext.reviewAspects.join(", ")}`,
     );
@@ -973,6 +1111,8 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       title: pr.title,
       body: pr.body || "(no PR description)",
       linkedIssues,
+      commitList,
+      standardsFiles,
       baseSha: mergeBase,
       diff: reviewContext.diff,
       diffStat: reviewContext.diffStat,
@@ -988,21 +1128,83 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       `  review inputs written to ${reviewInputs.relativeDir} (${reviewContext.diffBytes} bytes diff)`,
     );
 
-    // Render the user prompt (now small — only metadata and file paths).
-    const userArgs = {
+    const sharedReviewArgs = {
       PR_NUMBER: String(pr.number),
       PR_TITLE: pr.title,
       BASE_SHA: mergeBase,
       DIFF_BYTES: String(reviewContext.diffBytes),
       ECOSYSTEMS: reviewContext.ecosystems.join(", ") || "(unknown)",
       REVIEW_ASPECTS: reviewContext.reviewAspects.join(", "),
-      PR_BODY_PATH: reviewInputs.paths.prBody,
-      LINKED_ISSUES_PATH: reviewInputs.paths.linkedIssues,
+      COMMIT_LIST_PATH: reviewInputs.paths.commitList,
       CHANGED_FILES_PATH: reviewInputs.paths.changedFiles,
       DIFF_STAT_PATH: reviewInputs.paths.diffStat,
       DIFF_PATH: reviewInputs.paths.diff,
       METADATA_PATH: reviewInputs.paths.metadata,
-      RESULT_PATH: `${reviewInputs.relativeDir}/review-result.json`,
+    };
+
+    const standardsAcquisition = await acquirePrReviewSpecialist<StandardsReview>({
+      sandbox,
+      prNumber: pr.number,
+      prBranch,
+      kind: "standards",
+      agentName: PR_STANDARDS_REVIEW_AGENT_CONFIG.name,
+      model: PR_STANDARDS_MODEL,
+      promptFile: PR_STANDARDS_REVIEW_USER_PROMPT_FILE,
+      promptArgs: {
+        ...sharedReviewArgs,
+        STANDARDS_FILES_PATH: reviewInputs.paths.standardsFiles,
+      },
+      completionSignal: "</standards_findings>",
+      parse: parseStandardsReview,
+    });
+
+    const specAcquisition = await acquirePrReviewSpecialist<SpecReview>({
+      sandbox,
+      prNumber: pr.number,
+      prBranch,
+      kind: "spec",
+      agentName: PR_SPEC_REVIEW_AGENT_CONFIG.name,
+      model: PR_SPEC_MODEL,
+      promptFile: PR_SPEC_REVIEW_USER_PROMPT_FILE,
+      promptArgs: {
+        ...sharedReviewArgs,
+        PR_BODY_PATH: reviewInputs.paths.prBody,
+        LINKED_ISSUES_PATH: reviewInputs.paths.linkedIssues,
+      },
+      completionSignal: "</spec_findings>",
+      parse: parseSpecReview,
+    });
+
+    const standardsReview = standardsAcquisition.review;
+    const specReview = specAcquisition.review;
+    const reviewFindings = combinePrReviewFindings(standardsReview, specReview);
+    const outputPaths = writePrReviewSpecialistArtifacts(
+      sandbox.worktreePath,
+      reviewInputs.relativeDir,
+      {
+        standardsRaw: standardsAcquisition.raw,
+        standardsReview,
+        specRaw: specAcquisition.raw,
+        specReview,
+        findings: reviewFindings,
+      },
+    );
+    console.log(
+      `  acquired ${standardsReview.findings.length} standards and ${specReview.findings.length} spec finding(s)`,
+    );
+
+    // The fixer starts in a fresh agent session and receives immutable,
+    // host-parsed specialist artifacts. It cannot omit a finding: the host
+    // validates one fixed/not-fixed disposition for every specialist ID.
+    const userArgs = {
+      ...sharedReviewArgs,
+      PR_BODY_PATH: reviewInputs.paths.prBody,
+      LINKED_ISSUES_PATH: reviewInputs.paths.linkedIssues,
+      STANDARDS_FILES_PATH: reviewInputs.paths.standardsFiles,
+      STANDARDS_REVIEW_PATH: outputPaths.standardsReview,
+      SPEC_REVIEW_PATH: outputPaths.specReview,
+      FINDINGS_PATH: outputPaths.findings,
+      FIX_RESULT_PATH: outputPaths.fixResult,
     };
     const userTemplate = readFileSync(PR_REVIEW_USER_PROMPT_FILE, "utf8");
     const rendered = renderSlimMessage(userTemplate, userArgs);
@@ -1015,7 +1217,7 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
     // Run the main review agent.
     const runName = `pr-review #${pr.number}`;
     const activeLogPath = tuiWorkingLogPath(runName);
-    console.log(`  invoking pr-review agent (model: ${REVIEWER_MODEL})`);
+    console.log(`  invoking pr-review fixer (model: ${PR_FIXER_MODEL})`);
 
     // sandcastle.opencode run result carries a commits array.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1025,7 +1227,7 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
         stage: "pr_review",
         agent: PR_REVIEW_AGENT_CONFIG.name,
         round: 1,
-        model: REVIEWER_MODEL,
+        model: PR_FIXER_MODEL,
         runName,
         worktreePath: sandbox.worktreePath,
         promptFile: PR_REVIEW_USER_PROMPT_FILE,
@@ -1035,7 +1237,7 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       () =>
         sandbox.run({
           name: runName,
-          agent: sandcastle.opencode(REVIEWER_MODEL, {
+          agent: sandcastle.opencode(PR_FIXER_MODEL, {
             agent: PR_REVIEW_AGENT_CONFIG.name,
           }),
           maxIterations: PR_REVIEW_MAX_ITERATIONS,
@@ -1052,6 +1254,11 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
     );
 
     const commitCount = result.commits.length;
+    if (commitCount > 1) {
+      throw new Error(
+        `PR review fixer produced ${commitCount} commits; expected at most one`,
+      );
+    }
     if (commitCount === 0) {
       console.log(`  no commits produced; no fixes were needed`);
     } else {
@@ -1060,26 +1267,40 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       );
     }
 
-    // Read and validate the review result artifact the agent wrote.
-    const resultPath = `${reviewInputs.relativeDir}/review-result.json`;
-    console.log(`  reading review result artifact ${resultPath}`);
-    let resultArtifactRaw: string;
+    // Read the fixer dispositions, verify that every immutable specialist
+    // finding is accounted for exactly once, then write the host-owned result.
+    console.log(`  reading fix result artifact ${outputPaths.fixResult}`);
+    let fixResultRaw: string;
     try {
-      resultArtifactRaw = readFileSync(
-        join(sandbox.worktreePath, resultPath),
+      fixResultRaw = readFileSync(
+        join(sandbox.worktreePath, outputPaths.fixResult),
         "utf8",
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`Could not read review result artifact: ${message}`);
+      throw new Error(`Could not read PR review fix result artifact: ${message}`);
     }
-    const validation = validatePrReviewResult(resultArtifactRaw);
-    if (!validation.ok) {
+    const parsedFixResult = parsePrReviewFixResult(fixResultRaw);
+    if (parsedFixResult.kind !== "fix_result") {
       throw new Error(
-        `Invalid review result artifact: ${validation.errors.join("; ")}`,
+        `Invalid PR review fix result artifact: ${parsedFixResult.message}`,
       );
     }
-    const reviewResult: PrReviewResult = validation.result;
+    const builtReviewResult = buildPrReviewResult(
+      reviewFindings,
+      parsedFixResult.result,
+    );
+    if (!builtReviewResult.ok) {
+      throw new Error(
+        `Invalid PR review finding accounting: ${builtReviewResult.errors.join("; ")}`,
+      );
+    }
+    const reviewResult = builtReviewResult.result;
+    writePrReviewJsonArtifact(
+      sandbox.worktreePath,
+      outputPaths.reviewResult,
+      reviewResult,
+    );
     const reviewedHeadSha = git(
       ["rev-parse", "HEAD"],
       sandbox.worktreePath,
