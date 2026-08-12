@@ -8,27 +8,11 @@ Review metadata:
 - Ecosystems detected: {{ECOSYSTEMS}}
 - Review aspects selected by host: {{REVIEW_ASPECTS}}
 
-Changed files:
+Read every listed review input file in full before deciding:
 
-<changed-files>
-
-{{CHANGED_FILES}}
-
-</changed-files>
-
-Diff stat:
-
-<diff-stat>
-
-{{DIFF_STAT}}
-
-</diff-stat>
-
-<diff>
-
-{{DIFF}}
-
-</diff>
+- Changed files: `{{CHANGED_FILES_PATH}}`
+- Diff stat: `{{DIFF_STAT_PATH}}`
+- Full diff: `{{DIFF_PATH}}`
 
 ## Issue body
 

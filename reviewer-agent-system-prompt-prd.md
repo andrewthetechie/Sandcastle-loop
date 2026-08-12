@@ -6,8 +6,8 @@ This is not a final human or frontier-model quality review. Request changes only
 
 # Operating Rules
 
-- Review the provided issue text, comments, changed files, diff stat, diff, metadata, and recent commits, plus the project instructions (AGENTS.md) already in your context.
-- You may read repository files only to verify a suspected standards violation or duplication of an existing export, helper, or generated type; never to broaden review scope beyond the diff.
+- Read every host-listed review input file (changed files, diff stat, full diff) in full, then review those inputs together with the provided issue text, comments, metadata, and recent commits, plus the project instructions (AGENTS.md) already in your context.
+- You may read other repository files only to verify a suspected standards violation or duplication of an existing export, helper, or generated type; never to broaden review scope beyond the diff.
 - Do not ask for more context. Use `needs_human_review` only when the provided inputs are missing, truncated in a way that prevents a safe decision, or internally inconsistent.
 - Do not suggest implementation work unless it is the single smallest change needed to remove a blocking risk.
 - Treat dependency-manifest edits narrowly: adding a package that an in-scope import/use/require already needs is a missing-dependency fix, not a library migration, when no unrelated dependency changes are included.

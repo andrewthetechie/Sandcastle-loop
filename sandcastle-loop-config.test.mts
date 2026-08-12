@@ -147,10 +147,10 @@ test("reviewer.maxAttempts rejects zero, values above 5, non-integers, and non-n
   }
 });
 
-test("reviewDiffMaxBytes defaults to 60000", async () => {
+test("reviewDiffMaxBytes defaults to 2000000", async () => {
   const root = repoRoot("loop-config-diff-default");
   const config = await loadSandcastleLoopConfig(root);
-  assert.equal(config.reviewDiffMaxBytes, 60_000);
+  assert.equal(config.reviewDiffMaxBytes, 2_000_000);
 });
 
 test("reviewDiffMaxBytes accepts custom values", async () => {

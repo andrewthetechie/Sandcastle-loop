@@ -47,6 +47,7 @@ import { EXTRA_REVIEW_INPUT_DIFF_EXCLUDES } from "./extra-review-inputs.mts";
 import {
   writeCompletedBranchReviewInputs,
 } from "./extra-review-inputs.mts";
+import { writeChildReviewInputs } from "./child-review-inputs.mts";
 import type {
   ExtraReviewPrdArtifactIdentity,
   ExtraReviewRoundArtifactIdentity,
@@ -253,9 +254,8 @@ const SANDBOX_READY_COMMANDS: string[] = LOOP_CONFIG.setupCommands;
 // Git pathspec exclusions for the reviewer diff.
 const REVIEW_DIFF_EXCLUDES: string[] = [...EXTRA_REVIEW_INPUT_DIFF_EXCLUDES];
 
-// Hard cap on the reviewer diff (bytes). opencode passes the whole prompt as a
-// single CLI arg and the Linux execve argv limit is ~128KB system-wide, so keep
-// this well under that with headroom for the rest of the prompt.
+// Policy backstop for a single reviewable branch diff. Child review round
+// inputs are file-backed (ADR 0006), so this is no longer an argv ceiling.
 const REVIEW_DIFF_MAX_BYTES = LOOP_CONFIG.reviewDiffMaxBytes;
 
 // Tracked task files must not be copied from the host into a worktree: doing
@@ -2186,19 +2186,17 @@ function looksLikeWorkflowPollution(
   );
 }
 
-// The reviewer diff is passed to opencode as a single CLI argument, so the
-// Linux execve argv limit (~128KB system-wide) is a hard technical ceiling —
-// not a preference for small changes. Oversized diffs cannot be reviewed at
-// all, so we ask the coder to split the work rather than reduce ambition.
+// Policy backstop once child review inputs are file-backed (ADR 0006). Above
+// this size the host will not invoke the reviewer; ask the coder to split work.
 function formatDiffTooLargeFeedback(context: ReviewContext): string {
   return [
     "## Diff too large to review",
     "",
     `The review diff is ${context.diffBytes} bytes, above the ${REVIEW_DIFF_MAX_BYTES} byte limit.`,
     "",
-    "This is a hard technical constraint: the diff is passed to the reviewer as a single command-line argument and the OS caps argument size. A diff over the limit cannot be reviewed at all.",
+    "This exceeds the configured maximum size for a single reviewable branch diff. The host will not invoke the reviewer above this policy limit.",
     "",
-    "Remove unrelated or generated changes from the branch. If the issue genuinely requires a change larger than the limit, split it into smaller commits that each stay reviewable, and keep this branch scoped to what fits.",
+    "Remove unrelated or generated changes from the branch. If the work genuinely requires a larger change, split it into smaller reviewable units and keep this branch scoped to what fits.",
     "",
     "Changed files:",
     "```",
@@ -2878,6 +2876,17 @@ async function runBacklogIssueViaSharedEngine(input: {
         async acquireReviewer(input) {
           noteRound(input.round);
           console.log(`  validation green; invoking reviewer`);
+          // Persist review inputs in the worktree so the full diff does not
+          // travel through argv (ADR 0006).
+          const reviewInputs = writeChildReviewInputs(sandbox.worktreePath, {
+            issueNumber: issue.number,
+            baseSha: input.context.baseSha,
+            diff: input.context.diff,
+            diffStat: input.context.diffStat,
+            changedFiles: input.context.changedFiles,
+            reviewAspects: input.context.reviewAspects,
+            ecosystems: input.context.ecosystems,
+          });
           const reviewerUserArgs = {
             ISSUE_NUMBER: String(issue.number),
             ISSUE_TITLE: issue.title,
@@ -2885,11 +2894,11 @@ async function runBacklogIssueViaSharedEngine(input: {
             ISSUE_COMMENTS: issueComments,
             BASE_BRANCH: taskBaseRef,
             REVIEW_BASE_SHA: input.context.baseSha,
-            DIFF: input.context.diff,
+            DIFF_PATH: reviewInputs.paths.diff,
+            DIFF_STAT_PATH: reviewInputs.paths.diffStat,
+            CHANGED_FILES_PATH: reviewInputs.paths.changedFiles,
             DIFF_BYTES: String(input.context.diffBytes),
             DIFF_MAX_BYTES: String(REVIEW_DIFF_MAX_BYTES),
-            CHANGED_FILES: input.context.changedFiles.join("\n") || "(none)",
-            DIFF_STAT: input.context.diffStat,
             REVIEW_ASPECTS: input.context.reviewAspects.join(", "),
             ECOSYSTEMS: input.context.ecosystems.join(", ") || "(unknown)",
           };

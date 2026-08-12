@@ -8,7 +8,8 @@ export const BACKLOG_V3_ENGINE_POLICY: Omit<
   coderMaxIterations: 30,
   failedRoundRepeatLimit: 3,
   maxRecoveryAttempts: 2,
-  reviewDiffMaxBytes: 60_000,
+  // File-backed child review inputs (ADR 0006); still overridden by loop config.
+  reviewDiffMaxBytes: 2_000_000,
   preCoderRebaseGuard: true,
   hostOnlyReviewAfterBaseAdvance: false,
 };

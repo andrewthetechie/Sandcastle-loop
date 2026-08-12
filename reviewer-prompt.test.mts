@@ -14,8 +14,8 @@ const EXPECTED_SYSTEM_PROMPT = [
   "",
   "# Operating Rules",
   "",
-  "- Review the provided issue text, comments, changed files, diff stat, diff, metadata, and recent commits, plus the project instructions (AGENTS.md) already in your context.",
-  "- You may read repository files only to verify a suspected standards violation or duplication of an existing export, helper, or generated type; never to broaden review scope beyond the diff.",
+  "- Read every host-listed review input file (changed files, diff stat, full diff) in full, then review those inputs together with the provided issue text, comments, metadata, and recent commits, plus the project instructions (AGENTS.md) already in your context.",
+  "- You may read other repository files only to verify a suspected standards violation or duplication of an existing export, helper, or generated type; never to broaden review scope beyond the diff.",
   "- Do not ask for more context. Use `needs_human_review` only when the provided inputs are missing, truncated in a way that prevents a safe decision, or internally inconsistent.",
   "- Do not suggest implementation work unless it is the single smallest change needed to remove a blocking risk.",
   "- Treat dependency-manifest edits narrowly: adding a package that an in-scope import/use/require already needs is a missing-dependency fix, not a library migration, when no unrelated dependency changes are included.",
@@ -210,27 +210,11 @@ const EXPECTED_USER_PROMPT = [
   "- Ecosystems detected: {{ECOSYSTEMS}}",
   "- Review aspects selected by host: {{REVIEW_ASPECTS}}",
   "",
-  "Changed files:",
+  "Read every listed review input file in full before deciding:",
   "",
-  "<changed-files>",
-  "",
-  "{{CHANGED_FILES}}",
-  "",
-  "</changed-files>",
-  "",
-  "Diff stat:",
-  "",
-  "<diff-stat>",
-  "",
-  "{{DIFF_STAT}}",
-  "",
-  "</diff-stat>",
-  "",
-  "<diff>",
-  "",
-  "{{DIFF}}",
-  "",
-  "</diff>",
+  "- Changed files: `{{CHANGED_FILES_PATH}}`",
+  "- Diff stat: `{{DIFF_STAT_PATH}}`",
+  "- Full diff: `{{DIFF_PATH}}`",
   "",
   "## Issue body",
   "",
@@ -286,12 +270,15 @@ test("reviewer user prompt contains only the slim dynamic review template", () =
   assert.match(userPrompt, /\{\{DIFF_MAX_BYTES\}\}/);
   assert.match(userPrompt, /\{\{ECOSYSTEMS\}\}/);
   assert.match(userPrompt, /\{\{REVIEW_ASPECTS\}\}/);
-  assert.match(userPrompt, /\{\{CHANGED_FILES\}\}/);
-  assert.match(userPrompt, /\{\{DIFF_STAT\}\}/);
-  assert.match(userPrompt, /\{\{DIFF\}\}/);
+  assert.match(userPrompt, /\{\{CHANGED_FILES_PATH\}\}/);
+  assert.match(userPrompt, /\{\{DIFF_STAT_PATH\}\}/);
+  assert.match(userPrompt, /\{\{DIFF_PATH\}\}/);
   assert.match(userPrompt, /\{\{ISSUE_BODY\}\}/);
   assert.match(userPrompt, /\{\{ISSUE_COMMENTS\}\}/);
   assert.match(userPrompt, /!`git log \{\{BASE_BRANCH\}\}\.\.HEAD/);
+  assert.doesNotMatch(userPrompt, /\{\{DIFF\}\}/);
+  assert.doesNotMatch(userPrompt, /\{\{CHANGED_FILES\}\}/);
+  assert.doesNotMatch(userPrompt, /\{\{DIFF_STAT\}\}/);
   assert.doesNotMatch(userPrompt, /\{\{PRD_BODY\}\}/);
   assert.doesNotMatch(userPrompt, /<prd>/);
 });

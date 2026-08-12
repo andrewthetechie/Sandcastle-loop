@@ -12,7 +12,7 @@ test("BACKLOG_V3_ENGINE_POLICY matches the backlog-v3 literals", () => {
     coderMaxIterations: 30,
     failedRoundRepeatLimit: 3,
     maxRecoveryAttempts: 2,
-    reviewDiffMaxBytes: 60_000,
+    reviewDiffMaxBytes: 2_000_000,
     preCoderRebaseGuard: true,
     hostOnlyReviewAfterBaseAdvance: false,
   });

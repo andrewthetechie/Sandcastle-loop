@@ -225,6 +225,19 @@ test("backlog-v3 creates PR on clean/partial delivery unless --no-pr", () => {
   assert.match(source, /formatParentPrBody\(/);
 });
 
+test("backlog-v3 file-backs child review round inputs instead of argv-inlining the diff", () => {
+  assert.match(source, /import \{ writeChildReviewInputs \} from "\.\/child-review-inputs\.mts";/);
+  assert.match(source, /writeChildReviewInputs\(sandbox\.worktreePath/);
+  assert.match(source, /DIFF_PATH: reviewInputs\.paths\.diff/);
+  assert.match(source, /DIFF_STAT_PATH: reviewInputs\.paths\.diffStat/);
+  assert.match(source, /CHANGED_FILES_PATH: reviewInputs\.paths\.changedFiles/);
+  assert.doesNotMatch(source, /DIFF: input\.context\.diff/);
+  assert.doesNotMatch(
+    source,
+    /the diff is passed to the reviewer as a single command-line argument/,
+  );
+});
+
 test("older runners remain outside the Issue-as-PRD outer-loop wiring", () => {
   if (prdV4) {
     assert.doesNotMatch(prdV4, /runIssueAsPrdParent\(/);

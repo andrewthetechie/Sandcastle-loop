@@ -126,7 +126,9 @@ const DEFAULT_VALIDATION_COMMANDS = [
 const DEFAULT_SETUP_COMMANDS = ["npm install"];
 const DEFAULT_REVIEWER_MAX_ATTEMPTS = 2;
 const DEFAULT_PARENT_COMMENT_MAX_BYTES = 32_000;
-const DEFAULT_REVIEW_DIFF_MAX_BYTES = 60_000;
+// Policy backstop for a single reviewable branch diff once inputs are
+// file-backed (see ADR 0006). Argv-inlined runners should pin a lower value.
+const DEFAULT_REVIEW_DIFF_MAX_BYTES = 2_000_000;
 const DEFAULT_CODER_ESCALATION_TIER2_FROM_ROUND = 3;
 const DEFAULT_CODER_ESCALATION_TIER3_FROM_ROUND = 5;
 
