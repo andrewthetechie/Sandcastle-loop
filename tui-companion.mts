@@ -1,4 +1,13 @@
-import { readFileSync, watch, type FSWatcher } from "node:fs";
+import {
+  closeSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+  watch,
+  type FSWatcher,
+} from "node:fs";
 import { basename } from "node:path";
 import React from "react";
 import { Box, Text, render, useApp, useInput, useStdout } from "ink";
@@ -14,6 +23,9 @@ import {
   orderSnapshotPaths,
   pickFreshestSnapshot,
   selectAdjacentSnapshot,
+  tailTextLines,
+  TUI_WORKING_LOG_MAX_LINES,
+  TUI_WORKING_LOG_MAX_READ_BYTES,
   type StatusView,
   type TuiLiveness,
 } from "./tui-view.mts";
@@ -24,6 +36,7 @@ import {
 
 const POLL_INTERVAL_MS = 1_000;
 const TICK_INTERVAL_MS = 1_000;
+const WATCH_DEBOUNCE_MS = 250;
 
 /** Parse an atomic status snapshot at the given path. Returns null when absent or unreadable. */
 function readStatusSnapshot(path: string): TuiStatus | null {
@@ -38,15 +51,51 @@ function readStatusSnapshot(path: string): TuiStatus | null {
   }
 }
 
-/** Read a working-log file into lines. Missing file → empty. Never throws. */
-function readLogLines(path: string | null): string[] {
-  if (path === null) return [];
+/**
+ * Tail a working-log file into a bounded line window. Reads at most
+ * `TUI_WORKING_LOG_MAX_READ_BYTES` from the end so multi-hour agent logs cannot
+ * OOM the companion. Missing file → empty. Never throws.
+ */
+function readLogTail(path: string | null): { lines: string[]; byteSize: number } {
+  if (path === null) return { lines: [], byteSize: 0 };
+  let fd: number | undefined;
   try {
-    const raw = readFileSync(path, "utf8");
-    if (raw === "") return [];
-    return raw.replace(/\n$/u, "").split("\n");
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    if (size <= 0) return { lines: [], byteSize: 0 };
+
+    const readSize = Math.min(size, TUI_WORKING_LOG_MAX_READ_BYTES);
+    const buffer = Buffer.allocUnsafe(readSize);
+    readSync(fd, buffer, 0, readSize, size - readSize);
+    let text = buffer.toString("utf8");
+    if (readSize < size) {
+      // Drop the likely-partial first line after a mid-file seek.
+      const newline = text.indexOf("\n");
+      text = newline === -1 ? text : text.slice(newline + 1);
+    }
+    return {
+      lines: tailTextLines(text, TUI_WORKING_LOG_MAX_LINES),
+      byteSize: size,
+    };
   } catch {
-    return [];
+    return { lines: [], byteSize: 0 };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // ignore close errors on a best-effort read path
+      }
+    }
+  }
+}
+
+function statLogByteSize(path: string | null): number {
+  if (path === null) return 0;
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
   }
 }
 
@@ -220,6 +269,8 @@ function WorkingLogPane(props: {
 interface LogState {
   path: string | null;
   lines: string[];
+  /** On-disk byte size last observed for `path`; used to skip unchanged re-reads. */
+  byteSize: number;
 }
 
 interface LoopPaneState {
@@ -238,7 +289,7 @@ function buildInitialLoops(cwd: string): Map<string, LoopPaneState> {
     loops.set(path, {
       status,
       prevStatus: null,
-      log: { path: null, lines: [] },
+      log: { path: null, lines: [], byteSize: 0 },
       scrollOffset: 0,
     });
   }
@@ -296,7 +347,7 @@ function TuiApp(props: { cwd: string }): React.ReactElement {
       const existing = next.get(path) ?? {
         status: null,
         prevStatus: null,
-        log: { path: null, lines: [] },
+        log: { path: null, lines: [], byteSize: 0 },
         scrollOffset: 0,
       };
 
@@ -306,10 +357,22 @@ function TuiApp(props: { cwd: string }): React.ReactElement {
       let scrollOffset = existing.scrollOffset;
 
       if (target.action === "clear") {
-        log = { path: target.activeLogPath, lines: readLogLines(target.activeLogPath) };
+        const tailed = readLogTail(target.activeLogPath);
+        log = { path: target.activeLogPath, lines: tailed.lines, byteSize: tailed.byteSize };
         scrollOffset = 0;
       } else if (target.action === "continue") {
-        log = { path: target.activeLogPath, lines: readLogLines(target.activeLogPath) };
+        const byteSize = statLogByteSize(target.activeLogPath);
+        // Same path + unchanged size: keep the prior window (avoids realloc churn).
+        if (
+          existing.log.path === target.activeLogPath &&
+          existing.log.byteSize === byteSize
+        ) {
+          log = existing.log;
+        } else {
+          const tailed = readLogTail(target.activeLogPath);
+          log = { path: target.activeLogPath, lines: tailed.lines, byteSize: tailed.byteSize };
+          scrollOffset = Math.min(scrollOffset, Math.max(0, log.lines.length));
+        }
       }
       // "freeze" (host step) keeps whatever the log pane was already showing.
 
@@ -342,9 +405,17 @@ function TuiApp(props: { cwd: string }): React.ReactElement {
     const tickTimer = setInterval(() => setNow(new Date()), TICK_INTERVAL_MS);
 
     let watcher: FSWatcher | null = null;
+    let watchDebounce: ReturnType<typeof setTimeout> | null = null;
     try {
       // Recursive watch covers all status-<loopType>.json renames and logs/*.log appends.
-      watcher = watch(tuiDir(cwd), { recursive: true }, () => refresh());
+      // Debounce: agent streams append often; re-reading on every write OOMs over long runs.
+      watcher = watch(tuiDir(cwd), { recursive: true }, () => {
+        if (watchDebounce !== null) clearTimeout(watchDebounce);
+        watchDebounce = setTimeout(() => {
+          watchDebounce = null;
+          refresh();
+        }, WATCH_DEBOUNCE_MS);
+      });
     } catch {
       // Some platforms lack recursive watch; the 1s poll is the safety net.
       watcher = null;
@@ -353,6 +424,7 @@ function TuiApp(props: { cwd: string }): React.ReactElement {
     return () => {
       clearInterval(poll);
       clearInterval(tickTimer);
+      if (watchDebounce !== null) clearTimeout(watchDebounce);
       if (watcher) watcher.close();
     };
   }, [cwd, refresh]);

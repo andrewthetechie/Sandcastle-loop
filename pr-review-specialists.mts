@@ -2,6 +2,11 @@ import type {
   PrReviewFinding,
   PrReviewResult,
 } from "./pr-review-result.mts";
+import {
+  validatePrReviewFixResult,
+  validateSpecReview,
+  validateStandardsReview,
+} from "./structured-result-validators.mts";
 
 export type PrReviewAxis = "standards" | "spec";
 export type PrReviewSpecialistSeverity = "high" | "medium" | "low";
@@ -86,7 +91,21 @@ export function parseStandardsReview(
 ): PrReviewSpecialistParseResult<StandardsReview> {
   const tagged = parseTaggedObject(stdout, "standards_findings");
   if (!tagged.ok) return tagged.failure;
-  return parseSpecialistEnvelope(tagged.value, parseStandardsFinding);
+  const validated = validateStandardsReview(tagged.value);
+  if (!validated.ok) {
+    return { kind: "parse_failure", message: validated.errors[0]?.message ?? validated.code };
+  }
+  if (validated.canonical.status === "blocked") {
+    return { kind: "blocked", summary: validated.canonical.summary };
+  }
+  return {
+    kind: "review",
+    review: {
+      status: "complete",
+      summary: validated.canonical.summary,
+      findings: validated.canonical.findings,
+    },
+  };
 }
 
 export function parseSpecReview(
@@ -94,7 +113,21 @@ export function parseSpecReview(
 ): PrReviewSpecialistParseResult<SpecReview> {
   const tagged = parseTaggedObject(stdout, "spec_findings");
   if (!tagged.ok) return tagged.failure;
-  return parseSpecialistEnvelope(tagged.value, parseSpecFinding);
+  const validated = validateSpecReview(tagged.value);
+  if (!validated.ok) {
+    return { kind: "parse_failure", message: validated.errors[0]?.message ?? validated.code };
+  }
+  if (validated.canonical.status === "blocked") {
+    return { kind: "blocked", summary: validated.canonical.summary };
+  }
+  return {
+    kind: "review",
+    review: {
+      status: "complete",
+      summary: validated.canonical.summary,
+      findings: validated.canonical.findings,
+    },
+  };
 }
 
 export function combinePrReviewFindings(
@@ -139,64 +172,14 @@ export function parsePrReviewFixResult(raw: string): PrReviewFixParseResult {
       message: `invalid fix-result JSON: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
-  if (!isRecord(value)) {
-    return { kind: "parse_failure", message: "fix result must be an object" };
-  }
-  if (!isIntegerInRange(value.risk, 0, 5)) {
+  const validated = validatePrReviewFixResult(value);
+  if (!validated.ok) {
     return {
       kind: "parse_failure",
-      message: "fix result risk must be an integer from 0 through 5",
+      message: validated.errors[0]?.message ?? validated.code,
     };
   }
-  if (!isNonEmptyString(value.summary)) {
-    return {
-      kind: "parse_failure",
-      message: "fix result summary must be a non-empty string",
-    };
-  }
-  if (!Array.isArray(value.dispositions)) {
-    return {
-      kind: "parse_failure",
-      message: "fix result dispositions must be an array",
-    };
-  }
-
-  const dispositions: PrReviewFixDisposition[] = [];
-  for (const [index, item] of value.dispositions.entries()) {
-    if (
-      !isRecord(item) ||
-      !isNonEmptyString(item.finding_id) ||
-      (item.disposition !== "fixed" && item.disposition !== "not_fixed") ||
-      !isNonEmptyString(item.reason)
-    ) {
-      return {
-        kind: "parse_failure",
-        message: `fix result dispositions[${index}] is invalid`,
-      };
-    }
-    dispositions.push({
-      finding_id: item.finding_id,
-      disposition: item.disposition,
-      reason: item.reason,
-    });
-  }
-
-  if (value.notes !== undefined && typeof value.notes !== "string") {
-    return {
-      kind: "parse_failure",
-      message: "fix result notes must be a string when present",
-    };
-  }
-
-  return {
-    kind: "fix_result",
-    result: {
-      risk: value.risk,
-      summary: value.summary,
-      dispositions,
-      notes: value.notes,
-    },
-  };
+  return { kind: "fix_result", result: validated.canonical };
 }
 
 export function buildPrReviewResult(

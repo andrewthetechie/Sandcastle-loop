@@ -17,8 +17,12 @@ import { enforceArgvSizeLimit } from "./custom-agent-argv-guard.mts";
 import { renderSlimMessage } from "./custom-agent-render.mts";
 import {
   ensureOpencodeGitExclude,
+  ensureSandboxGitExclude,
   writeAgentDefinitionFile,
 } from "./custom-agent-worktree.mts";
+import { installStructuredResultMcp } from "./structured-result-mcp-install.mts";
+import { withStructuredResultMcpAgent } from "./structured-result-agent-provider.mts";
+import { clearStructuredResultFromWorktree } from "./structured-result-acquisition.mts";
 import {
   EXTRA_DECOMPOSER_MAX_ITERATIONS,
   EXTRA_REVIEWER_MAX_ITERATIONS,
@@ -1032,7 +1036,7 @@ function formatReviewerAcquisitionFeedback(input: {
   candidateHeadSha: string;
   candidateTreeSha: string;
   logFilePath?: string;
-  resultSource: "stdout" | "run_log" | "none";
+  resultSource: "stdout" | "run_log" | "structured_result_file" | "none";
   failureCode: string;
   excerpt: string;
   diagnostics: string[];
@@ -1664,6 +1668,8 @@ async function runPrdV4IssueViaSharedEngine(input: {
           },
         });
         ensureOpencodeGitExclude(sandbox.worktreePath);
+        ensureSandboxGitExclude(sandbox.worktreePath);
+        installStructuredResultMcp(sandbox.worktreePath);
         return {
           worktreePath: sandbox.worktreePath,
           async close() {
@@ -2099,6 +2105,10 @@ async function runPrdV4IssueViaSharedEngine(input: {
           attempt,
         );
         const reviewerActiveLogPath = tuiWorkingLogPath(reviewerRunName);
+        clearStructuredResultFromWorktree(
+          activeSandbox.worktreePath,
+          "review",
+        );
         const reviewerResult: Awaited<ReturnType<typeof activeSandbox.run>> =
           await recordMeasuredAgentRun(
           {
@@ -2117,11 +2127,12 @@ async function runPrdV4IssueViaSharedEngine(input: {
           () =>
             activeSandbox.run({
               name: reviewerRunName,
-              agent: sandcastle.opencode(REVIEWER_MODEL, {
-                agent: REVIEWER_AGENT_CONFIG.name,
-              }),
+              agent: withStructuredResultMcpAgent(
+                sandcastle.opencode(REVIEWER_MODEL, {
+                  agent: REVIEWER_AGENT_CONFIG.name,
+                }),
+              ),
               maxIterations: 1,
-              completionSignal: "</review>",
               idleTimeoutSeconds,
               promptFile: REVIEWER_USER_PROMPT_FILE,
               promptArgs: reviewerUserArgs,
@@ -2140,17 +2151,8 @@ async function runPrdV4IssueViaSharedEngine(input: {
           typeof reviewerResult.logFilePath === "string"
             ? reviewerResult.logFilePath
             : undefined;
-        const runLogText =
-          logFilePath && existsSync(logFilePath)
-            ? readFileSync(logFilePath, "utf8")
-            : undefined;
         const acquisition = acquireReviewerResult({
-          stdout: reviewerResult.stdout,
-          runLogText,
-          runLogReadError:
-            logFilePath && !existsSync(logFilePath)
-              ? `missing log file at ${logFilePath}`
-              : undefined,
+          worktreePath: activeSandbox.worktreePath,
           logFilePath,
         });
         recordReviewerResult({
@@ -2178,7 +2180,9 @@ async function runPrdV4IssueViaSharedEngine(input: {
         }
         return {
           ...acquisition,
-          excerpt: runLogText ?? reviewerResult.stdout,
+          excerpt: sanitizeReviewerExcerpt(
+            acquisition.diagnostics.join("\n") || reviewerResult.stdout,
+          ),
         } satisfies EngineReviewerAcquisitionResult;
       },
       currentHeadSha() {
@@ -2530,6 +2534,7 @@ async function runExtraReviewRound(input: {
       idleTimeoutSeconds,
       copyToWorktree: COPY_TO_WORKTREE,
       hooks: sandboxReadyHooks(),
+      resultAcquisition: "structured_result_file",
       onAgentSession: ({ runName }) => {
         const activeLogPath = tuiWorkingLogPath(runName);
         return {
@@ -2551,9 +2556,11 @@ async function runExtraReviewRound(input: {
         }),
       createAgent: (model, agentName) => {
         const roleModel = extraReviewModelForAgent(agentName) ?? model;
-        return agentName
-          ? sandcastle.opencode(roleModel, { agent: agentName })
-          : sandcastle.opencode(roleModel);
+        return withStructuredResultMcpAgent(
+          agentName
+            ? sandcastle.opencode(roleModel, { agent: agentName })
+            : sandcastle.opencode(roleModel),
+        );
       },
       sessionAgents: {
         code_quality: {
@@ -2571,6 +2578,8 @@ async function runExtraReviewRound(input: {
       },
       writeAgentDefinition: ({ worktreePath, session, agentName }) => {
         ensureOpencodeGitExclude(worktreePath);
+        ensureSandboxGitExclude(worktreePath);
+        installStructuredResultMcp(worktreePath);
 
         const spec = {
           code_quality: {

@@ -1,3 +1,9 @@
+import {
+  STRUCTURED_RESULT_MCP_TOOL_GLOB,
+  structuredResultOpenCodeToolName,
+  type StructuredResultStageId,
+} from "./structured-result-contracts.mts";
+
 export type CustomAgentPermissionValue = "allow" | "deny";
 
 export type CustomAgentBashPermission =
@@ -19,6 +25,7 @@ export interface CustomAgentConfig {
   description: string;
   temperature: number;
   permission: CustomAgentPermission;
+  structuredResultStage?: StructuredResultStageId;
 }
 
 const DENY_ONLY_PERMISSION = {
@@ -54,6 +61,7 @@ export const REVIEWER_AGENT_CONFIG: CustomAgentConfig = {
   name: "reviewer",
   description: "Reviews one issue diff and emits a single verdict block",
   temperature: 0.1,
+  structuredResultStage: "review",
   permission: {
     edit: "deny",
     bash: "deny",
@@ -65,6 +73,7 @@ export const CODE_QUALITY_AGENT_CONFIG: CustomAgentConfig = {
   name: "code-quality",
   description: "Maintainability gate over the completed PRD branch",
   temperature: 0.1,
+  structuredResultStage: "code_quality_extra_review",
   permission: {
     edit: "deny",
     bash: "deny",
@@ -76,6 +85,7 @@ export const TWO_AXIS_AGENT_CONFIG: CustomAgentConfig = {
   name: "two-axis",
   description: "Standards + spec-fit gate over the completed PRD branch",
   temperature: 0.1,
+  structuredResultStage: "two_axis_extra_review",
   permission: {
     edit: "deny",
     bash: "deny",
@@ -87,6 +97,7 @@ export const DECOMPOSER_AGENT_CONFIG: CustomAgentConfig = {
   name: "decomposer",
   description: "Turns review findings into follow-up PRD issue drafts",
   temperature: 0.3,
+  structuredResultStage: "followup_issues",
   permission: {
     edit: "deny",
     bash: "deny",
@@ -98,6 +109,7 @@ export const INITIAL_ISSUE_DECOMPOSER_AGENT_CONFIG: CustomAgentConfig = {
   name: "initial-issue-decomposer",
   description: "Turns one parent issue into implementation-ready child issue drafts",
   temperature: 0.3,
+  structuredResultStage: "initial_issue_decomposition",
   permission: {
     edit: "deny",
     bash: "deny",
@@ -109,6 +121,7 @@ export const SUBTASK_READINESS_AGENT_CONFIG: CustomAgentConfig = {
   name: "subtask-readiness",
   description: "Readiness-gates one generated child issue before implementation",
   temperature: 0.1,
+  structuredResultStage: "subtask_readiness",
   permission: {
     edit: "deny",
     bash: "deny",
@@ -120,6 +133,7 @@ export const SUBTASK_IMPROVEMENT_AGENT_CONFIG: CustomAgentConfig = {
   name: "subtask-improvement",
   description: "Read-only evidence-backed improvement of one child issue immediately before coding",
   temperature: 0.1,
+  structuredResultStage: "subtask_improvement",
   permission: {
     edit: "deny",
     bash: [
@@ -150,6 +164,7 @@ export const REBASE_AGENT_CONFIG: CustomAgentConfig = {
   name: "rebase",
   description: "Resolves one local accumulation rebase without remote or tracker mutation",
   temperature: 0.1,
+  structuredResultStage: "rebase_result",
   permission: {
     edit: "allow",
     bash: [
@@ -203,6 +218,7 @@ export const PR_REVIEW_AGENT_CONFIG: CustomAgentConfig = {
   description:
     "Fixes host-verified PR review findings, records every disposition, and commits",
   temperature: 0.2,
+  structuredResultStage: "pr_review_fix",
   permission: {
     edit: "allow",
     bash: "allow",
@@ -218,6 +234,7 @@ export const PR_STANDARDS_REVIEW_AGENT_CONFIG: CustomAgentConfig = {
   description:
     "Read-only sub-agent: reviews a PR diff against coding standards and the Fowler smell baseline",
   temperature: 0.1,
+  structuredResultStage: "standards_findings",
   permission: {
     edit: "deny",
     bash: "deny",
@@ -230,6 +247,7 @@ export const PR_SPEC_REVIEW_AGENT_CONFIG: CustomAgentConfig = {
   description:
     "Read-only sub-agent: reviews a PR diff against the PR description and linked issues for spec compliance",
   temperature: 0.1,
+  structuredResultStage: "spec_findings",
   permission: {
     edit: "deny",
     bash: "deny",
@@ -263,6 +281,12 @@ export function buildAgentDefinition(
     `  question: ${config.permission.question}`,
     `  webfetch: ${config.permission.webfetch}`,
     `  websearch: ${config.permission.websearch}`,
+    `  "${STRUCTURED_RESULT_MCP_TOOL_GLOB}": deny`,
+    ...(config.structuredResultStage
+      ? [
+          `  "${structuredResultOpenCodeToolName(config.structuredResultStage)}": allow`,
+        ]
+      : []),
     ...(config.permission.skill
       ? [
           "  skill:",

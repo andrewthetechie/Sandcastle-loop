@@ -19,4 +19,4 @@ Exact current accumulation SHA: `{{ACCUMULATION_HEAD_SHA}}`
 {{SUBTASK_DISCUSSION}}
 </child-human-discussion>
 
-Return only the required tagged JSON result.
+Submit the fix-result through Structured-result MCP `structured-result_submit_subtask_improvement` when your `result` object is ready.

@@ -14,10 +14,17 @@ import {
 } from "./extra-review-artifacts.mts";
 import type { ExtraReviewInputMetadata } from "./extra-review-inputs.mts";
 import {
+  clearStructuredResultFromWorktree,
+  readCodeQualityExtraReviewFromWorktree,
+  readFollowupIssuesFromWorktree,
+  readTwoAxisExtraReviewFromWorktree,
+} from "./structured-result-acquisition.mts";
+import {
   parseCodeQualityExtraReview,
   parseFollowupIssues,
   parseTwoAxisExtraReview,
 } from "./extra-review-parsers.mts";
+import type { StructuredResultStageId } from "./structured-result-contracts.mts";
 import type {
   CodeQualityExtraReviewParseResult,
   ExtraReviewParseFailure,
@@ -143,7 +150,12 @@ export type ExtraReviewSandboxFactory = (
 export type ExtraReviewAgentFactory = (
   model: string,
   agentName?: string,
+  session?: ExtraReviewSessionKind,
 ) => unknown;
+
+export type ExtraReviewResultAcquisition =
+  | "tagged_stdout"
+  | "structured_result_file";
 
 export interface ExtraReviewSessionAgentEntry {
   agentName: string;
@@ -178,6 +190,8 @@ export interface RunSequentialExtraReviewSessionsInput {
   hooks?: unknown;
   createSandbox: ExtraReviewSandboxFactory;
   createAgent: ExtraReviewAgentFactory;
+  /** Frozen callers retain tagged stdout; MCP-wired runners opt in explicitly. */
+  resultAcquisition?: ExtraReviewResultAcquisition;
   /**
    * Per-session definition overrides. Any kind omitted falls back to the GLM
    * default (EXTRA_CODE_REVIEW_SESSION / EXTRA_TWO_AXIS_REVIEW_SESSION /
@@ -250,6 +264,7 @@ export async function runSequentialExtraReviewSessions(
   const readDirtyStatus = input.readDirtyStatus ?? readGitDirtyStatus;
   const logger = input.logger ?? console;
   const maxAcquisitionAttempts = input.maxAcquisitionAttempts ?? 1;
+  const resultAcquisition = input.resultAcquisition ?? "tagged_stdout";
 
   const definitions: Record<ExtraReviewSessionKind, ExtraReviewSessionDefinition> = {
     code_quality:
@@ -314,6 +329,7 @@ export async function runSequentialExtraReviewSessions(
           attempt,
           maxAcquisitionAttempts,
         ),
+        resultAcquisition,
         onAgentSession: input.onAgentSession,
       });
     },
@@ -349,6 +365,7 @@ export async function runSequentialExtraReviewSessions(
           attempt,
           maxAcquisitionAttempts,
         ),
+        resultAcquisition,
         onAgentSession: input.onAgentSession,
       });
     },
@@ -392,6 +409,7 @@ export async function runSequentialExtraReviewSessions(
           attempt,
           maxAcquisitionAttempts,
         ),
+        resultAcquisition,
         onAgentSession: input.onAgentSession,
       });
     },
@@ -652,12 +670,16 @@ async function runCodeQualityReview(input: {
   idleTimeoutSeconds: number;
   promptArgs: Record<string, string>;
   definition: ExtraReviewSessionDefinition;
+  resultAcquisition: ExtraReviewResultAcquisition;
   onAgentSession?: RunSessionAgentHook;
 }): Promise<CodeReviewOutput> {
   const raw = await runSession(input, input.definition);
   return {
     raw,
-    parsed: parseCodeQualityExtraReview(raw),
+    parsed:
+      input.resultAcquisition === "structured_result_file"
+        ? readCodeQualityExtraReviewFromWorktree(input.sandbox.worktreePath)
+        : parseCodeQualityExtraReview(raw),
   };
 }
 
@@ -676,12 +698,16 @@ async function runTwoAxisReview(input: {
   idleTimeoutSeconds: number;
   promptArgs: Record<string, string>;
   definition: ExtraReviewSessionDefinition;
+  resultAcquisition: ExtraReviewResultAcquisition;
   onAgentSession?: RunSessionAgentHook;
 }): Promise<TwoAxisOutput> {
   const raw = await runSession(input, input.definition);
   return {
     raw,
-    parsed: parseTwoAxisExtraReview(raw),
+    parsed:
+      input.resultAcquisition === "structured_result_file"
+        ? readTwoAxisExtraReviewFromWorktree(input.sandbox.worktreePath)
+        : parseTwoAxisExtraReview(raw),
   };
 }
 
@@ -700,12 +726,16 @@ async function runIssueDecomposer(input: {
   idleTimeoutSeconds: number;
   promptArgs: Record<string, string>;
   definition: ExtraReviewSessionDefinition;
+  resultAcquisition: ExtraReviewResultAcquisition;
   onAgentSession?: RunSessionAgentHook;
 }): Promise<IssueDecomposerOutput> {
   const raw = await runSession(input, input.definition);
   return {
     raw,
-    parsed: parseFollowupIssues(raw),
+    parsed:
+      input.resultAcquisition === "structured_result_file"
+        ? readFollowupIssuesFromWorktree(input.sandbox.worktreePath)
+        : parseFollowupIssues(raw),
   };
 }
 
@@ -724,6 +754,7 @@ async function runSession(
     }) => void;
     idleTimeoutSeconds: number;
     promptArgs: Record<string, string>;
+    resultAcquisition: ExtraReviewResultAcquisition;
     onAgentSession?: RunSessionAgentHook;
   },
   definition: ExtraReviewSessionDefinition,
@@ -760,21 +791,48 @@ async function runSession(
       promptArgs: input.promptArgs,
       activeLogPath: workingLog?.activeLogPath,
     },
-    () =>
-      input.sandbox.run({
+    () => {
+      if (input.resultAcquisition === "structured_result_file") {
+        clearStructuredResultFromWorktree(
+          input.sandbox.worktreePath,
+          structuredResultStageForExtraReview(input.session),
+        );
+      }
+      return input.sandbox.run({
         name: definition.runName,
-        agent: input.createAgent(definition.model, input.agentEntry?.agentName),
-        maxIterations: definition.maxIterations,
-        // The extra-review prompts produce tagged JSON, so stop as soon as the
-        // closing tag arrives instead of letting the agent keep looping.
-        completionSignal: definition.completionSignal,
+        agent: input.createAgent(
+          definition.model,
+          input.agentEntry?.agentName,
+          input.session,
+        ),
+        maxIterations:
+          input.resultAcquisition === "structured_result_file"
+            ? 1
+            : definition.maxIterations,
+        ...(input.resultAcquisition === "tagged_stdout"
+          ? { completionSignal: definition.completionSignal }
+          : {}),
         idleTimeoutSeconds: input.idleTimeoutSeconds,
         promptFile,
         promptArgs: input.promptArgs,
         logging: workingLog?.logging,
-      }),
+      });
+    },
   );
   return result.stdout;
+}
+
+function structuredResultStageForExtraReview(
+  session: ExtraReviewSessionKind,
+): StructuredResultStageId {
+  switch (session) {
+    case "code_quality":
+      return "code_quality_extra_review";
+    case "two_axis":
+      return "two_axis_extra_review";
+    case "issue_decomposer":
+      return "followup_issues";
+  }
 }
 
 async function runSessionWithAcquisitionRetries<Output extends { raw: string; parsed: unknown }>(input: {

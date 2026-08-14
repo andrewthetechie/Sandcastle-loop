@@ -1,4 +1,5 @@
 import { preview } from "./extra-review-parser-utils.mts";
+import { validateRebaseAgentResult } from "./structured-result-validators.mts";
 
 export interface RebaseAgentResult {
   kind: "rebase_result";
@@ -25,67 +26,14 @@ export function parseRebaseAgentResult(stdout: string):
   } catch (error) {
     return { ok: false, diagnostics: [`Malformed rebase result JSON: ${error instanceof Error ? error.message : String(error)}`] };
   }
-  if (!isRecord(value)) return { ok: false, diagnostics: ["Rebase result must be a JSON object."] };
-  const keys = [
-    "kind", "outcome", "pre_rebase_sha", "target_mainline_sha", "rebased_sha",
-    "conflicted_files", "resolution_summaries", "validation", "diagnostics",
-  ];
-  if (Object.keys(value).length !== keys.length || keys.some((key) => !(key in value))) {
-    return { ok: false, diagnostics: ["Rebase result must contain exactly the required keys."] };
-  }
-  const string = (key: string): string | undefined =>
-    typeof value[key] === "string" ? value[key] as string : undefined;
-  const array = (key: string): string[] | undefined =>
-    Array.isArray(value[key]) && (value[key] as unknown[]).every((item) => typeof item === "string")
-      ? value[key] as string[]
-      : undefined;
-  const kind = string("kind");
-  const outcome = string("outcome");
-  const pre = string("pre_rebase_sha");
-  const target = string("target_mainline_sha");
-  const rebased = string("rebased_sha");
-  const conflicted = array("conflicted_files");
-  const summaries = array("resolution_summaries");
-  const validation = array("validation");
-  const diagnostics = array("diagnostics");
-  if (
-    kind !== "rebase_result" ||
-    (outcome !== "resolved" && outcome !== "unresolved") ||
-    !isSha(pre) ||
-    !isSha(target) ||
-    rebased === undefined ||
-    !conflicted || !summaries || !validation || !diagnostics
-  ) {
-    return { ok: false, diagnostics: [`Invalid rebase result: ${preview(stdout, 400)}`] };
-  }
-  if (
-    outcome === "resolved" &&
-    (!isSha(rebased) || conflicted.length === 0 || summaries.length === 0 || validation.length === 0)
-  ) {
+  const validated = validateRebaseAgentResult(value);
+  if (!validated.ok) {
     return {
       ok: false,
-      diagnostics: [
-        "Resolved rebase result needs a rebased SHA, conflicted files, resolution summaries, and validation results.",
-      ],
+      diagnostics: validated.errors.map((error) => error.message).length > 0
+        ? validated.errors.map((error) => error.message)
+        : [`Invalid rebase result: ${preview(stdout, 400)}`],
     };
   }
-  if (outcome === "unresolved" && (rebased !== "" || diagnostics.length === 0)) {
-    return { ok: false, diagnostics: ["Unresolved rebase result needs empty rebased_sha and diagnostics."] };
-  }
-  return {
-    ok: true,
-    result: {
-      kind, outcome, pre_rebase_sha: pre, target_mainline_sha: target,
-      rebased_sha: rebased, conflicted_files: conflicted,
-      resolution_summaries: summaries, validation, diagnostics,
-    },
-  };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isSha(value: string | undefined): value is string {
-  return value !== undefined && /^[0-9a-f]{40}$/iu.test(value);
+  return { ok: true, result: validated.canonical };
 }

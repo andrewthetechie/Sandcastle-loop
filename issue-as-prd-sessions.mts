@@ -4,6 +4,7 @@ import {
   type InitialDecompositionAcquisition,
   type InitialIssueDecomposition,
   type InitialIssueDecompositionParseFailure,
+  type IssueAsPrdParseFailure,
   type SubtaskReadinessAcquisition,
   type SubtaskReadinessParseFailure,
   type SubtaskReadinessResult,
@@ -11,11 +12,6 @@ import {
   type SubtaskImprovementParseFailure,
   type SubtaskImprovementResult,
 } from "./issue-as-prd-contracts.mts";
-import {
-  parseInitialIssueDecomposition,
-  parseSubtaskReadiness,
-  parseSubtaskImprovement,
-} from "./issue-as-prd-parsers.mts";
 import {
   recordMeasuredAgentRun,
   type RecordMeasuredAgentRunDeps,
@@ -27,6 +23,12 @@ export const INITIAL_ISSUE_DECOMPOSER_STAGE = "initial_issue_decomposer";
 export const SUBTASK_READINESS_STAGE = "subtask_readiness";
 export const SUBTASK_IMPROVEMENT_STAGE = "subtask_improvement";
 export const ISSUE_AS_PRD_MAX_ATTEMPTS = 2;
+// OpenCode performs its own model/tool loop inside one invocation. Structured
+// result files replace the old cross-invocation closing-tag signal, so a second
+// Sandcastle iteration would only repeat an already completed agent session.
+export const INITIAL_ISSUE_DECOMPOSER_MAX_ITERATIONS = 1;
+export const REBASE_MAX_ITERATIONS = 1;
+export const SUBTASK_IMPROVEMENT_MAX_ITERATIONS = 1;
 
 export const INITIAL_ISSUE_DECOMPOSER_USER_PROMPT_FILE =
   fileURLToPath(new URL("./initial-issue-decomposer-user-prompt-prd.md", import.meta.url));
@@ -50,7 +52,7 @@ export function extractSingleTaggedOutput(
 }
 
 export interface IssueAsPrdAttemptResult {
-  stdout: string;
+  parsed: unknown;
 }
 
 export interface AcquireInitialDecompositionInput {
@@ -109,7 +111,6 @@ export async function acquireInitialDecomposition(
         )),
     measuredRunDeps: input.measuredRunDeps,
     runAttempt: input.runAttempt,
-    parse: parseInitialIssueDecomposition,
     accept(result, artifact, diagnostics) {
       if (result.status === "needs_human_review") {
         const detail = [
@@ -152,7 +153,6 @@ export async function acquireSubtaskReadiness(
         subtaskReadinessWorkingLogPath(input.childIssueNumber, attempt)),
     measuredRunDeps: input.measuredRunDeps,
     runAttempt: input.runAttempt,
-    parse: parseSubtaskReadiness,
     accept(result) {
       return { accept: true, result };
     },
@@ -180,7 +180,6 @@ export async function acquireSubtaskImprovement(
       ((attempt) => subtaskImprovementWorkingLogPath(input.childIssueNumber, attempt)),
     measuredRunDeps: input.measuredRunDeps,
     runAttempt: input.runAttempt,
-    parse: parseSubtaskImprovement,
     accept(result, artifact, diagnostics) {
       const resultDiagnostics = input.validateResult?.(result) ?? [];
       if (resultDiagnostics.length > 0) {
@@ -269,7 +268,6 @@ async function acquireWithRetries<
   workingLogPathForAttempt(attempt: 1 | 2): string | undefined;
   measuredRunDeps?: RecordMeasuredAgentRunDeps;
   runAttempt(attempt: 1 | 2): Promise<IssueAsPrdAttemptResult>;
-  parse(stdout: string): Result | ParseFailure;
   accept(
     result: Result,
     artifact: AgentAttemptArtifact,
@@ -311,19 +309,14 @@ async function acquireWithRetries<
 
       const artifact: AgentAttemptArtifact = {
         attempt,
-        stdout: runResult.stdout,
+        stdout: "",
         diagnostics: [],
         logFilePath,
       };
       artifacts.push(artifact);
 
-      const parsed = input.parse(runResult.stdout);
-      if (
-        typeof parsed === "object" &&
-        parsed !== null &&
-        "kind" in parsed &&
-        parsed.kind === "parse_failure"
-      ) {
+      const parsed = runResult.parsed;
+      if (isIssueAsPrdParseFailure(parsed)) {
         const detail = summarizeParseFailure(parsed.parse_failure);
         artifact.diagnostics.push(detail);
         diagnostics.push(detail);
@@ -360,6 +353,18 @@ async function acquireWithRetries<
     artifacts: [artifacts[0]!, artifacts[1]!],
     diagnostics,
   };
+}
+
+function isIssueAsPrdParseFailure(
+  value: unknown,
+): value is { kind: "parse_failure"; parse_failure: IssueAsPrdParseFailure } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "kind" in value &&
+    value.kind === "parse_failure" &&
+    "parse_failure" in value
+  );
 }
 
 function summarizeParseFailure(input: {

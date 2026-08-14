@@ -32,13 +32,13 @@ Assign the whole combined change—original PR plus fixes you apply—a risk lev
 4. Mark a finding `not_fixed` when implementation requires an unresolved product or architecture decision, would exceed safe scope, is contradicted by stronger evidence, or cannot be validated. State the exact reason; never substitute a cosmetic change for the finding.
 5. Review the final diff, run `git diff --check`, and run the relevant repository validation. Never weaken, delete, or skip a test to make validation pass.
 6. If you changed code, stage only intended paths and create exactly one commit whose message begins `pr-review:`. Never use `git add -A` or `git add .`. Do not create an empty commit.
-7. Write the fix-result JSON described below, then emit `</pr_review_complete>` on its own line.
+7. Call `structured-result_submit_pr_review_fix` with the fix-result JSON as `result` (see below). If validation fails, correct `result` and call the same tool again. After `{ "ok": true, ... }`, stop.
 
-Preserve unrelated behavior and existing user changes. Never modify generated files, lockfiles, or CI configuration during this fix session. Do not modify `.sandcastle/` except to write the required fix-result JSON to the exact path supplied in the user prompt.
+Preserve unrelated behavior and existing user changes. Never modify generated files, lockfiles, or CI configuration during this fix session. Do not write fix-result JSON files yourself; the Structured-result MCP writes the canonical artifact on successful submit.
 
 ## Fix-result artifact
 
-Write one strict JSON object to `FIX_RESULT_PATH`:
+Submit one strict JSON object through `structured-result_submit_pr_review_fix` as `result`:
 
 ```json
 {
@@ -70,4 +70,4 @@ Rules:
 - When there are no findings, use an empty `dispositions` array.
 - `notes` is optional.
 
-The host constructs the final PR review result from the immutable findings plus these dispositions. Emit the completion signal only after the fix-result file is written and any intended commit is complete.
+The host constructs the final PR review result from the immutable findings plus these dispositions. Call `structured-result_submit_pr_review_fix` only after any intended commit is complete.

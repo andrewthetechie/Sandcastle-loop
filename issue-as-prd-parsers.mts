@@ -274,7 +274,7 @@ function parseStrictTaggedJsonObject(
   return { value, rawJson };
 }
 
-function parseInitialIssueDecompositionObject(
+export function parseInitialIssueDecompositionObject(
   value: JsonRecord,
   details: IssueAsPrdParseFailureDetail[],
 ): InitialIssueDecomposition | null {
@@ -348,7 +348,7 @@ function parseInitialIssueDecompositionObject(
   };
 }
 
-function parseSubtaskReadinessObject(
+export function parseSubtaskReadinessObject(
   value: JsonRecord,
   details: IssueAsPrdParseFailureDetail[],
 ): SubtaskReadinessResult | null {
@@ -410,7 +410,7 @@ function parseSubtaskReadinessObject(
   };
 }
 
-function parseSubtaskImprovementObject(
+export function parseSubtaskImprovementObject(
   value: JsonRecord,
   details: IssueAsPrdParseFailureDetail[],
 ): SubtaskImprovementResult | null {

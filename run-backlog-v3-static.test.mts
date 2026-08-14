@@ -5,7 +5,8 @@ import { test } from "node:test";
 const source = readFileSync(new URL("./run-backlog-v3.mts", import.meta.url), "utf8");
 const prdV4Path = new URL("./run-prd-v4.mts", import.meta.url);
 const prdV4 = existsSync(prdV4Path) ? readFileSync(prdV4Path, "utf8") : undefined;
-const backlogV2 = readFileSync(new URL("./run-backlog-v2.mts", import.meta.url), "utf8");
+const backlogV2Path = new URL("./run-backlog-v2.mts", import.meta.url);
+const backlogV2 = existsSync(backlogV2Path) ? readFileSync(backlogV2Path, "utf8") : undefined;
 
 test("backlog-v3 routes the outer loop through Issue-as-PRD acquisition and orchestrator processing", () => {
   assert.match(source, /async function acquireNextIssueAsPrdParentForLoop\(/);
@@ -130,6 +131,16 @@ test("backlog-v3 recovers a canonical tagged result from the current agent log",
   assert.match(source, /if \(recoveredOutput\) return \{ stdout: recoveredOutput \};/);
 });
 
+test("backlog-v3 gives Issue-as-PRD prompt sessions tool-use iteration budgets", () => {
+  assert.match(source, /SUBTASK_IMPROVEMENT_MAX_ITERATIONS/);
+  assert.match(source, /INITIAL_ISSUE_DECOMPOSER_MAX_ITERATIONS/);
+  assert.match(source, /REBASE_MAX_ITERATIONS/);
+  assert.match(
+    source,
+    /maxIterations:\s*input\.stage === "subtask_improvement"\s*\?\s*SUBTASK_IMPROVEMENT_MAX_ITERATIONS\s*:\s*input\.stage === "rebase"\s*\?\s*REBASE_MAX_ITERATIONS\s*:\s*INITIAL_ISSUE_DECOMPOSER_MAX_ITERATIONS,/s,
+  );
+});
+
 test("backlog-v3 switches the TUI ticket between parent and child work", () => {
   assert.match(
     source,
@@ -203,6 +214,23 @@ test("backlog-v3 removes publication-time readiness and refreshes after every du
   assert.doesNotMatch(source, /client\.closeIssue\(\s*parent\.number/);
 });
 
+test("backlog-v3 publishes terminal accumulation heads against the observed remote tip", () => {
+  assert.match(source, /function publishTerminalAccumulationHead\(/);
+  assert.match(source, /publishTerminalAccumulationHead\(\{\s*accumulationBranch: currentState\.accumulationBranch,/s);
+  assert.doesNotMatch(
+    source,
+    /expectedRemoteSha:\s*deliveryHeadSha/,
+  );
+  assert.doesNotMatch(
+    source,
+    /expectedRemoteSha:\s*failedHeadSha/,
+  );
+  assert.match(
+    source,
+    /expectedRemoteSha:\s*remoteHeadSha/,
+  );
+});
+
 test("backlog-v3 accepts --no-pr flag", () => {
   assert.match(source, /--no-pr/);
   assert.match(source, /import \{ hasFlag, readCliStringFlag \} from "\.\/cli-string-flag\.mts";/);
@@ -243,6 +271,8 @@ test("older runners remain outside the Issue-as-PRD outer-loop wiring", () => {
     assert.doesNotMatch(prdV4, /runIssueAsPrdParent\(/);
     assert.doesNotMatch(prdV4, /acquireNextIssueAsPrdParentForLoop\(/);
   }
-  assert.doesNotMatch(backlogV2, /runIssueAsPrdParent\(/);
-  assert.doesNotMatch(backlogV2, /acquireNextIssueAsPrdParentForLoop\(/);
+  if (backlogV2) {
+    assert.doesNotMatch(backlogV2, /runIssueAsPrdParent\(/);
+    assert.doesNotMatch(backlogV2, /acquireNextIssueAsPrdParentForLoop\(/);
+  }
 });

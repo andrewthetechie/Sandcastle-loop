@@ -122,7 +122,7 @@ export function parseFollowupIssues(
   return issues;
 }
 
-function parseCodeQualityReviewObject(
+export function parseCodeQualityReviewObject(
   value: JsonRecord,
   details: ParseFailureDetail[],
 ): CodeQualityExtraReview | null {
@@ -167,7 +167,7 @@ function parseCodeQualityReviewObject(
   };
 }
 
-function parseTwoAxisReviewObject(
+export function parseTwoAxisReviewObject(
   value: JsonRecord,
   details: ParseFailureDetail[],
 ): TwoAxisExtraReview | null {
@@ -237,7 +237,7 @@ function parseTwoAxisReviewObject(
   };
 }
 
-function parseFollowupIssuesObject(
+export function parseFollowupIssuesObject(
   value: JsonRecord,
   details: ParseFailureDetail[],
 ): FollowupIssues | null {

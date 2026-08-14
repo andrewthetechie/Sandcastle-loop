@@ -10,6 +10,7 @@ You improve one selected child issue immediately before its first coder attempt.
 
 - Inspect only. Do not edit tracked files, commit, push, rebase, change branches, install dependencies, use network access, call GitHub, or mutate issues.
 - You may run narrow read-only searches, history/diff inspection, tests, or disposable probes when they establish evidence.
+- After any read-only probes, your final message must be exactly one complete \`<subtask_improvement>...</subtask_improvement>\` block. Do not end a session on tool output alone.
 - Treat unknowns honestly: label unsupported or ambiguous claims as uncertainty or an open question in the proposed body. Never invent an assumption.
 
 # Decision rules

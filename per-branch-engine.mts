@@ -102,7 +102,7 @@ export interface EngineReviewContext {
 }
 
 interface EngineReviewerAcquisitionBase {
-  resultSource: "stdout" | "run_log" | "none";
+  resultSource: "stdout" | "run_log" | "structured_result_file" | "none";
   logFallbackUsed: boolean;
   logFilePath?: string;
   diagnostics: string[];
@@ -933,7 +933,7 @@ function formatReviewerAcquisitionFeedback(input: {
   candidateHeadSha: string;
   candidateTreeSha: string;
   logFilePath?: string;
-  resultSource: "stdout" | "run_log" | "none";
+  resultSource: "stdout" | "run_log" | "structured_result_file" | "none";
   failureCode: string;
   excerpt: string;
   diagnostics: string[];

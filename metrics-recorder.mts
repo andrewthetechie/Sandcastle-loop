@@ -251,7 +251,7 @@ export interface ReviewerResultMetadata {
     | "needs_human_review"
     | "parse_failed"
     | "incomplete";
-  resultSource: "stdout" | "run_log" | "none";
+  resultSource: "stdout" | "run_log" | "structured_result_file" | "none";
   logFallbackUsed: boolean;
   logFilePath?: string;
   parseFailureCode?: string;

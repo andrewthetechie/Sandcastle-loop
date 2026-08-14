@@ -36,6 +36,8 @@ import {
   ensureSandboxGitExclude,
   writeAgentDefinitionFile,
 } from "./custom-agent-worktree.mts";
+import { installStructuredResultMcp } from "./structured-result-mcp-install.mts";
+import { withStructuredResultMcpAgent } from "./structured-result-agent-provider.mts";
 import { EXTRA_REVIEW_INPUT_DIFF_EXCLUDES } from "./extra-review-inputs.mts";
 import {
   writePrReviewInputs,
@@ -47,13 +49,16 @@ import { discoverPrReviewStandardsFiles } from "./pr-review-context.mts";
 import {
   buildPrReviewResult,
   combinePrReviewFindings,
-  parsePrReviewFixResult,
-  parseSpecReview,
-  parseStandardsReview,
   type PrReviewSpecialistParseResult,
   type SpecReview,
   type StandardsReview,
 } from "./pr-review-specialists.mts";
+import {
+  clearStructuredResultFromWorktree,
+  readPrReviewFixResultFromWorktree,
+  readSpecReviewFromWorktree,
+  readStandardsReviewFromWorktree,
+} from "./structured-result-acquisition.mts";
 import { loadSandcastleLoopConfig } from "./sandcastle-loop-config.mts";
 import { hasFlag, readCliStringFlag } from "./cli-string-flag.mts";
 import { recordMeasuredAgentRun } from "./metrics-recorder.mts";
@@ -194,10 +199,10 @@ if (idleRaw !== undefined) {
   idleTimeoutSeconds = parsed;
 }
 
-// Each specialist gets an independent bounded session. The fresh fixer gets a
-// larger budget to verify immutable findings, edit, validate, and commit.
-const PR_REVIEW_MAX_ITERATIONS = 20;
-const PR_SPECIALIST_MAX_ITERATIONS = 15;
+// OpenCode owns the model/tool loop inside one invocation. MCP submission no
+// longer emits the chat closing tags Sandcastle previously used between runs.
+const PR_REVIEW_MAX_ITERATIONS = 1;
+const PR_SPECIALIST_MAX_ITERATIONS = 1;
 const PR_SPECIALIST_MAX_ATTEMPTS = 2;
 
 // Max push recovery attempts for the PR branch.
@@ -912,8 +917,7 @@ async function acquirePrReviewSpecialist<T>(input: {
   model: string;
   promptFile: string;
   promptArgs: Record<string, string>;
-  completionSignal: string;
-  parse: (stdout: string) => PrReviewSpecialistParseResult<T>;
+  prReviewRelativeDir: string;
 }): Promise<{ review: T; raw: string }> {
   const rendered = renderSlimMessage(
     readFileSync(input.promptFile, "utf8"),
@@ -932,6 +936,14 @@ async function acquirePrReviewSpecialist<T>(input: {
       `  invoking ${input.kind} specialist attempt ${attempt}/${PR_SPECIALIST_MAX_ATTEMPTS} (model: ${input.model})`,
     );
     try {
+      const stageId = input.kind === "standards"
+        ? "standards_findings"
+        : "spec_findings";
+      clearStructuredResultFromWorktree(
+        input.sandbox.worktreePath,
+        stageId,
+        { prReviewRelativeDir: input.prReviewRelativeDir },
+      );
       const result = await recordMeasuredAgentRun<{
         stdout: string;
         commits?: unknown[];
@@ -951,11 +963,15 @@ async function acquirePrReviewSpecialist<T>(input: {
         () =>
           input.sandbox.run({
             name: runName,
-            agent: sandcastle.opencode(input.model, {
-              agent: input.agentName,
-            }),
+            agent: withStructuredResultMcpAgent(
+              sandcastle.opencode(input.model, {
+                agent: input.agentName,
+              }),
+              {
+                prReviewRelativeDir: input.prReviewRelativeDir,
+              },
+            ),
             maxIterations: PR_SPECIALIST_MAX_ITERATIONS,
-            completionSignal: input.completionSignal,
             idleTimeoutSeconds,
             promptFile: input.promptFile,
             promptArgs: input.promptArgs,
@@ -970,9 +986,24 @@ async function acquirePrReviewSpecialist<T>(input: {
         failures.push(`attempt ${attempt}: read-only specialist produced a commit`);
         continue;
       }
-      const parsed = input.parse(result.stdout);
+      if (input.kind === "standards") {
+        const parsed = readStandardsReviewFromWorktree(input.sandbox.worktreePath, {
+          prReviewRelativeDir: input.prReviewRelativeDir,
+        });
+        if (parsed.kind === "review") {
+          return { review: parsed.review as T, raw: result.stdout };
+        }
+        if (parsed.kind === "blocked") {
+          throw new Error(`${input.kind} review blocked: ${parsed.summary}`);
+        }
+        failures.push(`attempt ${attempt}: ${parsed.message}`);
+        continue;
+      }
+      const parsed = readSpecReviewFromWorktree(input.sandbox.worktreePath, {
+        prReviewRelativeDir: input.prReviewRelativeDir,
+      });
       if (parsed.kind === "review") {
-        return { review: parsed.review, raw: result.stdout };
+        return { review: parsed.review as T, raw: result.stdout };
       }
       if (parsed.kind === "blocked") {
         throw new Error(`${input.kind} review blocked: ${parsed.summary}`);
@@ -1124,6 +1155,7 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       sandbox.worktreePath,
       reviewInputData,
     );
+    installStructuredResultMcp(sandbox.worktreePath);
     console.log(
       `  review inputs written to ${reviewInputs.relativeDir} (${reviewContext.diffBytes} bytes diff)`,
     );
@@ -1154,8 +1186,7 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
         ...sharedReviewArgs,
         STANDARDS_FILES_PATH: reviewInputs.paths.standardsFiles,
       },
-      completionSignal: "</standards_findings>",
-      parse: parseStandardsReview,
+      prReviewRelativeDir: reviewInputs.relativeDir,
     });
 
     const specAcquisition = await acquirePrReviewSpecialist<SpecReview>({
@@ -1171,8 +1202,7 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
         PR_BODY_PATH: reviewInputs.paths.prBody,
         LINKED_ISSUES_PATH: reviewInputs.paths.linkedIssues,
       },
-      completionSignal: "</spec_findings>",
-      parse: parseSpecReview,
+      prReviewRelativeDir: reviewInputs.relativeDir,
     });
 
     const standardsReview = standardsAcquisition.review;
@@ -1218,6 +1248,11 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
     const runName = `pr-review #${pr.number}`;
     const activeLogPath = tuiWorkingLogPath(runName);
     console.log(`  invoking pr-review fixer (model: ${PR_FIXER_MODEL})`);
+    clearStructuredResultFromWorktree(
+      sandbox.worktreePath,
+      "pr_review_fix",
+      { prReviewRelativeDir: reviewInputs.relativeDir },
+    );
 
     // sandcastle.opencode run result carries a commits array.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1237,11 +1272,15 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
       () =>
         sandbox.run({
           name: runName,
-          agent: sandcastle.opencode(PR_FIXER_MODEL, {
-            agent: PR_REVIEW_AGENT_CONFIG.name,
-          }),
+          agent: withStructuredResultMcpAgent(
+            sandcastle.opencode(PR_FIXER_MODEL, {
+              agent: PR_REVIEW_AGENT_CONFIG.name,
+            }),
+            {
+              prReviewRelativeDir: reviewInputs.relativeDir,
+            },
+          ),
           maxIterations: PR_REVIEW_MAX_ITERATIONS,
-          completionSignal: "</pr_review_complete>",
           idleTimeoutSeconds,
           promptFile: PR_REVIEW_USER_PROMPT_FILE,
           promptArgs: userArgs,
@@ -1270,17 +1309,10 @@ async function processPr(pr: PrDetail): Promise<{ outcome: string }> {
     // Read the fixer dispositions, verify that every immutable specialist
     // finding is accounted for exactly once, then write the host-owned result.
     console.log(`  reading fix result artifact ${outputPaths.fixResult}`);
-    let fixResultRaw: string;
-    try {
-      fixResultRaw = readFileSync(
-        join(sandbox.worktreePath, outputPaths.fixResult),
-        "utf8",
-      );
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`Could not read PR review fix result artifact: ${message}`);
-    }
-    const parsedFixResult = parsePrReviewFixResult(fixResultRaw);
+    const parsedFixResult = readPrReviewFixResultFromWorktree(
+      sandbox.worktreePath,
+      { prReviewRelativeDir: reviewInputs.relativeDir },
+    );
     if (parsedFixResult.kind !== "fix_result") {
       throw new Error(
         `Invalid PR review fix result artifact: ${parsedFixResult.message}`,

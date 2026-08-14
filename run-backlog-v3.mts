@@ -41,8 +41,11 @@ import { enforceArgvSizeLimit } from "./custom-agent-argv-guard.mts";
 import { renderSlimMessage } from "./custom-agent-render.mts";
 import {
   ensureOpencodeGitExclude,
+  ensureSandboxGitExclude,
   writeAgentDefinitionFile,
 } from "./custom-agent-worktree.mts";
+import { installStructuredResultMcp } from "./structured-result-mcp-install.mts";
+import { withStructuredResultMcpAgent } from "./structured-result-agent-provider.mts";
 import { EXTRA_REVIEW_INPUT_DIFF_EXCLUDES } from "./extra-review-inputs.mts";
 import {
   writeCompletedBranchReviewInputs,
@@ -142,13 +145,15 @@ import { tuiWorkingLogPath } from "./tui-status.mts";
 import type { ObservedParentRecoveryState } from "./issue-as-prd-state-contracts.mts";
 import { splitQueueChildren } from "./backlog-v3-issue-as-prd-recovery-state.mts";
 import {
+  INITIAL_ISSUE_DECOMPOSER_MAX_ITERATIONS,
   INITIAL_ISSUE_DECOMPOSER_USER_PROMPT_FILE,
+  REBASE_MAX_ITERATIONS,
+  SUBTASK_IMPROVEMENT_MAX_ITERATIONS,
   SUBTASK_IMPROVEMENT_USER_PROMPT_FILE,
   acquireInitialDecomposition,
   acquireSubtaskImprovement,
   buildInitialIssueDecomposerRunName,
   buildSubtaskImprovementRunName,
-  extractSingleTaggedOutput,
 } from "./issue-as-prd-sessions.mts";
 import {
   improveSubtaskJustInTime,
@@ -159,7 +164,12 @@ import { runAggregateValidation } from "./issue-as-prd-validation.mts";
 import { runIssueAsPrdExtraReview } from "./issue-as-prd-extra-review.mts";
 import { runIssueAsPrdParent } from "./issue-as-prd-orchestrator.mts";
 import { runVerifiedHostMutation } from "./verified-host-mutation.mts";
-import { parseRebaseAgentResult } from "./rebase-agent-result.mts";
+import {
+  clearStructuredResultFromWorktree,
+  readInitialIssueDecompositionFromWorktree,
+  readRebaseAgentResultFromWorktree,
+  readSubtaskImprovementFromWorktree,
+} from "./structured-result-acquisition.mts";
 import {
   recoverMainlineRefreshJournal,
   refreshAccumulationContinuously,
@@ -1267,7 +1277,7 @@ async function runIssueAsPrdPromptSession(input: {
   model: string;
   promptFile: string;
   promptArgs: Record<string, string>;
-}): Promise<{ stdout: string }> {
+}): Promise<{ parsed: unknown }> {
   const agentDefinition = promptAgentDefinition(input.stage);
   const sandbox = await sandcastle.createSandbox({
     sandbox: dockerSandboxProvider(),
@@ -1277,6 +1287,8 @@ async function runIssueAsPrdPromptSession(input: {
     hooks: sandboxReadyHooks(),
   });
   ensureOpencodeGitExclude(sandbox.worktreePath);
+  ensureSandboxGitExclude(sandbox.worktreePath);
+  installStructuredResultMcp(sandbox.worktreePath);
   writeAgentDefinitionFile(
     sandbox.worktreePath,
     agentDefinition.config.name,
@@ -1292,20 +1304,29 @@ async function runIssueAsPrdPromptSession(input: {
 
   const activeLogPath = tuiWorkingLogPath(input.runName);
   const sessionLogPath = agentRunLogPath(input.branch, input.runName);
-  const outputTag = input.stage === "initial_issue_decomposer"
+  const structuredResultStage = input.stage === "initial_issue_decomposer"
     ? "initial_issue_decomposition"
     : input.stage === "subtask_improvement"
         ? "subtask_improvement"
         : "rebase_result";
   try {
-    const result = await sandbox.run({
+    clearStructuredResultFromWorktree(
+      sandbox.worktreePath,
+      structuredResultStage,
+    );
+    await sandbox.run({
       name: input.runName,
-      agent: sandcastle.opencode(input.model, {
-        agent: agentDefinition.config.name,
-      }),
-      maxIterations: 1,
-      completionSignal:
-        `</${outputTag}>`,
+      agent: withStructuredResultMcpAgent(
+        sandcastle.opencode(input.model, {
+          agent: agentDefinition.config.name,
+        }),
+      ),
+      maxIterations:
+        input.stage === "subtask_improvement"
+          ? SUBTASK_IMPROVEMENT_MAX_ITERATIONS
+          : input.stage === "rebase"
+            ? REBASE_MAX_ITERATIONS
+            : INITIAL_ISSUE_DECOMPOSER_MAX_ITERATIONS,
       idleTimeoutSeconds,
       promptFile: input.promptFile,
       promptArgs: input.promptArgs,
@@ -1315,11 +1336,13 @@ async function runIssueAsPrdPromptSession(input: {
         onAgentStreamEvent: tuiEmitter.workingLogSink(activeLogPath),
       },
     });
-    const recoveredOutput = existsSync(sessionLogPath)
-      ? extractSingleTaggedOutput(readFileSync(sessionLogPath, "utf8"), outputTag)
-      : undefined;
-    if (recoveredOutput) return { stdout: recoveredOutput };
-    return { stdout: result.stdout };
+    const parsed =
+      input.stage === "initial_issue_decomposer"
+        ? readInitialIssueDecompositionFromWorktree(sandbox.worktreePath)
+        : input.stage === "subtask_improvement"
+          ? readSubtaskImprovementFromWorktree(sandbox.worktreePath)
+          : readRebaseAgentResultFromWorktree(sandbox.worktreePath);
+    return { parsed };
   } finally {
     await sandbox.close();
   }
@@ -1831,7 +1854,7 @@ function formatReviewerAcquisitionFeedback(input: {
   candidateHeadSha: string;
   candidateTreeSha: string;
   logFilePath?: string;
-  resultSource: "stdout" | "run_log" | "none";
+  resultSource: "stdout" | "run_log" | "structured_result_file" | "none";
   failureCode: string;
   excerpt: string;
   diagnostics: string[];
@@ -2458,6 +2481,8 @@ async function runBacklogIssueViaSharedEngine(input: {
     },
   });
   ensureOpencodeGitExclude(sandbox.worktreePath);
+  ensureSandboxGitExclude(sandbox.worktreePath);
+  installStructuredResultMcp(sandbox.worktreePath);
 
   let roundsUsed = 0;
   let sandboxClosedByEngine = false;
@@ -2941,6 +2966,10 @@ async function runBacklogIssueViaSharedEngine(input: {
             input.attempt,
           );
           const reviewerActiveLogPath = tuiWorkingLogPath(reviewerRunName);
+          clearStructuredResultFromWorktree(
+            sandbox.worktreePath,
+            "review",
+          );
           const reviewerResult: Awaited<ReturnType<typeof sandbox.run>> =
             await recordMeasuredAgentRun(
             {
@@ -2959,11 +2988,12 @@ async function runBacklogIssueViaSharedEngine(input: {
             () =>
               sandbox.run({
                 name: reviewerRunName,
-                agent: sandcastle.opencode(REVIEWER_MODEL, {
-                  agent: REVIEWER_AGENT_CONFIG.name,
-                }),
+                agent: withStructuredResultMcpAgent(
+                  sandcastle.opencode(REVIEWER_MODEL, {
+                    agent: REVIEWER_AGENT_CONFIG.name,
+                  }),
+                ),
                 maxIterations: 1,
-                completionSignal: "</review>",
                 idleTimeoutSeconds,
                 promptFile: REVIEWER_USER_PROMPT_FILE,
                 promptArgs: reviewerUserArgs,
@@ -2982,17 +3012,8 @@ async function runBacklogIssueViaSharedEngine(input: {
             typeof reviewerResult.logFilePath === "string"
               ? reviewerResult.logFilePath
               : undefined;
-          const runLogText =
-            logFilePath && existsSync(logFilePath)
-              ? readFileSync(logFilePath, "utf8")
-              : undefined;
           const acquisition = acquireReviewerResult({
-            stdout: reviewerResult.stdout,
-            runLogText,
-            runLogReadError:
-              logFilePath && !existsSync(logFilePath)
-                ? `missing log file at ${logFilePath}`
-                : undefined,
+            worktreePath: sandbox.worktreePath,
             logFilePath,
           });
           recordReviewerResult({
@@ -3016,7 +3037,9 @@ async function runBacklogIssueViaSharedEngine(input: {
           }
           return {
             ...acquisition,
-            excerpt: runLogText ?? reviewerResult.stdout,
+            excerpt: sanitizeReviewerExcerpt(
+              acquisition.diagnostics.join("\n") || reviewerResult.stdout,
+            ),
           } satisfies EngineReviewerAcquisitionResult;
         },
         currentHeadSha() {
@@ -3101,6 +3124,43 @@ function pushAccumulationBranchWithLease(input: {
     throw new Error(
       `Remote accumulation head mismatch for ${input.accumulationBranch}: expected ${input.expectedHeadSha}, observed ${verifiedRemote ?? "(missing)"}.`,
     );
+  }
+}
+
+// Terminal deliver/fail must publish the local accumulation tip using the
+// *observed* remote tip as the lease, not the tip being published. Leasing
+// against the local tip makes any unpushed rework a guaranteed lease reject
+// and previously crashed before stuck/deliver labels could apply.
+function publishTerminalAccumulationHead(input: {
+  accumulationBranch: string;
+}):
+  | { ok: true; headSha: string }
+  | { ok: false; headSha: string; diagnostics: string[] } {
+  const localHeadSha = git(["rev-parse", input.accumulationBranch]).trim();
+  const remoteHeadSha = readRemoteHead(input.accumulationBranch);
+  if (!remoteHeadSha) {
+    return {
+      ok: false,
+      headSha: localHeadSha,
+      diagnostics: [`Missing remote accumulation branch ${input.accumulationBranch}.`],
+    };
+  }
+  if (remoteHeadSha === localHeadSha) {
+    return { ok: true, headSha: localHeadSha };
+  }
+  try {
+    pushAccumulationBranchWithLease({
+      accumulationBranch: input.accumulationBranch,
+      expectedHeadSha: localHeadSha,
+      expectedRemoteSha: remoteHeadSha,
+    });
+    return { ok: true, headSha: localHeadSha };
+  } catch (err) {
+    return {
+      ok: false,
+      headSha: localHeadSha,
+      diagnostics: [err instanceof Error ? err.message : String(err)],
+    };
   }
 }
 
@@ -3554,7 +3614,7 @@ async function runMeasuredRebaseAgent(
       },
     },
   );
-  const parsed = parseRebaseAgentResult(agentRun.stdout);
+  const parsed = agentRun.parsed as ReturnType<typeof readRebaseAgentResultFromWorktree>;
   if (!parsed.ok) return { kind: "invalid", diagnostics: parsed.diagnostics };
   if (parsed.result.outcome === "unresolved") {
     return { kind: "unresolved", diagnostics: parsed.result.diagnostics };
@@ -4492,6 +4552,7 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
             runSequentialSessions: (sessionInput) =>
               runSequentialExtraReviewSessions({
                 ...sessionInput,
+                resultAcquisition: "structured_result_file",
                 sandboxBaseBranch: input.state.accumulationBranch,
                 idleTimeoutSeconds,
                 copyToWorktree: COPY_TO_WORKTREE,
@@ -4516,9 +4577,11 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
                     hooks: sandboxInput.hooks,
                   }),
                 createAgent: (model, agentName) =>
-                  agentName
-                    ? sandcastle.opencode(model, { agent: agentName })
-                    : sandcastle.opencode(model),
+                  withStructuredResultMcpAgent(
+                    agentName
+                      ? sandcastle.opencode(model, { agent: agentName })
+                      : sandcastle.opencode(model),
+                  ),
                 sessionAgents: {
                   code_quality: {
                     agentName: CODE_QUALITY_AGENT_CONFIG.name,
@@ -4535,6 +4598,8 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
                 },
                 writeAgentDefinition: ({ worktreePath, session, agentName }) => {
                   ensureOpencodeGitExclude(worktreePath);
+                  ensureSandboxGitExclude(worktreePath);
+                  installStructuredResultMcp(worktreePath);
                   const spec = {
                     code_quality: {
                       config: CODE_QUALITY_AGENT_CONFIG,
@@ -4643,12 +4708,15 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
       );
       return { stopLoop: true };
     }
-    const deliveryHeadSha = git(["rev-parse", currentState.accumulationBranch]).trim();
-    pushAccumulationBranchWithLease({
+    const published = publishTerminalAccumulationHead({
       accumulationBranch: currentState.accumulationBranch,
-      expectedHeadSha: deliveryHeadSha,
-      expectedRemoteSha: deliveryHeadSha,
     });
+    if (!published.ok) {
+      console.error(
+        `Terminal accumulation publish failed for parent #${parent.number}:\n${published.diagnostics.join("\n")}`,
+      );
+      return { stopLoop: true };
+    }
     await persistTerminalPhase("delivered");
     const add = terminal.labelPlan.add.filter((label) => !finalParent.labels.some((value) => value.name === label));
     const remove = terminal.labelPlan.remove.filter((label) => finalParent.labels.some((value) => value.name === label));
@@ -4751,12 +4819,14 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
     title: parent.title,
     branch: currentState.accumulationBranch,
   });
-  const failedHeadSha = git(["rev-parse", currentState.accumulationBranch]).trim();
-  pushAccumulationBranchWithLease({
+  const published = publishTerminalAccumulationHead({
     accumulationBranch: currentState.accumulationBranch,
-    expectedHeadSha: failedHeadSha,
-    expectedRemoteSha: failedHeadSha,
   });
+  if (!published.ok) {
+    console.warn(
+      `Terminal accumulation publish failed for stuck parent #${parent.number}; continuing with stuck labels.\n${published.diagnostics.join("\n")}`,
+    );
+  }
   await persistTerminalPhase("failed");
   const add = terminal.labelPlan.add.filter((label) => !finalParent.labels.some((value) => value.name === label));
   const remove = terminal.labelPlan.remove.filter((label) => finalParent.labels.some((value) => value.name === label));
@@ -4776,6 +4846,9 @@ async function processIssueAsPrdParent(input: Awaited<ReturnType<typeof acquireN
     `Parent issue cannot continue automatically: ${terminal.reason}`,
     "",
     ...terminal.diagnostics,
+    ...(published.ok
+      ? []
+      : ["", "Terminal accumulation publish failed:", ...published.diagnostics]),
   ].join("\n");
   recordLoopFailureDiagnostic({
     scope: "parent",

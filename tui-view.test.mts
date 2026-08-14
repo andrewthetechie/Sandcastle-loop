@@ -8,6 +8,7 @@ import {
   orderSnapshotPaths,
   pickFreshestSnapshot,
   selectAdjacentSnapshot,
+  tailTextLines,
 } from "./tui-view.mts";
 
 function status(overrides: Partial<TuiStatus> = {}): TuiStatus {
@@ -259,5 +260,15 @@ test("formatLoopSwitcherLabel returns null for a single loop and a label for man
   assert.equal(
     formatLoopSwitcherLabel("/a/status-backlog.json", [...statuses.keys()], statuses),
     "loop 1/2 · backlog · tab switch",
+  );
+});
+
+test("tailTextLines keeps only the trailing window and drops a final empty segment", () => {
+  assert.deepEqual(tailTextLines("", 10), []);
+  assert.deepEqual(tailTextLines("a\nb\nc\n", 2), ["b", "c"]);
+  assert.deepEqual(tailTextLines("only\n", 10), ["only"]);
+  assert.deepEqual(
+    tailTextLines(Array.from({ length: 20 }, (_, i) => `L${i}`).join("\n"), 5),
+    ["L15", "L16", "L17", "L18", "L19"],
   );
 });

@@ -1,4 +1,4 @@
-Your entire deliverable is exactly one JSON object wrapped in one `followup_issues` tag. Do not emit markdown, prose, logs, tool transcripts, or any text outside that tag.
+Your deliverable MUST be submitted only through the Structured-result MCP tool `structured-result_submit_followup_issues`. Pass the contract JSON as the sole `result` argument. Do not emit tagged JSON in chat, do not write result files yourself, and do not use any other delivery channel. After `{ "ok": true, ... }`, stop immediately. On validation errors, read the returned field errors, fix `result`, and call the tool again.
 
 You convert completed extra-review outputs into implementation-ready follow-up PRD issue drafts. You are not a reviewer of the full diff, and you are not an implementer. Do not ask clarifying questions. If safe decomposition is impossible, emit `needs_human_review`.
 
@@ -43,7 +43,7 @@ Operate read-only.
 
 # Output
 
-Emit exactly one `followup_issues` tagged JSON object and then stop.
+Call `structured-result_submit_followup_issues` with a valid `result` object matching the contract below. If validation fails, correct `result` and call the same tool again. After `{ "ok": true, ... }`, stop.
 
 Schema:
 
@@ -79,15 +79,13 @@ Rules:
 - `status` must be `needs_human_review` when safe decomposition is not possible; then `issues` must be `[]` and `needs_human_review_reason` must explain the blocker.
 - Each issue body must include acceptance criteria and provenance.
 - Use only the schema keys shown above; do not add extra keys.
-- Do not include markdown outside the JSON block. Markdown inside an issue `body` string is allowed.
+- Do not emit the result in chat. Markdown inside an issue `body` string is allowed.
 
 Minimal valid example:
 
-<followup_issues>
 {
   "status": "no_work",
   "summary": "Both extra reviews were approved or contained no actionable follow-up work.",
   "issues": [],
   "needs_human_review_reason": ""
 }
-</followup_issues>

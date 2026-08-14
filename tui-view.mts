@@ -23,6 +23,23 @@ export type TuiLiveness = "running" | "stale" | "dead" | "stopped";
 export const DEFAULT_STALE_THRESHOLD_MS = 8_000;
 export const DEFAULT_DEAD_THRESHOLD_MS = 30_000;
 
+/** Companion TUI keeps only a sliding window of working-log lines in memory. */
+export const TUI_WORKING_LOG_MAX_LINES = 500;
+/** Cap bytes read from a working log so giant agent logs cannot OOM the TUI. */
+export const TUI_WORKING_LOG_MAX_READ_BYTES = 256_000;
+
+/**
+ * Keep the trailing `maxLines` of a working-log body. Empty input yields [].
+ * A trailing newline is ignored so a final empty segment is not retained.
+ */
+export function tailTextLines(raw: string, maxLines: number): string[] {
+  if (raw === "" || maxLines <= 0) return [];
+  const trimmed = raw.replace(/\n$/u, "");
+  if (trimmed === "") return [];
+  const lines = trimmed.split("\n");
+  return lines.length <= maxLines ? lines : lines.slice(-maxLines);
+}
+
 export interface DeriveStatusViewOptions {
   /** Result of a `process.kill(pid, 0)` probe. `undefined` means not probed. */
   pidAlive?: boolean;
